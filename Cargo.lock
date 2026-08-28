@@ -315,6 +315,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fornax-verify"
+version = "0.0.1"
+dependencies = [
+ "chrono",
+ "fornax-types",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "futures-channel"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
