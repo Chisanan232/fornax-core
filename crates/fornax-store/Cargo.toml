@@ -1,0 +1,15 @@
+[package]
+name = "fornax-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fornax-types = { path = "../fornax-types" }
+sqlx.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
