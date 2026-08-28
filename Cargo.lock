@@ -377,6 +377,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "fornax-adapter-claude"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "fornax-types",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "fornax-daemon"
 version = "0.0.1"
 dependencies = [
