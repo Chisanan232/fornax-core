@@ -216,3 +216,130 @@ pub struct FindingRow {
     pub session_id: String,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fornax_types::{EventKind, EvidenceKind, Provider, Verdict};
+    use uuid::Uuid;
+
+    fn tmp_db_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("fornax-store-test-{name}-{}.db", Uuid::new_v4()))
+    }
+
+    #[tokio::test]
+    async fn fresh_db_creates_with_owner_only_permissions() {
+        let path = tmp_db_path("perms");
+        let _store = Store::open(&path).await.expect("open fresh db");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "DB file must not be group/world readable");
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn event_evidence_claim_finding_round_trip() {
+        let path = tmp_db_path("roundtrip");
+        let store = Store::open(&path).await.expect("open db");
+
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "s1".into(),
+            provider: Provider::Codex,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: Some("exec_command".into()),
+            tool_input: Some(serde_json::json!(["pytest"])),
+            tool_response: Some(serde_json::json!({"exit_code": 1})),
+            raw: serde_json::json!({"type": "exec_command_end"}),
+        };
+        store.insert_event(&event).await.expect("insert event");
+
+        let evidence = Evidence {
+            id: Uuid::new_v4(),
+            session_id: "s1".into(),
+            source_event_id: event.id,
+            kind: EvidenceKind::ExitCode,
+            observed_at: "2026-01-01T00:00:01Z".into(),
+            payload: serde_json::json!({"command": ["pytest"], "exit_code": 1}),
+            provenance: "test".into(),
+        };
+        store
+            .insert_evidence(&evidence)
+            .await
+            .expect("insert evidence");
+
+        let claim = Claim {
+            id: Uuid::new_v4(),
+            session_id: "s1".into(),
+            source_event_id: event.id,
+            text: "All tests passed.".into(),
+            subject: "test_result".into(),
+            claimed_at: "2026-01-01T00:00:02Z".into(),
+        };
+        store.insert_claim(&claim).await.expect("insert claim");
+
+        let finding = Finding {
+            id: Uuid::new_v4(),
+            claim_id: claim.id,
+            verdict: Verdict::Contradicted,
+            evidence_ids: vec![evidence.id],
+            verifier_name: "test_result_verifier_v1".into(),
+            rationale: "exit_code=1".into(),
+            computed_at: "2026-01-01T00:00:03Z".into(),
+        };
+        store
+            .insert_finding(&finding)
+            .await
+            .expect("insert finding");
+
+        let fetched_evidence = store
+            .evidence_for_session("s1")
+            .await
+            .expect("query evidence");
+        assert_eq!(fetched_evidence.len(), 1);
+        assert_eq!(fetched_evidence[0].id, evidence.id);
+        assert_eq!(fetched_evidence[0].payload["exit_code"], 1);
+
+        let recent = store.recent_findings(10).await.expect("query findings");
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].verdict, "contradicted");
+        assert_eq!(recent[0].claim_text, "All tests passed.");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn reopening_existing_db_preserves_prior_data() {
+        let path = tmp_db_path("restart");
+        {
+            let store = Store::open(&path).await.expect("open db first time");
+            let event = AgentEvent {
+                id: Uuid::new_v4(),
+                session_id: "s2".into(),
+                provider: Provider::ClaudeCode,
+                kind: EventKind::SessionStart,
+                observed_at: "2026-01-01T00:00:00Z".into(),
+                tool_name: None,
+                tool_input: None,
+                tool_response: None,
+                raw: serde_json::json!({}),
+            };
+            store.insert_event(&event).await.expect("insert event");
+        }
+        // Simulate a daemon restart: reopen the same path.
+        let store = Store::open(&path).await.expect("reopen db after restart");
+        let evidence = store
+            .evidence_for_session("s2")
+            .await
+            .expect("query after restart");
+        assert!(
+            evidence.is_empty(),
+            "no evidence was inserted, only an event"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+}
