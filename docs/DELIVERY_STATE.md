@@ -1,7 +1,18 @@
 # Fornax delivery state
 
-Last updated: 2026-08-28. Resume by reading this file + `git log` +
-`docs/adr/*` before re-deriving anything — do not re-plan from zero.
+Last updated: 2026-08-28 (post-build-fix). Resume by reading this file +
+`git log` + `docs/adr/*` before re-deriving anything — do not re-plan from
+zero.
+
+**Build/test status as of last commit: GREEN.** `cargo build --workspace`,
+`cargo test --workspace` (9/9 pass), `cargo fmt --all -- --check`, and
+`cargo clippy --workspace --all-targets -- -D warnings` all clean. Use
+`CARGO_TARGET_DIR=./target` — the machine's shared `~/.cargo/shared-target`
+has ~65k unrelated `deps` entries and makes builds extremely slow.
+
+Repo pushed: https://github.com/Chisanan232/fornax-core (main, 11 commits).
+Jira FORNX-22..29/31/32 marked Done; FORNX-30/33/34 marked In Progress
+(partial/unproven, see their Jira comments); FORNX-35..51 untouched (To Do).
 
 ## Jira snapshot (FORNX-20 epic, 31 children, all started "To Do")
 
@@ -19,8 +30,8 @@ Last updated: 2026-08-28. Resume by reading this file + `git log` +
 | FORNX-30 Status-line | Partial — `fornax status` produces the compact segment; not wired as a status-line segment in any global config (same reasoning as FORNX-28) |
 | FORNX-31 Detail command | Done — `fornax detail` |
 | FORNX-32 Localhost dashboard | Done — `GET /dashboard` on the daemon's axum server |
-| FORNX-33 Privacy/redaction | **Not started.** Currently evidence payloads (tool_response/aggregated_output) are stored as-is, no redaction classifier yet. Real non-blocking finding recorded on this ticket: Codex rollout files can leak secrets in captured command output (owner: risk accepted/deferred). Store file permissions (0600) implemented as a partial mitigation for Fornax's *own* DB. |
-| FORNX-34 LOCAL READY gate | **Not proven end-to-end yet this session** — code compiles (workspace build in progress at session end); full loop (real Claude Code Stop hook wired + real Codex rollout tail + dashboard showing a real CONTRADICTED finding) has not been run live. See "Next session" below. |
+| FORNX-33 Privacy/redaction | **Partial.** `fornax_types::redact` — pattern-based secret classifier (GitHub tokens, `TOKEN=`/`SECRET=`-style assignments, generic high-entropy tokens) applied at the daemon's ingest boundary before persistence. 4 unit tests. No policy allowlist, no cloud-egress gating (moot — no cloud code exists). Real non-blocking finding recorded on this ticket: Codex rollout files can leak secrets in captured command output (owner: risk accepted/deferred). Store file permissions (0600) implemented as a partial mitigation for Fornax's *own* DB. |
+| FORNX-34 LOCAL READY gate | **Proven with a synthetic rollout file, not a real live session.** Full pipeline verified: synthetic Codex-shaped `exec_command_end{exit_code:1}` + `task_complete{last_agent_message:"All tests passed."}` → daemon → `CONTRADICTED` → identical result via `fornax status`, `fornax detail`, `/dashboard`. Real live Claude Code (Stop hook wired) and real live Codex session runs still needed before this gate can actually close. |
 | FORNX-35..50 (cloud/SaaS/docs/website/payment/research/validation) | **Not started.** Sequenced after Gate 2 (LOCAL READY) per the epic's hard gate — correctly out of scope for this session. |
 | FORNX-51 Jira admin metadata | Not started. |
 
