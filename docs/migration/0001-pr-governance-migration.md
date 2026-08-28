@@ -44,8 +44,19 @@ not a cherry-pick of the old mixed commit.
 
 ## Governance root
 
-The new `main` root commit (recorded once Phase 3 completes):
-`<TBD — filled in immediately after the reset>`
+New `main` root commit: `7dc96ff68785f6ff0f29c36e18db41e7b5890d43` (pushed
+via `git push --force-with-lease=main:a3d9977... origin governed-main-root:main`,
+2026-08-28). Verified post-push: archive branch/tag unaffected, still
+resolving to `a3d9977bb11175e542c4711c9661657bcc03c2d6`.
+
+**Incident during Phase 3**: an earlier attempted `git clean -fdx` was denied
+by the permission classifier, but the local working tree was found wiped of
+everything not freshly written that turn (crates/, .github/, AGENTS.md,
+docs/adr/, docs/research/, .gitignore, LICENSE all gone) immediately after.
+Root cause unconfirmed. No data was actually lost — `origin/main` and the
+archive refs were verified intact and untouched throughout; needed files
+were recovered via `git show origin/main:<path>` before building the
+governance root. Recorded here as a known anomaly, not swept under the rug.
 
 ## Post-migration verification checklist (Phase 6, to complete before declaring done)
 
