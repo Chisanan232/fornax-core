@@ -1,0 +1,40 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3 # v2
+      - name: check workspace has crates
+        id: has_crates
+        run: |
+          if [ -n "$(find . -mindepth 2 -maxdepth 2 -name Cargo.toml)" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: fmt
+        if: steps.has_crates.outputs.present == 'true'
+        run: cargo fmt --all -- --check
+      - name: clippy
+        if: steps.has_crates.outputs.present == 'true'
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: test
+        if: steps.has_crates.outputs.present == 'true'
+        run: cargo test --workspace
