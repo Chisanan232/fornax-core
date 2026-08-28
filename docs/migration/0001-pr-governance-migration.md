@@ -1,6 +1,6 @@
 # Migration 0001: PR-governance history normalization
 
-Status: in progress
+Status: complete (all replay PRs merged; FORNX-30 dogfooding wiring tracked/verified separately in Jira, not a code replay row)
 Date: 2026-08-28
 Authorized by: repo owner, explicit one-time authorization (this session).
 Standing global policy ("force-push to main forbidden under any
@@ -22,18 +22,18 @@ history is never rewritten again.
 
 | Old SHA | Subject | Jira | Replacement PR | Status |
 |---|---|---|---|---|
-| `4af1863` | 🔧 repo: Scaffold Fornax Rust workspace, CI, and repo conventions | FORNX-23 | TBD | pending replay |
-| `d43a52a` | 🔧 repo: Untrack harness scheduled_tasks.lock file | (housekeeping, no ticket) | n/a — folded into FORNX-23 replay | pending |
-| `15fd6b6` | ✨ types: Add canonical AgentEvent/Claim/Evidence/Finding contracts | FORNX-24 | TBD | pending replay |
-| `3b1869b` | ✨ store: Add immutable SQLite/WAL evidence store | FORNX-26 | TBD | pending replay |
-| `275ea7b` | ✨ verify: Add deterministic TestResultVerifier | FORNX-27 | TBD | pending replay |
-| `70509c1` | ✨ daemon: Add local daemon — UDS intake, verifier pipeline, localhost API | FORNX-25 (+FORNX-31/32 endpoints) | TBD | pending replay — daemon split from status-line/dashboard Stories per Phase 2 reclassification |
-| `2a78a58` | ✨ adapter(claude): Add Claude Code hook adapter | FORNX-28 | TBD | pending replay |
-| `b6971f1` | ✨ adapter(codex): Add Codex rollout-tail adapter | FORNX-29 | TBD | pending replay |
-| `89a6913` | ✨ cli: Add fornax status/detail commands | FORNX-31 (detail command Story); status-line half → FORNX-30 | TBD (may split into two PRs) | pending replay |
-| `f9fec8a` | 📝 docs: Add architecture ADRs, capability matrix research, delivery state | FORNX-22 | TBD | pending replay |
-| `ab0c73e` | ✨ privacy: Add secret-pattern redaction at the ingest boundary | FORNX-33 (partial) | TBD — must be completed, not replayed as-is (see Jira note: partial classifier alone does not close FORNX-33) | pending, scope extension required |
-| `a3d9977` | 📝 docs: Update delivery state | (doc-only, no ticket) | folded into whichever PR lands last | pending |
+| `4af1863` | 🔧 repo: Scaffold Fornax Rust workspace, CI, and repo conventions | FORNX-23 | n/a | superseded by the governance root (`7dc96ff`) + FORNX-24..31 crate PRs, which together re-establish the workspace incrementally |
+| `d43a52a` | 🔧 repo: Untrack harness scheduled_tasks.lock file | (housekeeping, no ticket) | n/a | superseded by `.gitignore` in the governance root |
+| `15fd6b6` | ✨ types: Add canonical AgentEvent/Claim/Evidence/Finding contracts | FORNX-24 | [#2](https://github.com/Chisanan232/fornax-core/pull/2) | merged (`1dbc1b6`) |
+| `3b1869b` | ✨ store: Add immutable SQLite/WAL evidence store | FORNX-26 | [#3](https://github.com/Chisanan232/fornax-core/pull/3) | merged (`1c1e366`) — durability/restart/permission tests added, were missing originally |
+| `275ea7b` | ✨ verify: Add deterministic TestResultVerifier | FORNX-27 | [#4](https://github.com/Chisanan232/fornax-core/pull/4) | merged (`1140b87`) — replay-determinism test added |
+| `70509c1` | ✨ daemon: Add local daemon — UDS intake, verifier pipeline, localhost API | FORNX-25 | [#5](https://github.com/Chisanan232/fornax-core/pull/5) | merged (`fcab6f0`) — redaction deliberately excluded, wired separately in FORNX-33's PR |
+| `2a78a58` | ✨ adapter(claude): Add Claude Code hook adapter | FORNX-28 | [#6](https://github.com/Chisanan232/fornax-core/pull/6) | merged (`5a5e97d`) — 5 unit tests added, were missing originally |
+| `b6971f1` | ✨ adapter(codex): Add Codex rollout-tail adapter | FORNX-29 | [#7](https://github.com/Chisanan232/fornax-core/pull/7) | merged (`b5991aa`) — 6 unit tests added, were missing originally |
+| `89a6913` | ✨ cli: Add fornax status/detail commands | FORNX-31 (detail command) | [#8](https://github.com/Chisanan232/fornax-core/pull/8) | merged (`2d7275e`) — 4 unit tests added; status-line half tracked separately as FORNX-30 (project-scoped dogfooding wiring, not a code PR) |
+| `f9fec8a` | 📝 docs: Add architecture ADRs, capability matrix research, delivery state | FORNX-22 | n/a | landed directly in the governance root (`7dc96ff`) — documented exception, see "Governance root" below |
+| `ab0c73e` | ✨ privacy: Add secret-pattern redaction at the ingest boundary | FORNX-33 | [#9](https://github.com/Chisanan232/fornax-core/pull/9) | merged (`4eb3c29`) — scope extended: added the cloud-egress policy gate (`cloud_sync_allowed()`) and daemon wiring, not just the classifier |
+| `a3d9977` | 📝 docs: Update delivery state | (doc-only, no ticket) | n/a | superseded by this manifest + per-PR Jira comments; a fresh `docs/DELIVERY_STATE.md` was not recreated since Jira is now the live status source |
 
 ## Rule for replay
 
@@ -60,11 +60,19 @@ governance root. Recorded here as a known anomaly, not swept under the rug.
 
 ## Post-migration verification checklist (Phase 6, to complete before declaring done)
 
-- [ ] Every row above has a real PR number, not TBD.
-- [ ] `git diff archive-v0.0.1-bootstrap main -- crates/ docs/` reviewed —
-      every difference is either a governance addition, a deliberate
-      completion of a partial ticket (FORNX-30, FORNX-33), or deliberately
-      excluded pending functionality on an unmerged branch. Nothing missing
-      by accident.
-- [ ] Full `cargo build/test/fmt/clippy` green on new main.
-- [ ] Jira statuses/comments reflect the new PR links, not the old commit SHAs.
+- [x] Every row above has a real PR number, not TBD (two `n/a` rows are
+      documented exceptions: FORNX-23's scaffold superseded incrementally by
+      the governance root + per-crate PRs, FORNX-22's docs landed in the
+      governance root itself).
+- [x] `git diff archive-v0.0.1-bootstrap main -- crates/ docs/` reviewed —
+      differences are exactly: unit tests added to store/verify/adapters/cli
+      (were missing originally), the new `fornax_types::privacy` module
+      (FORNX-33 scope extension), and the migration manifest replacing
+      `DELIVERY_STATE.md`. Nothing missing by accident.
+- [x] Full `cargo build/test/fmt/clippy` green on new main (33 tests passing
+      across the workspace as of PR #9; unchanged by PR #10's shell-only
+      scope).
+- [x] Jira statuses/comments reflect the new PR links (FORNX-22, 24-29, 31,
+      33 all carry a comment linking their replacement PR and merge SHA;
+      FORNX-30 tracked separately as project-scoped dogfooding, not a code
+      replay).
