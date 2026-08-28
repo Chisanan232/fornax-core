@@ -12,3 +12,7 @@
 node_modules/
 dist/
 .claude/scheduled_tasks.lock
+# Personal, machine-local Claude Code overrides (Claude Code also adds this
+# to the global git excludes automatically on first write — this entry is
+# defense in depth, see docs/dogfooding-status-line.md).
+.claude/settings.local.json
