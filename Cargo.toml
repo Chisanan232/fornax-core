@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/fornax-types"]
+members = ["crates/fornax-types", "crates/fornax-store"]
 
 [workspace.package]
 version = "0.0.1"
