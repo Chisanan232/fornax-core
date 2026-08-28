@@ -6,6 +6,7 @@
 use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
+use fornax_types::redact::redact_json;
 use fornax_types::{IngestMessage, RuntimeCapabilities};
 use fornax_verify::{TestResultVerifier, Verifier};
 use std::collections::HashMap;
@@ -137,12 +138,18 @@ async fn handle_message(
                 state.caps.lock().await.insert(sid, caps);
             }
         }
-        IngestMessage::Event(ev) => {
+        IngestMessage::Event(mut ev) => {
             *session_hint = Some(ev.session_id.clone());
+            // Privacy boundary (FORNX-33): redact recognizable secrets from
+            // raw tool output before it is ever persisted. Applied once,
+            // here, not re-derived by every downstream reader.
+            ev.tool_response = ev.tool_response.as_ref().map(redact_json);
+            ev.raw = redact_json(&ev.raw);
             state.store.insert_event(&ev).await?;
         }
-        IngestMessage::Evidence(ev) => {
+        IngestMessage::Evidence(mut ev) => {
             *session_hint = Some(ev.session_id.clone());
+            ev.payload = redact_json(&ev.payload);
             state.store.insert_evidence(&ev).await?;
         }
         IngestMessage::Claim(claim) => {
