@@ -1,0 +1,13 @@
+/target
+/.cargo/shared-target
+**/*.rs.bk
+*.db
+*.db-shm
+*.db-wal
+.DS_Store
+.env
+.claude/.current-ticket
+.claude/.current-worktree
+.claude/.current-release
+node_modules/
+dist/
