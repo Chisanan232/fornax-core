@@ -35,6 +35,29 @@ fn from_tag<T: serde::de::DeserializeOwned>(s: &str) -> Result<T> {
     ))?)
 }
 
+/// `<path>` with `suffix` appended to the file name, e.g.
+/// `append_ext("a/db.sqlite", "-wal")` -> `a/db.sqlite-wal` (SQLite's own
+/// naming convention for WAL-mode sidecar files, not a `.` extension).
+#[cfg(unix)]
+fn append_ext(path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    std::path::PathBuf::from(name)
+}
+
+/// Best-effort 0600 chmod. Silently does nothing if the file doesn't exist
+/// yet (WAL/SHM sidecars may not be created until the first checkpoint) or
+/// the chmod fails for another reason — never block store startup on this.
+#[cfg(unix)]
+fn chmod_owner_only(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let mut perms = meta.permissions();
+        perms.set_mode(0o600);
+        let _ = std::fs::set_permissions(path, perms);
+    }
+}
+
 #[derive(Clone)]
 pub struct Store {
     pool: SqlitePool,
@@ -66,11 +89,16 @@ impl Store {
 
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(meta) = std::fs::metadata(path) {
-                let mut perms = meta.permissions();
-                perms.set_mode(0o600);
-                let _ = std::fs::set_permissions(path, perms);
+            // In WAL mode the most recently written rows live in the
+            // `-wal` sidecar (and its `-shm` index) until a checkpoint, not
+            // in the main file — chmod all three or the 0600 guarantee
+            // above is defeated for exactly the newest evidence/claims.
+            for sidecar in [
+                path.to_path_buf(),
+                append_ext(path, "-wal"),
+                append_ext(path, "-shm"),
+            ] {
+                chmod_owner_only(&sidecar);
             }
         }
 
