@@ -3,7 +3,7 @@
 //! verifiers (FORNX-49) from this store alone, with no network/adapter
 //! dependency.
 
-use fornax_types::{AgentEvent, Claim, Evidence, Finding};
+use fornax_types::{AgentEvent, Claim, Evidence, Finding, RuntimeCapabilities};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
 use std::path::Path;
@@ -201,6 +201,64 @@ impl Store {
         rows.into_iter().map(TryInto::try_into).collect()
     }
 
+    /// Persist (or overwrite) the capabilities a provider adapter announced
+    /// for `session_id` (FORNX-62). Unlike `insert_*`, this is an upsert on
+    /// `(session_id, provider)` — see `migrations/0002_runtime_capabilities.sql`
+    /// for why capabilities don't follow the insert-only convention.
+    pub async fn upsert_capabilities(
+        &self,
+        session_id: &str,
+        caps: &RuntimeCapabilities,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO runtime_capabilities
+                (session_id, provider, supports_pre_tool_use, supports_post_tool_use,
+                 supports_tool_response_capture, supports_session_stop_event,
+                 supports_transcript_tail, supports_subagent_lifecycle, notes, observed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+             ON CONFLICT(session_id, provider) DO UPDATE SET
+                supports_pre_tool_use = excluded.supports_pre_tool_use,
+                supports_post_tool_use = excluded.supports_post_tool_use,
+                supports_tool_response_capture = excluded.supports_tool_response_capture,
+                supports_session_stop_event = excluded.supports_session_stop_event,
+                supports_transcript_tail = excluded.supports_transcript_tail,
+                supports_subagent_lifecycle = excluded.supports_subagent_lifecycle,
+                notes = excluded.notes,
+                observed_at = excluded.observed_at",
+        )
+        .bind(session_id)
+        .bind(tag(&caps.provider)?)
+        .bind(caps.supports_pre_tool_use)
+        .bind(caps.supports_post_tool_use)
+        .bind(caps.supports_tool_response_capture)
+        .bind(caps.supports_session_stop_event)
+        .bind(caps.supports_transcript_tail)
+        .bind(caps.supports_subagent_lifecycle)
+        .bind(serde_json::to_string(&caps.notes)?)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// All capabilities announcements for a session, one row per provider
+    /// that has announced (FORNX-62/FORNX-60: `export-spool` reads this to
+    /// emit a `capabilities` envelope alongside events/claims/evidence).
+    pub async fn capabilities_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<RuntimeCapabilities>> {
+        let rows = sqlx::query_as::<_, CapabilitiesRow>(
+            "SELECT provider, supports_pre_tool_use, supports_post_tool_use,
+                    supports_tool_response_capture, supports_session_stop_event,
+                    supports_transcript_tail, supports_subagent_lifecycle, notes
+             FROM runtime_capabilities WHERE session_id = ?1 ORDER BY provider ASC",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
     /// All claims for a session, oldest first (FORNX-60).
     pub async fn claims_for_session(&self, session_id: &str) -> Result<Vec<Claim>> {
         let rows = sqlx::query_as::<_, ClaimRow>(
@@ -308,6 +366,34 @@ impl TryFrom<ClaimRow> for Claim {
             text: r.text,
             subject: r.subject,
             claimed_at: r.claimed_at,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct CapabilitiesRow {
+    provider: String,
+    supports_pre_tool_use: bool,
+    supports_post_tool_use: bool,
+    supports_tool_response_capture: bool,
+    supports_session_stop_event: bool,
+    supports_transcript_tail: bool,
+    supports_subagent_lifecycle: bool,
+    notes: String,
+}
+
+impl TryFrom<CapabilitiesRow> for RuntimeCapabilities {
+    type Error = StoreError;
+    fn try_from(r: CapabilitiesRow) -> Result<Self> {
+        Ok(RuntimeCapabilities {
+            provider: from_tag(&r.provider)?,
+            supports_pre_tool_use: r.supports_pre_tool_use,
+            supports_post_tool_use: r.supports_post_tool_use,
+            supports_tool_response_capture: r.supports_tool_response_capture,
+            supports_session_stop_event: r.supports_session_stop_event,
+            supports_transcript_tail: r.supports_transcript_tail,
+            supports_subagent_lifecycle: r.supports_subagent_lifecycle,
+            notes: serde_json::from_str(&r.notes)?,
         })
     }
 }
@@ -497,6 +583,97 @@ mod tests {
             evidence.is_empty(),
             "no evidence was inserted, only an event"
         );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    fn sample_capabilities() -> RuntimeCapabilities {
+        RuntimeCapabilities {
+            provider: Provider::ClaudeCode,
+            supports_pre_tool_use: true,
+            supports_post_tool_use: true,
+            supports_tool_response_capture: true,
+            supports_session_stop_event: false,
+            supports_transcript_tail: true,
+            supports_subagent_lifecycle: false,
+            notes: [("session_id".to_string(), "s3".to_string())].into(),
+        }
+    }
+
+    /// FORNX-62: a capabilities announcement must survive a daemon restart
+    /// (reopen of the same store path), the same guarantee already proven
+    /// for events/evidence in `reopening_existing_db_preserves_prior_data`.
+    #[tokio::test]
+    async fn capabilities_round_trip_survives_reopen() {
+        let path = tmp_db_path("caps-roundtrip");
+        {
+            let store = Store::open(&path).await.expect("open db first time");
+            store
+                .upsert_capabilities("s3", &sample_capabilities())
+                .await
+                .expect("upsert capabilities");
+        }
+        // Simulate a daemon restart: reopen the same path.
+        let store = Store::open(&path).await.expect("reopen db after restart");
+
+        let fetched = store
+            .capabilities_for_session("s3")
+            .await
+            .expect("query capabilities after restart");
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].provider, Provider::ClaudeCode);
+        assert!(fetched[0].supports_pre_tool_use);
+        assert!(!fetched[0].supports_session_stop_event);
+        assert_eq!(fetched[0].notes.get("session_id").unwrap(), "s3");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A later announcement for the same (session_id, provider) overwrites
+    /// the previous one rather than accumulating a second row — this is the
+    /// one place this store deviates from insert-only (see
+    /// `migrations/0002_runtime_capabilities.sql`).
+    #[tokio::test]
+    async fn capabilities_reannouncement_overwrites_not_accumulates() {
+        let path = tmp_db_path("caps-upsert");
+        let store = Store::open(&path).await.expect("open db");
+
+        store
+            .upsert_capabilities("s4", &sample_capabilities())
+            .await
+            .expect("first announcement");
+
+        let mut updated = sample_capabilities();
+        updated.supports_session_stop_event = true;
+        store
+            .upsert_capabilities("s4", &updated)
+            .await
+            .expect("second announcement");
+
+        let fetched = store
+            .capabilities_for_session("s4")
+            .await
+            .expect("query capabilities");
+        assert_eq!(
+            fetched.len(),
+            1,
+            "re-announcement must overwrite, not add a row"
+        );
+        assert!(fetched[0].supports_session_stop_event);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn capabilities_for_session_empty_when_none_announced() {
+        let path = tmp_db_path("caps-empty");
+        let store = Store::open(&path).await.expect("open db");
+
+        let fetched = store
+            .capabilities_for_session("no-such-session")
+            .await
+            .expect("query capabilities");
+        assert!(fetched.is_empty());
 
         std::fs::remove_file(&path).ok();
     }
