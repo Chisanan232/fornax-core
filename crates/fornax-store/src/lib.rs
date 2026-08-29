@@ -35,6 +35,29 @@ fn from_tag<T: serde::de::DeserializeOwned>(s: &str) -> Result<T> {
     ))?)
 }
 
+/// `<path>` with `suffix` appended to the file name, e.g.
+/// `append_ext("a/db.sqlite", "-wal")` -> `a/db.sqlite-wal` (SQLite's own
+/// naming convention for WAL-mode sidecar files, not a `.` extension).
+#[cfg(unix)]
+fn append_ext(path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    std::path::PathBuf::from(name)
+}
+
+/// Best-effort 0600 chmod. Silently does nothing if the file doesn't exist
+/// yet (WAL/SHM sidecars may not be created until the first checkpoint) or
+/// the chmod fails for another reason — never block store startup on this.
+#[cfg(unix)]
+fn chmod_owner_only(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let mut perms = meta.permissions();
+        perms.set_mode(0o600);
+        let _ = std::fs::set_permissions(path, perms);
+    }
+}
+
 #[derive(Clone)]
 pub struct Store {
     pool: SqlitePool,
@@ -66,11 +89,16 @@ impl Store {
 
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(meta) = std::fs::metadata(path) {
-                let mut perms = meta.permissions();
-                perms.set_mode(0o600);
-                let _ = std::fs::set_permissions(path, perms);
+            // In WAL mode the most recently written rows live in the
+            // `-wal` sidecar (and its `-shm` index) until a checkpoint, not
+            // in the main file — chmod all three or the 0600 guarantee
+            // above is defeated for exactly the newest evidence/claims.
+            for sidecar in [
+                path.to_path_buf(),
+                append_ext(path, "-wal"),
+                append_ext(path, "-shm"),
+            ] {
+                chmod_owner_only(&sidecar);
             }
         }
 
@@ -237,6 +265,53 @@ mod tests {
             assert_eq!(mode, 0o600, "DB file must not be group/world readable");
         }
         std::fs::remove_file(&path).ok();
+    }
+
+    /// FORNX-57: WAL mode keeps the newest rows — including claim text and
+    /// evidence payloads that may carry secrets — in the `-wal` sidecar
+    /// until a checkpoint. That file must be as locked-down as the main db.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wal_and_shm_sidecars_are_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = tmp_db_path("wal-perms");
+        let store = Store::open(&path).await.expect("open fresh db");
+
+        // Force a write so the -wal file actually has content, not just
+        // exist with default perms from being newly created.
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "wal-perms".into(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: None,
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        store.insert_event(&event).await.expect("insert event");
+
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = append_ext(&path, suffix);
+            let mode = std::fs::metadata(&sidecar)
+                .unwrap_or_else(|e| panic!("expected {} to exist: {e}", sidecar.display()))
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode,
+                0o600,
+                "{} must not be group/world readable",
+                sidecar.display()
+            );
+        }
+
+        drop(store);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(append_ext(&path, "-wal")).ok();
+        std::fs::remove_file(append_ext(&path, "-shm")).ok();
     }
 
     #[tokio::test]
