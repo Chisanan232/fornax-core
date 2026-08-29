@@ -55,6 +55,32 @@ async fn main() {
     }
 }
 
+/// Declared conservatively, matching what this adapter actually reads —
+/// never inferred as more capable than confirmed (D5, ADR 0001). Confirmed
+/// against a live Claude Code v2.1.238 session (2026-08-29): PostToolUse and
+/// Stop both fire with the shapes this adapter parses.
+fn claude_capabilities(session_id: &str) -> fornax_types::RuntimeCapabilities {
+    fornax_types::RuntimeCapabilities {
+        provider: Provider::ClaudeCode,
+        supports_pre_tool_use: true,
+        supports_post_tool_use: true,
+        supports_tool_response_capture: true,
+        supports_session_stop_event: true,
+        supports_transcript_tail: true,
+        supports_subagent_lifecycle: true,
+        notes: [
+            ("session_id".to_string(), session_id.to_string()),
+            (
+                "exit_code".to_string(),
+                "heuristic from stdout/stderr/interrupted — Claude Code's Bash tool_response \
+                 carries no literal exit code as of v2.1.238"
+                    .to_string(),
+            ),
+        ]
+        .into(),
+    }
+}
+
 fn translate(raw: &serde_json::Value) -> Vec<IngestMessage> {
     let hook_event = raw
         .get("hook_event_name")
@@ -99,7 +125,19 @@ fn translate(raw: &serde_json::Value) -> Vec<IngestMessage> {
         raw: raw.clone(),
     };
 
-    let mut out = vec![IngestMessage::Event(event)];
+    // Declare capabilities on every event, not just session start: Claude
+    // Code hooks are stateless invocations of this binary, so there is no
+    // single "session start" moment where a capability declaration is
+    // guaranteed to be sent exactly once. The daemon's Capabilities handler
+    // overwrites its per-session map entry, so repeated identical
+    // declarations are idempotent. This was a real gap found 2026-08-29
+    // while proving FORNX-34 against live Claude Code data: without it,
+    // the daemon never learns this session can expose exit-code evidence,
+    // and every claim resolves Unavailable regardless of Evidence present.
+    let mut out = vec![
+        IngestMessage::Capabilities(claude_capabilities(&session_id)),
+        IngestMessage::Event(event),
+    ];
 
     // PostToolUse for a Bash call: if Claude Code's tool_response carries an
     // exit-code-shaped field, extract it as Evidence. Field name is not
@@ -107,10 +145,54 @@ fn translate(raw: &serde_json::Value) -> Vec<IngestMessage> {
     // check a small set of plausible keys rather than assume one.
     if kind == EventKind::PostToolUse && tool_name.as_deref() == Some("Bash") {
         if let Some(resp) = &tool_response {
-            let exit_code = ["exit_code", "exitCode", "returncode", "status"]
+            let explicit_code = ["exit_code", "exitCode", "returncode", "status"]
                 .iter()
                 .find_map(|k| resp.get(k).and_then(|v| v.as_i64()));
-            if let Some(code) = exit_code {
+
+            // Confirmed against a real Claude Code v2.1.238 transcript
+            // (2026-08-29): the Bash tool_response never carries any of the
+            // keys above — it is {stdout, stderr, interrupted, isImage,
+            // noOutputExpected}. Fall back to a heuristic derived from that
+            // shape so Evidence is still produced, and mark its provenance
+            // as heuristic (not authoritative) rather than silently
+            // fabricating a real exit code.
+            let (code, provenance) = match explicit_code {
+                Some(code) => (
+                    Some(code),
+                    "claude_code:PostToolUse:Bash#tool_response".to_string(),
+                ),
+                None => {
+                    let interrupted = resp
+                        .get("interrupted")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let stderr_nonempty = resp
+                        .get("stderr")
+                        .and_then(|v| v.as_str())
+                        .map(|s| !s.trim().is_empty())
+                        .unwrap_or(false);
+                    if interrupted {
+                        (
+                            Some(130),
+                            "claude_code:PostToolUse:Bash#heuristic:interrupted".to_string(),
+                        )
+                    } else if stderr_nonempty {
+                        (
+                            Some(1),
+                            "claude_code:PostToolUse:Bash#heuristic:stderr_nonempty".to_string(),
+                        )
+                    } else if resp.get("stdout").is_some() {
+                        (
+                            Some(0),
+                            "claude_code:PostToolUse:Bash#heuristic:stderr_empty".to_string(),
+                        )
+                    } else {
+                        (None, String::new())
+                    }
+                }
+            };
+
+            if let Some(code) = code {
                 out.push(IngestMessage::Evidence(Evidence {
                     id: Uuid::new_v4(),
                     session_id: session_id.clone(),
@@ -120,8 +202,9 @@ fn translate(raw: &serde_json::Value) -> Vec<IngestMessage> {
                     payload: serde_json::json!({
                         "command": tool_input_command(raw),
                         "exit_code": code,
+                        "heuristic": explicit_code.is_none(),
                     }),
-                    provenance: "claude_code:PostToolUse:Bash#tool_response".to_string(),
+                    provenance,
                 }));
             }
         }
@@ -177,11 +260,20 @@ fn last_assistant_text(raw: &serde_json::Value) -> Option<String> {
         if entry.get("type").and_then(|v| v.as_str()) != Some("assistant") {
             continue;
         }
-        if let Some(text) = entry
-            .pointer("/message/content/0/text")
-            .and_then(|v| v.as_str())
-        {
-            last_text = Some(text.to_string());
+        // A real assistant turn's content array frequently has a tool_use
+        // (or thinking) block at index 0 with no "text" field at all —
+        // confirmed against a live Claude Code v2.1.238 transcript
+        // 2026-08-29, where content[0] was a tool_use block. Scan every
+        // block in the turn for a "text"-typed one instead of assuming
+        // index 0.
+        if let Some(blocks) = entry.pointer("/message/content").and_then(|v| v.as_array()) {
+            for block in blocks {
+                if block.get("type").and_then(|v| v.as_str()) == Some("text") {
+                    if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                        last_text = Some(text.to_string());
+                    }
+                }
+            }
         }
     }
     last_text
@@ -202,8 +294,9 @@ mod tests {
             "tool_response": {"exit_code": 1}
         });
         let msgs = translate(&raw);
-        assert_eq!(msgs.len(), 2);
-        match &msgs[0] {
+        assert_eq!(msgs.len(), 3);
+        assert!(matches!(&msgs[0], IngestMessage::Capabilities(_)));
+        match &msgs[1] {
             IngestMessage::Event(e) => {
                 assert_eq!(e.provider, Provider::ClaudeCode);
                 assert_eq!(e.kind, EventKind::PostToolUse);
@@ -211,7 +304,7 @@ mod tests {
             }
             other => panic!("expected Event, got {other:?}"),
         }
-        match &msgs[1] {
+        match &msgs[2] {
             IngestMessage::Evidence(ev) => {
                 assert_eq!(ev.payload["exit_code"], 1);
             }
@@ -220,16 +313,98 @@ mod tests {
     }
 
     #[test]
-    fn post_tool_use_without_exit_code_produces_only_event() {
+    fn post_tool_use_real_claude_code_shape_infers_heuristic_success() {
+        // Confirmed real Claude Code v2.1.238 Bash tool_response shape
+        // (2026-08-29 live capture): no exit_code/exitCode/returncode/status
+        // key exists at all. Empty stderr + not interrupted should still
+        // yield heuristic exit-code-0 Evidence, marked as a heuristic.
         let raw = serde_json::json!({
             "hook_event_name": "PostToolUse",
             "session_id": "sess-1",
             "tool_name": "Bash",
             "tool_input": {"command": "echo hi"},
-            "tool_response": {"stdout": "hi\n"}
+            "tool_response": {"stdout": "hi\n", "stderr": "", "interrupted": false, "isImage": false, "noOutputExpected": false}
         });
         let msgs = translate(&raw);
-        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs.len(), 3);
+        match &msgs[2] {
+            IngestMessage::Evidence(ev) => {
+                assert_eq!(ev.payload["exit_code"], 0);
+                assert_eq!(ev.payload["heuristic"], true);
+                assert!(ev.provenance.contains("heuristic:stderr_empty"));
+            }
+            _ => panic!("expected Evidence"),
+        }
+    }
+
+    #[test]
+    fn post_tool_use_real_shape_stderr_nonempty_infers_heuristic_failure() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "sess-1",
+            "tool_name": "Bash",
+            "tool_input": {"command": "false"},
+            "tool_response": {"stdout": "", "stderr": "boom", "interrupted": false}
+        });
+        let msgs = translate(&raw);
+        assert_eq!(msgs.len(), 3);
+        match &msgs[2] {
+            IngestMessage::Evidence(ev) => {
+                assert_eq!(ev.payload["exit_code"], 1);
+                assert!(ev.provenance.contains("heuristic:stderr_nonempty"));
+            }
+            _ => panic!("expected Evidence"),
+        }
+    }
+
+    #[test]
+    fn post_tool_use_without_any_recognizable_shape_produces_only_event() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "sess-1",
+            "tool_name": "Bash",
+            "tool_input": {"command": "echo hi"},
+            "tool_response": {}
+        });
+        let msgs = translate(&raw);
+        assert_eq!(msgs.len(), 2);
+        assert!(matches!(&msgs[0], IngestMessage::Capabilities(_)));
+        assert!(matches!(&msgs[1], IngestMessage::Event(_)));
+    }
+
+    #[test]
+    fn stop_event_finds_text_block_when_content_0_is_tool_use() {
+        // Confirmed real Claude Code v2.1.238 transcript shape (2026-08-29
+        // live capture): an assistant turn's content[0] is routinely a
+        // tool_use block with no "text" field — the final text-bearing
+        // block can be anywhere in the array, not just index 0.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("fornax-test-transcript-{}.jsonl", Uuid::new_v4()));
+        let transcript = serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {}},
+                    {"type": "text", "text": "all tests passed"}
+                ]
+            }
+        })
+        .to_string();
+        std::fs::write(&path, transcript).unwrap();
+
+        let raw = serde_json::json!({
+            "hook_event_name": "Stop",
+            "session_id": "sess-1",
+            "transcript_path": path.to_str().unwrap()
+        });
+        let msgs = translate(&raw);
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(msgs.len(), 3);
+        match &msgs[2] {
+            IngestMessage::Claim(c) => assert_eq!(c.text, "all tests passed"),
+            _ => panic!("expected Claim"),
+        }
     }
 
     #[test]
@@ -239,7 +414,9 @@ mod tests {
             "session_id": "sess-1"
         });
         let msgs = translate(&raw);
-        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs.len(), 2);
+        assert!(matches!(&msgs[0], IngestMessage::Capabilities(_)));
+        assert!(matches!(&msgs[1], IngestMessage::Event(_)));
     }
 
     #[test]
@@ -259,9 +436,10 @@ mod tests {
             "prompt": "run the tests"
         });
         let msgs = translate(&raw);
-        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs.len(), 2);
+        assert!(matches!(&msgs[0], IngestMessage::Capabilities(_)));
         assert!(
-            matches!(&msgs[0], IngestMessage::Event(e) if e.kind == EventKind::UserPromptSubmit)
+            matches!(&msgs[1], IngestMessage::Event(e) if e.kind == EventKind::UserPromptSubmit)
         );
     }
 }
