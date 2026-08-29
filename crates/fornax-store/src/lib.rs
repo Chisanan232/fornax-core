@@ -187,6 +187,32 @@ impl Store {
         rows.into_iter().map(TryInto::try_into).collect()
     }
 
+    /// All events for a session, oldest first (FORNX-60: needed alongside
+    /// `claims_for_session`/`evidence_for_session` to export a session's full
+    /// record to an external spool, e.g. `fornax-cloud`'s uploader).
+    pub async fn events_for_session(&self, session_id: &str) -> Result<Vec<AgentEvent>> {
+        let rows = sqlx::query_as::<_, EventRow>(
+            "SELECT id, session_id, provider, kind, observed_at, tool_name, tool_input, tool_response, raw
+             FROM agent_events WHERE session_id = ?1 ORDER BY observed_at ASC",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
+    /// All claims for a session, oldest first (FORNX-60).
+    pub async fn claims_for_session(&self, session_id: &str) -> Result<Vec<Claim>> {
+        let rows = sqlx::query_as::<_, ClaimRow>(
+            "SELECT id, session_id, source_event_id, text, subject, claimed_at
+             FROM claims WHERE session_id = ?1 ORDER BY claimed_at ASC",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
     /// Most recent findings across all sessions, for the localhost dashboard
     /// (FORNX-32) and detail command (FORNX-31).
     pub async fn recent_findings(&self, limit: i64) -> Result<Vec<FindingRow>> {
@@ -225,6 +251,63 @@ impl TryFrom<EvidenceRow> for Evidence {
             observed_at: r.observed_at,
             payload: serde_json::from_str(&r.payload)?,
             provenance: r.provenance,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct EventRow {
+    id: String,
+    session_id: String,
+    provider: String,
+    kind: String,
+    observed_at: String,
+    tool_name: Option<String>,
+    tool_input: Option<String>,
+    tool_response: Option<String>,
+    raw: String,
+}
+
+impl TryFrom<EventRow> for AgentEvent {
+    type Error = StoreError;
+    fn try_from(r: EventRow) -> Result<Self> {
+        Ok(AgentEvent {
+            id: uuid::Uuid::parse_str(&r.id).unwrap_or_default(),
+            session_id: r.session_id,
+            provider: from_tag(&r.provider)?,
+            kind: from_tag(&r.kind)?,
+            observed_at: r.observed_at,
+            tool_name: r.tool_name,
+            tool_input: r.tool_input.map(|s| serde_json::from_str(&s)).transpose()?,
+            tool_response: r
+                .tool_response
+                .map(|s| serde_json::from_str(&s))
+                .transpose()?,
+            raw: serde_json::from_str(&r.raw)?,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct ClaimRow {
+    id: String,
+    session_id: String,
+    source_event_id: String,
+    text: String,
+    subject: String,
+    claimed_at: String,
+}
+
+impl TryFrom<ClaimRow> for Claim {
+    type Error = StoreError;
+    fn try_from(r: ClaimRow) -> Result<Self> {
+        Ok(Claim {
+            id: uuid::Uuid::parse_str(&r.id).unwrap_or_default(),
+            session_id: r.session_id,
+            source_event_id: uuid::Uuid::parse_str(&r.source_event_id).unwrap_or_default(),
+            text: r.text,
+            subject: r.subject,
+            claimed_at: r.claimed_at,
         })
     }
 }
