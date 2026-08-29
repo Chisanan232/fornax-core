@@ -31,8 +31,11 @@ fn dirs_home() -> PathBuf {
 #[derive(Clone)]
 struct AppState {
     store: fornax_store::Store,
-    /// Per-session capabilities, announced once by the adapter. In-memory
-    /// only — capabilities describe the live runtime, not persisted history.
+    /// Per-session capabilities, announced once by the adapter. Also
+    /// persisted to `store` (FORNX-62, `capabilities_for_session`) for
+    /// `export-spool`/replay — kept here in-memory too so FORNX-53/55's
+    /// live-session verdict computation never pays a DB round trip on the
+    /// claim-verification hot path.
     caps: Arc<Mutex<HashMap<String, RuntimeCapabilities>>>,
 }
 
@@ -135,6 +138,7 @@ async fn handle_message(
                 .or_else(|| session_hint.clone());
             if let Some(sid) = sid {
                 *session_hint = Some(sid.clone());
+                state.store.upsert_capabilities(&sid, &caps).await?;
                 state.caps.lock().await.insert(sid, caps);
             }
         }
