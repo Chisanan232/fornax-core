@@ -6,8 +6,8 @@ where they conflict. See `CONTRIBUTING.md` for full development conventions
 
 ## Repository identity
 
-- Repo: `Chisanan232/fornax-core` (personal account; transfer to a dedicated
-  Fornax GitHub Org pending — see FORNX-21). Public OSS.
+- Repo: `horonomy/fornax-core`. Fornax is a Horonomy product — canonical org
+  is `horonomy`, not a dedicated Fornax org. Public OSS.
 - Language: Rust, edition 2021, workspace of crates under `crates/`.
 - Jira: project `FORNX`, epic FORNX-20, discovery thesis HVDL-15.
 - History: `main` was normalized 2026-08-28 (FORNX-52, owner-authorized
