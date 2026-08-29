@@ -34,7 +34,7 @@ fn codex_capabilities() -> RuntimeCapabilities {
     RuntimeCapabilities {
         provider: Provider::Codex,
         supports_pre_tool_use: false,
-        supports_post_tool_use: true, // via rollout exec_command_end, not hooks
+        supports_post_tool_use: true, // via rollout custom_tool_call/_output pairing, not hooks
         supports_tool_response_capture: true,
         supports_session_stop_event: true, // task_complete in rollout
         supports_transcript_tail: true,
@@ -98,6 +98,10 @@ async fn main() -> anyhow::Result<()> {
     let mut session_id: Option<String> = None;
     let mut caps_sent = false;
     let mut offset: u64 = 0;
+    // call_id -> best-effort command text, so a later custom_tool_call_output
+    // can be paired back to the exec it answers (FORNX-55).
+    let mut pending_calls: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
 
     loop {
         if stream.is_none() {
@@ -135,7 +139,7 @@ async fn main() -> anyhow::Result<()> {
                     caps_sent = true;
                 }
 
-                if let Some(msgs) = translate_line(&entry, &sid) {
+                if let Some(msgs) = translate_line(&entry, &sid, &mut pending_calls) {
                     for m in msgs {
                         send(s, &m).await;
                     }
@@ -154,8 +158,95 @@ async fn send(stream: &mut UnixStream, msg: &IngestMessage) {
     }
 }
 
-fn translate_line(entry: &serde_json::Value, session_id: &str) -> Option<Vec<IngestMessage>> {
+fn translate_line(
+    entry: &serde_json::Value,
+    session_id: &str,
+    pending_calls: &mut std::collections::HashMap<String, String>,
+) -> Option<Vec<IngestMessage>> {
     let top_type = entry.get("type").and_then(|v| v.as_str())?;
+
+    // Confirmed against a real `codex exec` turn (codex-cli 0.147.0,
+    // 2026-08-29 live capture, FORNX-55): this installed version never
+    // emits `event_msg{type:"exec_command_end"}` at all — shell execution
+    // is wrapped as a `response_item` pair, `custom_tool_call` (the
+    // invocation) followed later by `custom_tool_call_output` (the
+    // result), matched by `call_id`. Handled here alongside the
+    // `event_msg` path rather than assuming only one wire shape exists.
+    if top_type == "response_item" {
+        let payload = entry.get("payload")?;
+        let sub_type = payload.get("type").and_then(|v| v.as_str())?;
+        return match sub_type {
+            "custom_tool_call" if payload.get("name").and_then(|v| v.as_str()) == Some("exec") => {
+                if let (Some(call_id), Some(input)) = (
+                    payload.get("call_id").and_then(|v| v.as_str()),
+                    payload.get("input").and_then(|v| v.as_str()),
+                ) {
+                    pending_calls.insert(call_id.to_string(), extract_cmd(input));
+                }
+                None
+            }
+            "custom_tool_call_output" => {
+                let call_id = payload.get("call_id").and_then(|v| v.as_str())?;
+                let command = pending_calls.remove(call_id).unwrap_or_default();
+                let output_text: String = payload
+                    .get("output")
+                    .and_then(|v| v.as_array())
+                    .map(|blocks| {
+                        blocks
+                            .iter()
+                            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                            .collect::<Vec<_>>()
+                            .join("")
+                    })
+                    .unwrap_or_default();
+
+                let now = chrono::Utc::now().to_rfc3339();
+                let event_id = Uuid::new_v4();
+                let event = AgentEvent {
+                    id: event_id,
+                    session_id: session_id.to_string(),
+                    provider: Provider::Codex,
+                    kind: EventKind::PostToolUse,
+                    observed_at: now.clone(),
+                    tool_name: Some("exec_command".to_string()),
+                    tool_input: Some(serde_json::json!({"command": command})),
+                    tool_response: Some(payload.clone()),
+                    raw: entry.clone(),
+                };
+                let mut out = vec![IngestMessage::Event(event)];
+
+                // No literal exit code is exposed in this shape at all
+                // (unlike exec_command_end, which at least had the field
+                // even if this adapter's earlier guess for it was moot).
+                // "Script completed" is the only confirmed real success
+                // marker observed so far; a real failing-command capture
+                // to confirm the failure-path marker is still outstanding
+                // (tracked as residual FORNX-55 follow-up) — so an
+                // unrecognized shape produces no Evidence rather than a
+                // guessed verdict in either direction.
+                if output_text.contains("Script completed") {
+                    out.push(IngestMessage::Evidence(Evidence {
+                        id: Uuid::new_v4(),
+                        session_id: session_id.to_string(),
+                        source_event_id: event_id,
+                        kind: EvidenceKind::ExitCode,
+                        observed_at: now,
+                        payload: serde_json::json!({
+                            "command": command,
+                            "exit_code": 0,
+                            "heuristic": true,
+                        }),
+                        provenance:
+                            "codex:rollout:custom_tool_call_output#heuristic:script_completed"
+                                .to_string(),
+                    }));
+                }
+                Some(out)
+            }
+            _ => None,
+        };
+    }
+
     if top_type != "event_msg" {
         return None;
     }
@@ -225,6 +316,40 @@ fn translate_line(entry: &serde_json::Value, session_id: &str) -> Option<Vec<Ing
     }
 }
 
+/// Best-effort extraction of the shell command from a `custom_tool_call`'s
+/// `input`, which is a JS snippet string like
+/// `const r = await tools.exec_command({cmd:"echo hi",workdir:...}); ...`
+/// — not structured JSON. No regex dependency; a small manual scan for the
+/// `cmd:"..."` argument is enough for provenance purposes. Falls back to
+/// the raw input string if the pattern isn't found, rather than dropping
+/// the command entirely.
+fn extract_cmd(input: &str) -> String {
+    if let Some(start) = input.find("cmd:") {
+        let rest = &input[start + 4..];
+        let rest = rest.trim_start();
+        if let Some(quote) = rest.chars().next() {
+            if quote == '"' || quote == '\'' {
+                let body = &rest[1..];
+                let mut result = String::new();
+                let mut chars = body.chars();
+                while let Some(c) = chars.next() {
+                    if c == '\\' {
+                        if let Some(next) = chars.next() {
+                            result.push(next);
+                        }
+                        continue;
+                    }
+                    if c == quote {
+                        return result;
+                    }
+                    result.push(c);
+                }
+            }
+        }
+    }
+    input.to_string()
+}
+
 fn claims_tests_passed(text: &str) -> bool {
     let t = text.to_lowercase();
     (t.contains("test") || t.contains("tests"))
@@ -247,7 +372,8 @@ mod tests {
                 "aggregated_output": "7 failed, 1 passed"
             }
         });
-        let msgs = translate_line(&entry, "sess-1").expect("should translate");
+        let msgs = translate_line(&entry, "sess-1", &mut std::collections::HashMap::new())
+            .expect("should translate");
         assert_eq!(msgs.len(), 2);
         match &msgs[0] {
             IngestMessage::Event(e) => {
@@ -271,7 +397,8 @@ mod tests {
             "type": "event_msg",
             "payload": {"type": "exec_command_end", "command": ["pwd"]}
         });
-        let msgs = translate_line(&entry, "sess-1").expect("should translate");
+        let msgs = translate_line(&entry, "sess-1", &mut std::collections::HashMap::new())
+            .expect("should translate");
         assert_eq!(msgs.len(), 1);
     }
 
@@ -281,7 +408,8 @@ mod tests {
             "type": "event_msg",
             "payload": {"type": "task_complete", "last_agent_message": "All tests passed."}
         });
-        let msgs = translate_line(&entry, "sess-1").expect("should translate");
+        let msgs = translate_line(&entry, "sess-1", &mut std::collections::HashMap::new())
+            .expect("should translate");
         assert_eq!(msgs.len(), 2);
         assert!(matches!(&msgs[1], IngestMessage::Claim(c) if c.subject == "test_result"));
     }
@@ -292,19 +420,78 @@ mod tests {
             "type": "event_msg",
             "payload": {"type": "task_complete", "last_agent_message": "Done, see the diff."}
         });
-        let msgs = translate_line(&entry, "sess-1").expect("should translate");
+        let msgs = translate_line(&entry, "sess-1", &mut std::collections::HashMap::new())
+            .expect("should translate");
         assert_eq!(msgs.len(), 1);
     }
 
     #[test]
     fn non_event_msg_lines_are_ignored() {
         let entry = serde_json::json!({"type": "session_meta", "payload": {"session_id": "s"}});
-        assert!(translate_line(&entry, "sess-1").is_none());
+        assert!(translate_line(&entry, "sess-1", &mut std::collections::HashMap::new()).is_none());
     }
 
     #[test]
     fn unknown_event_msg_subtype_is_ignored() {
         let entry = serde_json::json!({"type": "event_msg", "payload": {"type": "token_count"}});
-        assert!(translate_line(&entry, "sess-1").is_none());
+        assert!(translate_line(&entry, "sess-1", &mut std::collections::HashMap::new()).is_none());
+    }
+
+    #[test]
+    fn custom_tool_call_then_output_correlate_into_heuristic_evidence() {
+        // Confirmed real codex-cli 0.147.0 shapes (2026-08-29 live capture,
+        // FORNX-55): shell exec has no exec_command_end event at all; it is
+        // this response_item pair matched by call_id.
+        let mut pending = std::collections::HashMap::new();
+        let call = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "call_id": "call_1",
+                "name": "exec",
+                "input": "const r = await tools.exec_command({cmd:\"echo hi\",workdir:\"/tmp\"}); text(r.output);\n"
+            }
+        });
+        assert!(translate_line(&call, "sess-1", &mut pending).is_none());
+        assert_eq!(pending.get("call_1").map(String::as_str), Some("echo hi"));
+
+        let output = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "call_1",
+                "output": [
+                    {"type": "input_text", "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"},
+                    {"type": "input_text", "text": "hi\n"}
+                ]
+            }
+        });
+        let msgs = translate_line(&output, "sess-1", &mut pending).expect("should translate");
+        assert_eq!(msgs.len(), 2);
+        assert!(pending.is_empty(), "call_id should be consumed");
+        match &msgs[1] {
+            IngestMessage::Evidence(ev) => {
+                assert_eq!(ev.payload["exit_code"], 0);
+                assert_eq!(ev.payload["command"], "echo hi");
+                assert_eq!(ev.payload["heuristic"], true);
+                assert!(ev.provenance.contains("script_completed"));
+            }
+            other => panic!("expected Evidence, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn custom_tool_call_output_without_recognized_marker_produces_only_event() {
+        let mut pending = std::collections::HashMap::new();
+        let output = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "call_unknown",
+                "output": [{"type": "input_text", "text": "something unexpected\n"}]
+            }
+        });
+        let msgs = translate_line(&output, "sess-1", &mut pending).expect("should translate");
+        assert_eq!(msgs.len(), 1);
     }
 }
