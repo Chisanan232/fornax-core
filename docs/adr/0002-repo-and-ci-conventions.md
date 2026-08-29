@@ -33,9 +33,11 @@ Horonomy GitHub organization
 ```
 
 `fornax-cloud`/`fornax-docs`/`fornax-website`/`fornax-infra` are created when
-their corresponding tickets (FORNX-35+, FORNX-44, FORNX-45) actually need
-them — not speculatively. No separate GitHub organization per Horonomy
-product unless a future explicit owner decision changes this.
+their corresponding tickets actually need them — not speculatively. Always
+verify the current ticket key live in Jira before citing it here; this ADR
+has twice recorded a stale FORNX-<n> mapping after renumbering. No separate
+GitHub organization per Horonomy product unless a future explicit owner
+decision changes this.
 
 ### CI
 
@@ -48,17 +50,27 @@ default. No push-to-deploy for infra — deploy workflows are manual dispatch
 only, per `ophiuchus`'s ADR-0010 amendment (this was a deliberate correction
 there after an unattended-apply incident risk was identified).
 
-### Docs — distributed authoring, no central aggregator (correcting the epic's phrasing)
+### Docs — distributed authoring, centralized publishing (superseded 2026-08-29)
 
-The epic says "distributed authoring + centralized publishing," but the actual
-Horonom precedent (`circinus` ADR-0007, `ophiuchus`) is **one Docusaurus site
-per product** at `<product>.horo.run` with docs at `/docs` on that same site —
-never a separate `docs.*` subdomain, and no repo aggregates another repo's
-docs content. `official-website` only links out via a hand-maintained
-registry; it doesn't pull in docs. Fornax follows this: `fornax.horo.run`
-serves both the marketing surface and `/docs`, until a real constraint forces
-a split. This is stricter than FORNX-45's ticket title implies and should be
-reconciled there rather than re-litigated per PR.
+Originally this ADR picked the `circinus`/`ophiuchus` precedent — one
+Docusaurus site per product, no central aggregator repo. **Superseded by an
+explicit owner directive (2026-08-29)**: Fornax uses a dedicated
+`horonomy/fornax-docs` repo (public) that owns the Docusaurus shell, theme,
+navigation, and centralized build/publish, aggregating content authored
+close to the code (`fornax-core/docs/**`, `fornax-cloud/docs/public/**`) —
+"distributed authoring + centralized publishing" as the epic originally
+specified, not the single-site precedent.
+
+Hosting stays reconciled with the rest of this ADR's one-domain-per-product
+convention: the canonical URL is still `fornax.horo.run/docs` (no separate
+`docs.*` subdomain), it's just that the content serving that path is now
+built and owned by a separate repo rather than living inside
+`fornax-website`'s own codebase. The actual routing (reverse proxy /
+Cloudflare path rule from `fornax.horo.run/docs` to the `fornax-docs`
+deploy) is Beta-infra work (FORNX-43, Cloudflare domain topology) and is not
+implemented yet — recorded here as the intended hostname, not a live deploy.
+
+`fornax-docs` was created and its MVP content shipped under FORNX-45.
 
 ### Terraform / environment isolation
 
@@ -94,8 +106,8 @@ family's `v<version>/<TICKET>/<type>/<slug>` pattern. PR-only to `main`.
 
 ## Consequences
 
-- FORNX-45 (Docs) acceptance criteria should be read as "one site with
-  `/docs`," not two subdomains — flagged for correction when that ticket is
-  picked up.
+- FORNX-45 (Docs) uses a dedicated `fornax-docs` repo per the 2026-08-29
+  owner directive (superseding this ADR's original single-site stance);
+  canonical hostname stays `fornax.horo.run/docs`, routing not yet deployed.
 - FORNX-37 (Neon) uses one project + branches per the epic; the alternative
   two-project pattern is documented here as a known trade-off, not adopted.
