@@ -22,6 +22,12 @@ daemon process, no cloud dependency on the local critical path, immutable
 observation before interpretation, five-state verdict vocabulary never
 collapsed, adapters stay thin.
 
+## Dependency versions
+
+See `docs/adr/0003-dependency-version-policy.md` (applies to every Fornax
+repo, not just this one). Invariant: **latest stable by default; pinned for
+reproducibility; downgrade only with demonstrated compatibility evidence.**
+
 ## Commands
 
 - Build: `cargo build --workspace`
