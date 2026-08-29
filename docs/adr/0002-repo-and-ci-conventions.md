@@ -13,6 +13,30 @@ per concern and records why, so it isn't re-derived per ticket.
 
 ## Decisions
 
+### GitHub organization and repository topology (FORNX-21)
+
+Fornax is a Horonomy product. Canonical org: `horonomy`
+(https://github.com/horonomy) — no dedicated Fornax GitHub organization.
+`fornax-core` was bootstrapped under a personal account and transferred via
+native GitHub repository transfer once this was confirmed (2026-08-29),
+preserving history/PRs/branches/tags.
+
+Repository topology under `horonomy`:
+
+```
+Horonomy GitHub organization
+├── fornax-core       PUBLIC   (this repo — local Rust runtime, adapters, CLI)
+├── fornax-cloud      PRIVATE  (ingest, backend, SaaS frontend)
+├── fornax-docs       PUBLIC   (technical documentation)
+├── fornax-website    PUBLIC   (marketing/product site)
+└── fornax-infra      PRIVATE  (Terraform, deployment config)
+```
+
+`fornax-cloud`/`fornax-docs`/`fornax-website`/`fornax-infra` are created when
+their corresponding tickets (FORNX-35+, FORNX-44, FORNX-45) actually need
+them — not speculatively. No separate GitHub organization per Horonomy
+product unless a future explicit owner decision changes this.
+
 ### CI
 
 Per-build-unit, path-filtered GitHub Actions workflows (not one monolith):

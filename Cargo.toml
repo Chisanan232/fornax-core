@@ -6,7 +6,7 @@ members = ["crates/fornax-types", "crates/fornax-store", "crates/fornax-verify",
 version = "0.0.1"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/Chisanan232/fornax-core"
+repository = "https://github.com/horonomy/fornax-core"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }

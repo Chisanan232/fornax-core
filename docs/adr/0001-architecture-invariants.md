@@ -83,13 +83,15 @@ CLI/local UX, docs/site code with no sensitive operational material.
 Private: SaaS/cloud implementation, production infra/topology, credentials,
 customer data, billing/ops, internal runbooks, proprietary calibration data.
 
-### D9 — Repository/org bootstrap sequencing
+### D9 — Repository/org ownership (corrected)
 
-Dedicated Fornax GitHub Organization creation requires a human browser session
-(no API for org creation under a personal account) — tracked as an open manual
-action on FORNX-21, not a blocker for engineering work. Repos are created under
-the personal account (`Chisanan232/fornax-core`, ...) now and transferred to the
-org later (GitHub repo transfer preserves history/issues/PRs).
+Fornax is a Horonomy product. The canonical GitHub organization is
+`horonomy` (https://github.com/horonomy) — Fornax does not get a dedicated
+standalone GitHub organization. `fornax-core` was bootstrapped under the
+personal account `Chisanan232/fornax-core` and transferred to
+`horonomy/fornax-core` via native GitHub repository transfer (FORNX-21,
+2026-08-29), preserving full history, PRs, branches, and tags. See ADR 0002
+for the full repository topology under `horonomy`.
 
 ## Consequences
 
