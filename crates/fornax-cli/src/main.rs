@@ -22,15 +22,19 @@ enum Commands {
     Status,
     /// Full evidence/finding detail for recent sessions.
     Detail,
-    /// Export one session's events/claims/evidence from the local store into
-    /// a directory-based spool, as one wire-compatible envelope JSON file per
-    /// message (FORNX-60). Reads `$FORNAX_HOME/fornax.db` directly — no
-    /// daemon dependency, so this also works while the daemon is stopped.
+    /// Export one session's events/claims/evidence/capabilities from the
+    /// local store into a directory-based spool, as one wire-compatible
+    /// envelope JSON file per message (FORNX-60, FORNX-62). Reads
+    /// `$FORNAX_HOME/fornax.db` directly — no daemon dependency, so this
+    /// also works while the daemon is stopped.
     ///
     /// Written to `<out>/pending/<id>.json`, matching the layout a consumer
     /// such as fornax-cloud's uploader spool expects: one JSON object per
     /// file, internally tagged with a `"type"` field of `"event"`,
-    /// `"claim"`, or `"evidence"`.
+    /// `"claim"`, `"evidence"`, or `"capabilities"`. A `capabilities` file is
+    /// only emitted when the session has at least one announcement on
+    /// record (FORNX-62) — a session with none produces the same 3-category
+    /// output as before this ticket.
     ExportSpool {
         /// Session id to export.
         #[arg(long)]
@@ -107,10 +111,21 @@ fn write_envelope(
 async fn export_spool(session: &str, out: &std::path::Path) -> anyhow::Result<()> {
     let db_path = fornax_home().join("fornax.db");
     let store = fornax_store::Store::open(&db_path).await?;
+    export_spool_from_store(&store, session, out).await
+}
 
+/// Does the actual read + write work for `export_spool`, taking an
+/// already-open `Store` so it can be exercised in tests without touching
+/// `$FORNAX_HOME` (which is process-global and unsafe to mutate per-test).
+async fn export_spool_from_store(
+    store: &fornax_store::Store,
+    session: &str,
+    out: &std::path::Path,
+) -> anyhow::Result<()> {
     let events = store.events_for_session(session).await?;
     let claims = store.claims_for_session(session).await?;
     let evidence = store.evidence_for_session(session).await?;
+    let capabilities = store.capabilities_for_session(session).await?;
 
     let pending_dir = out.join("pending");
     std::fs::create_dir_all(&pending_dir)?;
@@ -124,12 +139,21 @@ async fn export_spool(session: &str, out: &std::path::Path) -> anyhow::Result<()
     for ev in &evidence {
         write_envelope(&pending_dir, "evidence", ev.id, ev)?;
     }
+    for caps in &capabilities {
+        // RuntimeCapabilities carries no id of its own on the wire (the
+        // cloud backend keys these on (device_id, provider), never on an
+        // envelope id — see fornax-cloud's fornax-uploader::types::IngestMessage
+        // ::canonical_id doc comment) — synthesize one purely for the spool
+        // filename, matching that same convention.
+        write_envelope(&pending_dir, "capabilities", uuid::Uuid::new_v4(), caps)?;
+    }
 
     println!(
-        "exported session {session}: {} event(s), {} claim(s), {} evidence -> {}",
+        "exported session {session}: {} event(s), {} claim(s), {} evidence, {} capabilities -> {}",
         events.len(),
         claims.len(),
         evidence.len(),
+        capabilities.len(),
         pending_dir.display()
     );
     Ok(())
@@ -219,5 +243,174 @@ mod tests {
         assert_eq!(verdict_icon("contradicted"), "🛡 ✕");
         assert_eq!(verdict_icon("review"), "🛡 !");
         assert_eq!(verdict_icon("unavailable"), "🛡 —");
+    }
+
+    // FORNX-62: export-spool must emit a `capabilities` envelope for a
+    // session that received a real Capabilities message, using the FORNX-53
+    // aha-scenario fixture pattern (`caps()`/claim-with-exit-code style)
+    // already established in fornax-verify's test suite.
+    mod export_spool_capabilities {
+        use super::*;
+        use fornax_types::{EventKind, EvidenceKind, Provider, RuntimeCapabilities};
+        use uuid::Uuid;
+
+        fn tmp_db_path(name: &str) -> std::path::PathBuf {
+            std::env::temp_dir().join(format!("fornax-cli-test-{name}-{}.db", Uuid::new_v4()))
+        }
+
+        fn aha_scenario_capabilities() -> RuntimeCapabilities {
+            RuntimeCapabilities {
+                provider: Provider::Codex,
+                supports_pre_tool_use: true,
+                supports_post_tool_use: true,
+                supports_tool_response_capture: true,
+                supports_session_stop_event: true,
+                supports_transcript_tail: true,
+                supports_subagent_lifecycle: false,
+                notes: [("session_id".to_string(), "s-aha".to_string())].into(),
+            }
+        }
+
+        async fn seeded_store(path: &std::path::Path) -> fornax_store::Store {
+            let store = fornax_store::Store::open(path).await.expect("open db");
+
+            let event = fornax_types::AgentEvent {
+                id: Uuid::new_v4(),
+                session_id: "s-aha".into(),
+                provider: Provider::Codex,
+                kind: EventKind::PostToolUse,
+                observed_at: "2026-01-01T00:00:00Z".into(),
+                tool_name: Some("exec_command".into()),
+                tool_input: Some(serde_json::json!(["pytest"])),
+                tool_response: Some(serde_json::json!({"exit_code": 1})),
+                raw: serde_json::json!({"type": "exec_command_end"}),
+            };
+            store.insert_event(&event).await.expect("insert event");
+
+            let evidence = fornax_types::Evidence {
+                id: Uuid::new_v4(),
+                session_id: "s-aha".into(),
+                source_event_id: event.id,
+                kind: EvidenceKind::ExitCode,
+                observed_at: "2026-01-01T00:00:01Z".into(),
+                payload: serde_json::json!({"command": ["pytest"], "exit_code": 1}),
+                provenance: "codex:rollout:exec_command_end".into(),
+            };
+            store
+                .insert_evidence(&evidence)
+                .await
+                .expect("insert evidence");
+
+            let claim = fornax_types::Claim {
+                id: Uuid::new_v4(),
+                session_id: "s-aha".into(),
+                source_event_id: event.id,
+                text: "All tests passed.".into(),
+                subject: "test_result".into(),
+                claimed_at: "2026-01-01T00:00:02Z".into(),
+            };
+            store.insert_claim(&claim).await.expect("insert claim");
+
+            store
+        }
+
+        fn read_pending_types(pending_dir: &std::path::Path) -> Vec<String> {
+            std::fs::read_dir(pending_dir)
+                .expect("read pending dir")
+                .map(|e| e.expect("dir entry"))
+                .map(|e| std::fs::read_to_string(e.path()).expect("read envelope file"))
+                .map(|contents| {
+                    let v: serde_json::Value =
+                        serde_json::from_str(&contents).expect("envelope is valid json");
+                    v["type"].as_str().expect("type field present").to_string()
+                })
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn emits_capabilities_envelope_when_announced() {
+            let db_path = tmp_db_path("with-caps");
+            let store = seeded_store(&db_path).await;
+            store
+                .upsert_capabilities("s-aha", &aha_scenario_capabilities())
+                .await
+                .expect("upsert capabilities");
+
+            let out_dir = std::env::temp_dir().join(format!("fornax-spool-{}", Uuid::new_v4()));
+            export_spool_from_store(&store, "s-aha", &out_dir)
+                .await
+                .expect("export spool");
+
+            let pending_dir = out_dir.join("pending");
+            let types = read_pending_types(&pending_dir);
+            assert_eq!(
+                types.iter().filter(|t| *t == "capabilities").count(),
+                1,
+                "expected exactly one capabilities envelope, got: {types:?}"
+            );
+            assert!(types.contains(&"event".to_string()));
+            assert!(types.contains(&"claim".to_string()));
+            assert!(types.contains(&"evidence".to_string()));
+
+            // The emitted capabilities file must be wire-compatible with
+            // fornax-cloud's fornax-uploader::types::RuntimeCapabilities:
+            // the flat field set below, plus "type" — no extra fields such
+            // as a store-internal session_id/id (the cloud backend keys
+            // capabilities on (device_id, provider), never on an envelope
+            // id — see that crate's IngestMessage::canonical_id doc).
+            let caps_file = std::fs::read_dir(&pending_dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .find(|p| {
+                    let v: serde_json::Value =
+                        serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
+                    v["type"] == "capabilities"
+                })
+                .expect("capabilities file exists");
+            let v: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&caps_file).unwrap()).unwrap();
+            let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                vec![
+                    "notes",
+                    "provider",
+                    "supports_post_tool_use",
+                    "supports_pre_tool_use",
+                    "supports_session_stop_event",
+                    "supports_subagent_lifecycle",
+                    "supports_tool_response_capture",
+                    "supports_transcript_tail",
+                    "type",
+                ]
+            );
+
+            std::fs::remove_file(&db_path).ok();
+            std::fs::remove_dir_all(&out_dir).ok();
+        }
+
+        #[tokio::test]
+        async fn no_capabilities_envelope_when_none_announced() {
+            let db_path = tmp_db_path("without-caps");
+            let store = seeded_store(&db_path).await;
+            // No `upsert_capabilities` call — this session never announced.
+
+            let out_dir = std::env::temp_dir().join(format!("fornax-spool-{}", Uuid::new_v4()));
+            export_spool_from_store(&store, "s-aha", &out_dir)
+                .await
+                .expect("export spool");
+
+            let pending_dir = out_dir.join("pending");
+            let types = read_pending_types(&pending_dir);
+            assert!(
+                !types.contains(&"capabilities".to_string()),
+                "expected no capabilities envelope, got: {types:?}"
+            );
+            assert!(types.contains(&"event".to_string()));
+
+            std::fs::remove_file(&db_path).ok();
+            std::fs::remove_dir_all(&out_dir).ok();
+        }
     }
 }
