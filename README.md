@@ -67,6 +67,23 @@ daemon's HTTP port work the same way — see
 shape and `crates/fornax-adapter-codex` for that adapter's translation
 logic.
 
+## Local storage, privacy and known limitations
+
+Everything above reads/writes under `$FORNAX_HOME` (default `~/.fornax`): an
+on-disk SQLite database, a Unix domain socket, and a localhost-only HTTP API.
+Nothing leaves your machine unless you explicitly turn on cloud sync
+(`FORNAX_CLOUD_SYNC_ENABLED`, see below) — there is no telemetry and no
+hosted Beta/production service to opt out of, because none exists at this
+version. `$FORNAX_HOME`'s on-disk schema is not yet guaranteed stable across
+releases.
+
+Claude Code and Codex CLI support is not symmetric: Codex's hook surface is
+opt-in and can be admin-disabled, so its adapter relies primarily on tailing
+Codex's own rollout-file transcripts rather than hooks — see
+`docs/research/adapter-capability-matrix.md` for the exact, empirically
+verified differences before relying on a specific hook/field existing on the
+Codex side.
+
 ### Exporting a session for cloud sync (optional)
 
 `fornax export-spool` reads `$FORNAX_HOME/fornax.db` directly (no daemon
