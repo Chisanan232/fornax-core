@@ -24,7 +24,7 @@ jobs:
       - name: check workspace has crates
         id: has_crates
         run: |
-          if [ -n "$(find . -mindepth 2 -maxdepth 2 -name Cargo.toml)" ]; then
+          if [ -n "$(find . -mindepth 3 -maxdepth 3 -name Cargo.toml)" ]; then
             echo "present=true" >> "$GITHUB_OUTPUT"
           else
             echo "present=false" >> "$GITHUB_OUTPUT"
@@ -35,6 +35,14 @@ jobs:
       - name: clippy
         if: steps.has_crates.outputs.present == 'true'
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: build workspace binaries
+        if: steps.has_crates.outputs.present == 'true'
+        # Some integration tests (e.g. fornax-daemon's) invoke sibling
+        # workspace binaries by their conventional target/<profile>/<bin>
+        # path rather than CARGO_BIN_EXE_<name> (which Cargo only sets for
+        # bins in the *same* crate as the test) — those binaries must exist
+        # on disk before `cargo test` runs, same as local dev convention.
+        run: cargo build --workspace
       - name: test
         if: steps.has_crates.outputs.present == 'true'
         run: cargo test --workspace
