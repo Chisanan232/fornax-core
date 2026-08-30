@@ -20,3 +20,6 @@ tokio.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+fornax-store = { path = "../fornax-store" }
