@@ -4,7 +4,7 @@
 //! Verifiers must never invent evidence: absent the signal they need, they
 //! return `Unavailable`, not `Verified`.
 
-use fornax_types::{Claim, Evidence, Finding, RuntimeCapabilities, Verdict};
+use fornax_types::{Claim, Evidence, Finding, RuntimeCapabilities, SignalClass, Verdict};
 use uuid::Uuid;
 
 pub trait Verifier {
@@ -52,7 +52,15 @@ impl Verifier for TestResultVerifier {
     fn verify(&self, claim: &Claim, evidence: &[Evidence], caps: &RuntimeCapabilities) -> Finding {
         let now = chrono::Utc::now().to_rfc3339();
 
-        if !caps.supports_post_tool_use && !caps.supports_transcript_tail {
+        // Formalized (FORNX-155) from the old `!caps.supports_post_tool_use
+        // && !caps.supports_transcript_tail` bool check — same two classes,
+        // same gate semantics. Deliberately not widened to also require
+        // `SignalClass::ProcessResult`: this verifier is about exit codes so
+        // that class feels natural to add here, but doing so would silently
+        // change which sessions resolve `Unavailable` today.
+        if !caps.is_observable(&SignalClass::ToolTrace)
+            && !caps.is_observable(&SignalClass::FinalResponse)
+        {
             return unavailable(
                 claim.id,
                 self.name(),
@@ -143,19 +151,63 @@ fn unavailable(claim_id: Uuid, verifier: &str, reason: &str, now: String) -> Fin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fornax_types::{EvidenceKind, Provider};
+    use fornax_types::{CapabilitySignal, EvidenceKind, Provider, SignalAvailability};
 
     fn caps() -> RuntimeCapabilities {
         RuntimeCapabilities {
+            schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
             provider: Provider::Codex,
-            supports_pre_tool_use: true,
-            supports_post_tool_use: true,
-            supports_tool_response_capture: true,
-            supports_session_stop_event: true,
-            supports_transcript_tail: true,
-            supports_subagent_lifecycle: false,
+            signals: vec![
+                CapabilitySignal {
+                    class: SignalClass::ToolInvocation,
+                    state: SignalAvailability::Available,
+                    detail: None,
+                },
+                CapabilitySignal {
+                    class: SignalClass::ToolTrace,
+                    state: SignalAvailability::Available,
+                    detail: None,
+                },
+                CapabilitySignal {
+                    class: SignalClass::ToolResultPayload,
+                    state: SignalAvailability::Available,
+                    detail: None,
+                },
+                CapabilitySignal {
+                    class: SignalClass::SessionLifecycle,
+                    state: SignalAvailability::Available,
+                    detail: None,
+                },
+                CapabilitySignal {
+                    class: SignalClass::FinalResponse,
+                    state: SignalAvailability::Available,
+                    detail: None,
+                },
+                CapabilitySignal {
+                    class: SignalClass::SubagentLifecycle,
+                    state: SignalAvailability::Unsupported,
+                    detail: None,
+                },
+            ],
             notes: Default::default(),
         }
+    }
+
+    fn with_state(
+        mut c: RuntimeCapabilities,
+        class: SignalClass,
+        state: SignalAvailability,
+    ) -> RuntimeCapabilities {
+        if let Some(s) = c.signals.iter_mut().find(|s| s.class == class) {
+            s.state = state;
+        } else {
+            c.signals.push(CapabilitySignal {
+                class,
+                state,
+                detail: None,
+            });
+        }
+        c
     }
 
     fn evidence_with_exit_code(code: i64) -> Evidence {
@@ -213,10 +265,57 @@ mod tests {
         let v = TestResultVerifier;
         let c = claim("All tests passed.");
         let mut no_caps = caps();
-        no_caps.supports_post_tool_use = false;
-        no_caps.supports_transcript_tail = false;
+        no_caps = with_state(no_caps, SignalClass::ToolTrace, SignalAvailability::Unknown);
+        no_caps = with_state(
+            no_caps,
+            SignalClass::FinalResponse,
+            SignalAvailability::Unknown,
+        );
         let f = v.verify(&c, &[], &no_caps);
         assert_eq!(f.verdict, Verdict::Unavailable);
+    }
+
+    /// FORNX-155 AC4 regression: deserializing the exact pre-formalization
+    /// flat-bool JSON shape for every combination of the two classes this
+    /// verifier's gate consults must still produce the pre-change verdict.
+    /// This is the proof that the formalization changed no externally
+    /// observable behavior, not just that the two hand-built fixtures above
+    /// happen to agree.
+    #[test]
+    fn legacy_bool_shapes_reproduce_pre_formalization_verdicts_for_every_combination() {
+        let v = TestResultVerifier;
+        let ev = vec![evidence_with_exit_code(0)];
+
+        for (post_tool_use, transcript_tail) in
+            [(true, true), (true, false), (false, true), (false, false)]
+        {
+            let json = format!(
+                r#"{{"provider":"codex","supports_pre_tool_use":true,
+                "supports_post_tool_use":{post_tool_use},
+                "supports_tool_response_capture":true,
+                "supports_session_stop_event":true,
+                "supports_transcript_tail":{transcript_tail},
+                "supports_subagent_lifecycle":false,"notes":{{}}}}"#
+            );
+            let caps: RuntimeCapabilities = serde_json::from_str(&json).unwrap();
+            let c = claim("All tests passed.");
+            let f = v.verify(&c, &ev, &caps);
+
+            let expect_available = post_tool_use || transcript_tail;
+            if expect_available {
+                assert_eq!(
+                    f.verdict,
+                    Verdict::Verified,
+                    "post_tool_use={post_tool_use} transcript_tail={transcript_tail}"
+                );
+            } else {
+                assert_eq!(
+                    f.verdict,
+                    Verdict::Unavailable,
+                    "post_tool_use={post_tool_use} transcript_tail={transcript_tail}"
+                );
+            }
+        }
     }
 
     #[test]
