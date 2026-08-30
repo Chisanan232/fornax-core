@@ -97,6 +97,16 @@ see zero events with no error, not a loud failure); and `dispose()` calls
 `child.stdin.end()` without first waiting for any already-queued writes to
 flush.
 
+**Update (FORNX-291):** this transport leg has since been run live
+end-to-end and both concrete failure modes above were checked directly —
+see `docs/research/0003-opencode-live-transport-verification.md`. The
+`child.stdin.write` case turned out not to throw synchronously in practice,
+but the closely related `spawn()` failure path did: an unhandled `'error'`
+event on the child process crashed the *host opencode process itself*
+(this plugin runs in-process), which is a more serious version of the
+concern raised here. Fixed in that ticket; an automated regression now
+covers it (`crates/fornax-adapter-opencode/tests/live_transport.rs`).
+
 ## Guardrail judgment call, disclosed explicitly
 
 The ticket's guardrails said: "If you discover mid-task that opencode's

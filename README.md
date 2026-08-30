@@ -72,11 +72,16 @@ opencode monitoring uses a third, distinct mechanism: an in-process
 `@opencode-ai/plugin` (`crates/fornax-adapter-opencode/plugin/fornax-capture.js`)
 that opencode's own runtime invokes synchronously, forwarding each hook
 event to the long-lived `fornax-hook-opencode` binary over stdin. Enable it
-by adding the plugin path to an opencode project's `opencode.json`
-(`{"plugin": ["<path>/fornax-capture.js"]}`) with `fornax-hook-opencode` on
-`PATH` — see `crates/fornax-adapter-opencode` and
+by putting the plugin file (or a path to it) where opencode loads plugins
+from — either project-local at `.opencode/plugin/fornax-capture.js`, or
+referenced by path in an opencode project's `opencode.json`
+(`{"plugin": ["<path>/fornax-capture.js"]}`) — with `fornax-hook-opencode` on
+`PATH`. See `crates/fornax-adapter-opencode` and
 `docs/research/0002-third-provider-fitness-report.md` for the full design
-and its capability gaps versus Claude Code/Codex.
+and its capability gaps versus Claude Code/Codex, and
+`docs/research/0003-opencode-live-transport-verification.md` (FORNX-291) for
+the real end-to-end run that proved this transport leg and the one bug it
+surfaced (fixed).
 
 ## Local storage, privacy and known limitations
 
