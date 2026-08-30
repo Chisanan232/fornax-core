@@ -16,12 +16,14 @@ pub mod adapter;
 pub mod capabilities;
 pub mod privacy;
 pub mod redact;
+pub mod sensor;
 
 pub use adapter::{AgentAdapter, NormalizationOutcome};
 pub use capabilities::{
     CapabilityProbe, CapabilitySignal, LegacyCapabilitiesWire, RuntimeCapabilities,
     SignalAvailability, SignalClass, CAPABILITY_SCHEMA_VERSION,
 };
+pub use sensor::{EvidenceSensor, EvidenceSource, SensorOutcome, TrustClass};
 
 /// Which coding-agent runtime an event/capability originated from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -106,6 +108,11 @@ pub struct Evidence {
     pub payload: serde_json::Value,
     /// Human-readable provenance, e.g. "claude_code:PostToolUse:Bash#tool_response".
     pub provenance: String,
+    /// Structured sensor/trust provenance (FORNX-157). `None` means this
+    /// evidence predates the sensor contract or was produced by code not
+    /// yet migrated onto it — see `sensor::EvidenceSource`'s doc comment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<sensor::EvidenceSource>,
 }
 
 /// The five-state verdict vocabulary (HVDL-15 / FORNX-20). Never collapsed

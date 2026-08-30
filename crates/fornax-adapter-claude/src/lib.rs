@@ -5,7 +5,8 @@
 
 use fornax_types::{
     AgentAdapter, AgentEvent, CapabilityProbe, Claim, EventKind, Evidence, EvidenceKind,
-    IngestMessage, NormalizationOutcome, Provider, RuntimeCapabilities,
+    EvidenceSensor, EvidenceSource, IngestMessage, NormalizationOutcome, Provider,
+    RuntimeCapabilities, SensorOutcome, SignalAvailability, SignalClass, TrustClass,
 };
 use uuid::Uuid;
 
@@ -125,6 +126,151 @@ fn stamped_capabilities(adapter: &ClaudeAdapter, session_id: &str) -> RuntimeCap
     caps
 }
 
+/// FORNX-157: formalizes what this adapter has always done inline —
+/// extracting a heuristic exit code from a Claude Code Bash `tool_response`
+/// — as an `EvidenceSensor`. The heuristic itself is byte-for-byte the same
+/// as before this migration (see the `tests` module's existing exit-code
+/// tests, whose assertions were left untouched as the before/after
+/// regression proof).
+///
+/// Carries `adapter_version` as a field (rather than a trait parameter,
+/// which `EvidenceSensor::collect`'s fixed signature has no room for) so
+/// its provenance strings keep embedding it, exactly as `translate` did
+/// before this migration.
+struct ClaudeBashExitCodeSensor {
+    adapter_version: &'static str,
+}
+
+impl EvidenceSensor for ClaudeBashExitCodeSensor {
+    fn name(&self) -> &'static str {
+        "claude_bash_exit_code_sensor_v1"
+    }
+
+    fn required_capabilities(&self) -> &'static [SignalClass] {
+        &[SignalClass::ToolResultPayload]
+    }
+
+    fn trust_class(&self) -> TrustClass {
+        // Claude Code's own tool_response is the provider's account of what
+        // happened, not something Fornax measured itself.
+        TrustClass::AgentAdjacent
+    }
+
+    // `caps` is intentionally unused: gating this sensor on
+    // `ToolResultPayload` being confirmed `Available` would change which
+    // sessions produce evidence today (a behavior change this migration
+    // must not introduce). The real adapter only ever calls `collect` on a
+    // live Claude Code PostToolUse event, where this capability is always
+    // available in practice.
+    fn collect(&self, event: &AgentEvent, _caps: &RuntimeCapabilities) -> SensorOutcome {
+        if event.kind != EventKind::PostToolUse || event.tool_name.as_deref() != Some("Bash") {
+            return SensorOutcome::not_collected(
+                SignalAvailability::Unknown,
+                Some("not a Bash PostToolUse event".to_string()),
+            );
+        }
+        let Some(resp) = &event.tool_response else {
+            return SensorOutcome::not_collected(
+                SignalAvailability::Unavailable,
+                Some("no tool_response present on this event".to_string()),
+            );
+        };
+
+        // Field name is not stable across CC versions (see
+        // docs/research/adapter-capability-matrix.md); check a small set of
+        // plausible keys rather than assume one.
+        let explicit_code = ["exit_code", "exitCode", "returncode", "status"]
+            .iter()
+            .find_map(|k| resp.get(k).and_then(|v| v.as_i64()));
+
+        // Confirmed against a real Claude Code v2.1.238 transcript
+        // (2026-08-29): the Bash tool_response never carries any of the
+        // keys above — it is {stdout, stderr, interrupted, isImage,
+        // noOutputExpected}. Fall back to a heuristic derived from that
+        // shape so Evidence is still produced, and mark its provenance as
+        // heuristic (not authoritative) rather than silently fabricating a
+        // real exit code.
+        let (code, provenance) = match explicit_code {
+            Some(code) => (
+                Some(code),
+                format!(
+                    "claude_code:{v}:PostToolUse:Bash#tool_response",
+                    v = self.adapter_version
+                ),
+            ),
+            None => {
+                let interrupted = resp
+                    .get("interrupted")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let stderr_nonempty = resp
+                    .get("stderr")
+                    .and_then(|v| v.as_str())
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false);
+                if interrupted {
+                    (
+                        Some(130),
+                        format!(
+                            "claude_code:{v}:PostToolUse:Bash#heuristic:interrupted",
+                            v = self.adapter_version
+                        ),
+                    )
+                } else if stderr_nonempty {
+                    (
+                        Some(1),
+                        format!(
+                            "claude_code:{v}:PostToolUse:Bash#heuristic:stderr_nonempty",
+                            v = self.adapter_version
+                        ),
+                    )
+                } else if resp.get("stdout").is_some() {
+                    (
+                        Some(0),
+                        format!(
+                            "claude_code:{v}:PostToolUse:Bash#heuristic:stderr_empty",
+                            v = self.adapter_version
+                        ),
+                    )
+                } else {
+                    (None, String::new())
+                }
+            }
+        };
+
+        let Some(code) = code else {
+            return SensorOutcome::not_collected(
+                SignalAvailability::Unavailable,
+                Some("no recognizable exit-code shape in tool_response".to_string()),
+            );
+        };
+
+        SensorOutcome::collected(vec![Evidence {
+            id: Uuid::new_v4(),
+            session_id: event.session_id.clone(),
+            source_event_id: event.id,
+            kind: EvidenceKind::ExitCode,
+            observed_at: event.observed_at.clone(),
+            payload: serde_json::json!({
+                "command": event
+                    .tool_input
+                    .as_ref()
+                    .and_then(|ti| ti.get("command"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                "exit_code": code,
+                "heuristic": explicit_code.is_none(),
+            }),
+            provenance,
+            source: Some(EvidenceSource::now(
+                self.name(),
+                self.trust_class(),
+                Some(Provider::ClaudeCode),
+            )),
+        }])
+    }
+}
+
 fn translate(
     adapter: &ClaudeAdapter,
     session_hint: &str,
@@ -194,92 +340,24 @@ fn translate(
     // while proving FORNX-34 against live Claude Code data: without it,
     // the daemon never learns this session can expose exit-code evidence,
     // and every claim resolves Unavailable regardless of Evidence present.
+    let caps = stamped_capabilities(adapter, &session_id);
     let mut out = vec![
-        IngestMessage::Capabilities(stamped_capabilities(adapter, &session_id)),
-        IngestMessage::Event(event),
+        IngestMessage::Capabilities(caps.clone()),
+        IngestMessage::Event(event.clone()),
     ];
 
     // PostToolUse for a Bash call: if Claude Code's tool_response carries an
-    // exit-code-shaped field, extract it as Evidence. Field name is not
-    // stable across CC versions (see docs/research/adapter-capability-matrix.md);
-    // check a small set of plausible keys rather than assume one.
+    // exit-code-shaped field, extract it as Evidence. Formalized (FORNX-157)
+    // as a `ClaudeBashExitCodeSensor` implementing `EvidenceSensor` — see
+    // that type for the unchanged heuristic (proven by the `tests` module's
+    // existing exit-code tests, whose assertions were not touched by this
+    // change).
     if kind == EventKind::PostToolUse && tool_name.as_deref() == Some("Bash") {
-        if let Some(resp) = &tool_response {
-            let explicit_code = ["exit_code", "exitCode", "returncode", "status"]
-                .iter()
-                .find_map(|k| resp.get(k).and_then(|v| v.as_i64()));
-
-            // Confirmed against a real Claude Code v2.1.238 transcript
-            // (2026-08-29): the Bash tool_response never carries any of the
-            // keys above — it is {stdout, stderr, interrupted, isImage,
-            // noOutputExpected}. Fall back to a heuristic derived from that
-            // shape so Evidence is still produced, and mark its provenance
-            // as heuristic (not authoritative) rather than silently
-            // fabricating a real exit code.
-            let (code, provenance) = match explicit_code {
-                Some(code) => (
-                    Some(code),
-                    format!(
-                        "claude_code:{adapter_version}:PostToolUse:Bash#tool_response",
-                        adapter_version = adapter.adapter_version()
-                    ),
-                ),
-                None => {
-                    let interrupted = resp
-                        .get("interrupted")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    let stderr_nonempty = resp
-                        .get("stderr")
-                        .and_then(|v| v.as_str())
-                        .map(|s| !s.trim().is_empty())
-                        .unwrap_or(false);
-                    if interrupted {
-                        (
-                            Some(130),
-                            format!(
-                                "claude_code:{v}:PostToolUse:Bash#heuristic:interrupted",
-                                v = adapter.adapter_version()
-                            ),
-                        )
-                    } else if stderr_nonempty {
-                        (
-                            Some(1),
-                            format!(
-                                "claude_code:{v}:PostToolUse:Bash#heuristic:stderr_nonempty",
-                                v = adapter.adapter_version()
-                            ),
-                        )
-                    } else if resp.get("stdout").is_some() {
-                        (
-                            Some(0),
-                            format!(
-                                "claude_code:{v}:PostToolUse:Bash#heuristic:stderr_empty",
-                                v = adapter.adapter_version()
-                            ),
-                        )
-                    } else {
-                        (None, String::new())
-                    }
-                }
-            };
-
-            if let Some(code) = code {
-                out.push(IngestMessage::Evidence(Evidence {
-                    id: Uuid::new_v4(),
-                    session_id: session_id.clone(),
-                    source_event_id: event_id,
-                    kind: EvidenceKind::ExitCode,
-                    observed_at: now.clone(),
-                    payload: serde_json::json!({
-                        "command": tool_input_command(raw),
-                        "exit_code": code,
-                        "heuristic": explicit_code.is_none(),
-                    }),
-                    provenance,
-                }));
-            }
-        }
+        let sensor = ClaudeBashExitCodeSensor {
+            adapter_version: adapter.adapter_version(),
+        };
+        let outcome = sensor.collect(&event, &caps);
+        out.extend(outcome.evidence.into_iter().map(IngestMessage::Evidence));
     }
 
     // Stop: best-effort claim extraction from the transcript's last
@@ -313,13 +391,6 @@ fn fornax_verify_claims_tests_passed(text: &str) -> bool {
     (t.contains("test") || t.contains("tests"))
         && (t.contains("passed") || t.contains("succeeded") || t.contains("all green"))
         && !t.contains("failed")
-}
-
-fn tool_input_command(raw: &serde_json::Value) -> serde_json::Value {
-    raw.get("tool_input")
-        .and_then(|ti| ti.get("command"))
-        .cloned()
-        .unwrap_or(serde_json::Value::Null)
 }
 
 fn last_assistant_text(raw: &serde_json::Value) -> Option<String> {
@@ -403,6 +474,60 @@ mod tests {
             }
             other => panic!("expected Evidence, got {other:?}"),
         }
+    }
+
+    /// FORNX-157: proves the exit-code evidence path now also carries
+    /// structured `EvidenceSource`/trust-class metadata, on top of the
+    /// unmodified provenance/payload assertions above (which are the
+    /// before/after behavior-preservation proof for the migration onto
+    /// `ClaudeBashExitCodeSensor`).
+    #[test]
+    fn post_tool_use_bash_evidence_carries_sensor_source_metadata() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "sess-1",
+            "tool_name": "Bash",
+            "tool_input": {"command": "pytest"},
+            "tool_response": {"exit_code": 1}
+        });
+        let msgs = normalize(&raw).into_messages();
+        match &msgs[2] {
+            IngestMessage::Evidence(ev) => {
+                let source = ev
+                    .source
+                    .as_ref()
+                    .expect("sensor-produced evidence must carry source");
+                assert_eq!(source.sensor_name, "claude_bash_exit_code_sensor_v1");
+                assert_eq!(source.trust_class, fornax_types::TrustClass::AgentAdjacent);
+                assert_eq!(source.provider, Some(Provider::ClaudeCode));
+            }
+            other => panic!("expected Evidence, got {other:?}"),
+        }
+    }
+
+    /// FORNX-157: the sensor is directly unit-testable in isolation from
+    /// `normalize()`'s hook-JSON plumbing, given only a canonical
+    /// `AgentEvent` — proving the "adapters consume canonical types, not
+    /// raw transport" boundary holds on the collection side too.
+    #[test]
+    fn claude_bash_exit_code_sensor_reports_unavailable_with_no_tool_response() {
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "sess-1".into(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: Some("Bash".into()),
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        let sensor = ClaudeBashExitCodeSensor {
+            adapter_version: ADAPTER_VERSION,
+        };
+        let outcome = sensor.collect(&event, &ClaudeAdapter.probe());
+        assert!(!outcome.has_evidence());
+        assert_eq!(outcome.state, SignalAvailability::Unavailable);
     }
 
     #[test]

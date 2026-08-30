@@ -143,9 +143,10 @@ impl Store {
     }
 
     pub async fn insert_evidence(&self, ev: &Evidence) -> Result<()> {
+        let source = ev.source.as_ref().map(serde_json::to_string).transpose()?;
         sqlx::query(
-            "INSERT INTO evidence (id, session_id, source_event_id, kind, observed_at, payload, provenance)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO evidence (id, session_id, source_event_id, kind, observed_at, payload, provenance, source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )
         .bind(ev.id.to_string())
         .bind(&ev.session_id)
@@ -154,6 +155,7 @@ impl Store {
         .bind(&ev.observed_at)
         .bind(ev.payload.to_string())
         .bind(&ev.provenance)
+        .bind(source)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -180,7 +182,7 @@ impl Store {
     /// needs alongside a claim.
     pub async fn evidence_for_session(&self, session_id: &str) -> Result<Vec<Evidence>> {
         let rows = sqlx::query_as::<_, EvidenceRow>(
-            "SELECT id, session_id, source_event_id, kind, observed_at, payload, provenance
+            "SELECT id, session_id, source_event_id, kind, observed_at, payload, provenance, source
              FROM evidence WHERE session_id = ?1 ORDER BY observed_at ASC",
         )
         .bind(session_id)
@@ -310,6 +312,11 @@ struct EvidenceRow {
     observed_at: String,
     payload: String,
     provenance: String,
+    /// `NULL` for any row written before FORNX-157's 0004 migration, or by
+    /// code not yet migrated onto the `EvidenceSensor` contract — reads
+    /// back as `Evidence::source == None`, not a fabricated value (see
+    /// `migrations/0004_evidence_source.sql`).
+    source: Option<String>,
 }
 
 impl TryFrom<EvidenceRow> for Evidence {
@@ -323,6 +330,7 @@ impl TryFrom<EvidenceRow> for Evidence {
             observed_at: r.observed_at,
             payload: serde_json::from_str(&r.payload)?,
             provenance: r.provenance,
+            source: r.source.map(|s| serde_json::from_str(&s)).transpose()?,
         })
     }
 }
@@ -545,6 +553,12 @@ mod tests {
             observed_at: "2026-01-01T00:00:01Z".into(),
             payload: serde_json::json!({"command": ["pytest"], "exit_code": 1}),
             provenance: "test".into(),
+            source: Some(fornax_types::EvidenceSource {
+                sensor_name: "test_sensor_v1".into(),
+                trust_class: fornax_types::TrustClass::HostObserved,
+                collected_at: "2026-01-01T00:00:01Z".into(),
+                provider: Some(Provider::Codex),
+            }),
         };
         store
             .insert_evidence(&evidence)
@@ -582,6 +596,9 @@ mod tests {
         assert_eq!(fetched_evidence.len(), 1);
         assert_eq!(fetched_evidence[0].id, evidence.id);
         assert_eq!(fetched_evidence[0].payload["exit_code"], 1);
+        // FORNX-157: structured EvidenceSource/trust-class metadata must
+        // survive the local persistence round trip byte-for-byte.
+        assert_eq!(fetched_evidence[0].source, evidence.source);
 
         let recent = store.recent_findings(10).await.expect("query findings");
         assert_eq!(recent.len(), 1);
@@ -788,6 +805,50 @@ mod tests {
             fetched[0].state_of(&fornax_types::SignalClass::ProcessResult),
             fornax_types::SignalAvailability::Unknown
         );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// FORNX-157: a row written before the 0004 migration (or by code not
+    /// yet migrated onto `EvidenceSensor`) has `source IS NULL`. It must
+    /// still read back cleanly, with `Evidence::source == None` — not a
+    /// fabricated value and not a query error. Mirrors
+    /// `pre_migration_row_with_null_signals_reconstructs_from_legacy_bools`'s
+    /// hand-insert pattern for `runtime_capabilities`.
+    #[tokio::test]
+    async fn pre_migration_evidence_row_with_null_source_reads_back_as_none() {
+        let path = tmp_db_path("evidence-pre-migration");
+        let store = Store::open(&path).await.expect("open db");
+
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "s6".into(),
+            provider: Provider::Codex,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: Some("exec_command".into()),
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        store.insert_event(&event).await.expect("insert event");
+
+        sqlx::query(
+            "INSERT INTO evidence (id, session_id, source_event_id, kind, observed_at, payload, provenance)
+             VALUES (?1, 's6', ?2, 'exit_code', '2026-01-01T00:00:01Z', '{\"exit_code\":0}', 'legacy')",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(event.id.to_string())
+        .execute(&store.pool)
+        .await
+        .expect("hand-insert pre-migration evidence row with no source column value");
+
+        let fetched = store
+            .evidence_for_session("s6")
+            .await
+            .expect("query evidence");
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].source, None);
 
         std::fs::remove_file(&path).ok();
     }
