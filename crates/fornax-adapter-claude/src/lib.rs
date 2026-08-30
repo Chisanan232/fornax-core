@@ -4,8 +4,8 @@
 //! JSON into canonical `fornax_types::IngestMessage`s.
 
 use fornax_types::{
-    AgentAdapter, AgentEvent, CapabilityProbe, Claim, EventKind, Evidence, EvidenceKind,
-    EvidenceSensor, EvidenceSource, IngestMessage, NormalizationOutcome, Provider,
+    AgentAdapter, AgentEvent, CapabilityProbe, Claim, CollectionMethod, EventKind, Evidence,
+    EvidenceKind, EvidenceSensor, EvidenceSource, IngestMessage, NormalizationOutcome, Provider,
     RuntimeCapabilities, SensorOutcome, SignalAvailability, SignalClass, TrustClass,
 };
 use uuid::Uuid;
@@ -156,6 +156,18 @@ impl EvidenceSensor for ClaudeBashExitCodeSensor {
         TrustClass::AgentAdjacent
     }
 
+    fn collection_method(&self) -> CollectionMethod {
+        // PostToolUse fires as an in-process hook callback invoked by
+        // Claude Code around the Bash call — distinct from Codex's
+        // rollout-file-poll sensors, which share the same trust class (see
+        // `fornax_types::sensor`'s module docs' worked example).
+        CollectionMethod::HookCallback
+    }
+
+    fn collector_version(&self) -> Option<String> {
+        Some(self.adapter_version.to_string())
+    }
+
     // `caps` is intentionally unused: gating this sensor on
     // `ToolResultPayload` being confirmed `Available` would change which
     // sessions produce evidence today (a behavior change this migration
@@ -266,6 +278,8 @@ impl EvidenceSensor for ClaudeBashExitCodeSensor {
                 self.name(),
                 self.trust_class(),
                 Some(Provider::ClaudeCode),
+                self.collection_method(),
+                self.collector_version(),
             )),
             extension: None,
         }])
