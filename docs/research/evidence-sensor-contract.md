@@ -158,8 +158,7 @@ version is the same shape, extra keys" reasoning `0005-schema-evolution.md`
 already established for `ExtensionEnvelope`'s unknown-field tolerance. A new
 column would duplicate data already inside the existing blob.
 
-### Honesty on old data (FORNX-159 AC: "existing evidence is migrated with
-honest defaults/unknowns where history lacks detail")
+### Honesty on old data (FORNX-159 AC: "existing evidence is migrated with honest defaults/unknowns where history lacks detail")
 
 `Evidence::source == None` (a pre-FORNX-157 record, or code never migrated
 onto the sensor contract) is unaffected — still reads back as `None`, same
