@@ -422,6 +422,22 @@ fn claims_tests_passed(text: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// FORNX-155 AC4: the real `codex_capabilities()` this adapter sends,
+    /// projected through the legacy wire shape (what `fornax-cli
+    /// export-spool` actually emits), must reproduce the exact six bool
+    /// values this adapter declared before the formalization — not just a
+    /// hand-built fixture that happens to agree.
+    #[test]
+    fn codex_capabilities_legacy_projection_matches_pre_formalization_bools() {
+        let legacy = fornax_types::LegacyCapabilitiesWire::from(&codex_capabilities());
+        assert!(!legacy.supports_pre_tool_use);
+        assert!(legacy.supports_post_tool_use);
+        assert!(legacy.supports_tool_response_capture);
+        assert!(legacy.supports_session_stop_event);
+        assert!(legacy.supports_transcript_tail);
+        assert!(!legacy.supports_subagent_lifecycle);
+    }
+
     #[test]
     fn exec_command_end_with_nonzero_exit_produces_event_and_evidence() {
         let entry = serde_json::json!({

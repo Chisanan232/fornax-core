@@ -332,6 +332,22 @@ mod tests {
     use super::*;
     use fornax_types::{EventKind, IngestMessage, Provider};
 
+    /// FORNX-155 AC4: the real `claude_capabilities()` this adapter sends,
+    /// projected through the legacy wire shape (what `fornax-cli
+    /// export-spool` actually emits), must reproduce the exact six bool
+    /// values this adapter declared before the formalization — not just a
+    /// hand-built fixture that happens to agree.
+    #[test]
+    fn claude_capabilities_legacy_projection_matches_pre_formalization_bools() {
+        let legacy = fornax_types::LegacyCapabilitiesWire::from(&claude_capabilities("sess-1"));
+        assert!(legacy.supports_pre_tool_use);
+        assert!(legacy.supports_post_tool_use);
+        assert!(legacy.supports_tool_response_capture);
+        assert!(legacy.supports_session_stop_event);
+        assert!(legacy.supports_transcript_tail);
+        assert!(legacy.supports_subagent_lifecycle);
+    }
+
     #[test]
     fn post_tool_use_bash_with_exit_code_produces_event_and_evidence() {
         let raw = serde_json::json!({
