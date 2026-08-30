@@ -144,9 +144,14 @@ impl Store {
 
     pub async fn insert_evidence(&self, ev: &Evidence) -> Result<()> {
         let source = ev.source.as_ref().map(serde_json::to_string).transpose()?;
+        let extension = ev
+            .extension
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         sqlx::query(
-            "INSERT INTO evidence (id, session_id, source_event_id, kind, observed_at, payload, provenance, source)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO evidence (id, session_id, source_event_id, kind, observed_at, payload, provenance, source, extension)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )
         .bind(ev.id.to_string())
         .bind(&ev.session_id)
@@ -156,6 +161,7 @@ impl Store {
         .bind(ev.payload.to_string())
         .bind(&ev.provenance)
         .bind(source)
+        .bind(extension)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -182,7 +188,7 @@ impl Store {
     /// needs alongside a claim.
     pub async fn evidence_for_session(&self, session_id: &str) -> Result<Vec<Evidence>> {
         let rows = sqlx::query_as::<_, EvidenceRow>(
-            "SELECT id, session_id, source_event_id, kind, observed_at, payload, provenance, source
+            "SELECT id, session_id, source_event_id, kind, observed_at, payload, provenance, source, extension
              FROM evidence WHERE session_id = ?1 ORDER BY observed_at ASC",
         )
         .bind(session_id)
@@ -317,6 +323,11 @@ struct EvidenceRow {
     /// back as `Evidence::source == None`, not a fabricated value (see
     /// `migrations/0004_evidence_source.sql`).
     source: Option<String>,
+    /// `NULL` for any row with no provider-extension data (the common
+    /// case) or written before FORNX-158's 0005 migration — reads back as
+    /// `Evidence::extension == None` (see
+    /// `migrations/0005_evidence_extension.sql`).
+    extension: Option<String>,
 }
 
 impl TryFrom<EvidenceRow> for Evidence {
@@ -331,6 +342,7 @@ impl TryFrom<EvidenceRow> for Evidence {
             payload: serde_json::from_str(&r.payload)?,
             provenance: r.provenance,
             source: r.source.map(|s| serde_json::from_str(&s)).transpose()?,
+            extension: r.extension.map(|s| serde_json::from_str(&s)).transpose()?,
         })
     }
 }
@@ -559,6 +571,7 @@ mod tests {
                 collected_at: "2026-01-01T00:00:01Z".into(),
                 provider: Some(Provider::Codex),
             }),
+            extension: None,
         };
         store
             .insert_evidence(&evidence)
@@ -849,6 +862,115 @@ mod tests {
             .expect("query evidence");
         assert_eq!(fetched.len(), 1);
         assert_eq!(fetched[0].source, None);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// FORNX-158: a row written before the 0005 migration (or with no
+    /// provider-extension data at all, the common case) has `extension IS
+    /// NULL`. It must read back cleanly as `Evidence::extension == None`,
+    /// not a fabricated value or a query error. Mirrors
+    /// `pre_migration_evidence_row_with_null_source_reads_back_as_none`.
+    #[tokio::test]
+    async fn pre_migration_evidence_row_with_null_extension_reads_back_as_none() {
+        let path = tmp_db_path("evidence-extension-pre-migration");
+        let store = Store::open(&path).await.expect("open db");
+
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "s7".into(),
+            provider: Provider::Codex,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: Some("exec_command".into()),
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        store.insert_event(&event).await.expect("insert event");
+
+        sqlx::query(
+            "INSERT INTO evidence (id, session_id, source_event_id, kind, observed_at, payload, provenance)
+             VALUES (?1, 's7', ?2, 'exit_code', '2026-01-01T00:00:01Z', '{\"exit_code\":0}', 'legacy')",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(event.id.to_string())
+        .execute(&store.pool)
+        .await
+        .expect("hand-insert pre-migration evidence row with no extension column value");
+
+        let fetched = store
+            .evidence_for_session("s7")
+            .await
+            .expect("query evidence");
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].extension, None);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// FORNX-158 required test: an unknown top-level field on an
+    /// `ExtensionEnvelope`, within a compatible `schema_version`, must
+    /// survive the SQLite store round trip (insert -> read back ->
+    /// re-serialize), not just an in-memory serde round trip — this is
+    /// where a naive "deserialize into a fixed struct" implementation would
+    /// actually drop it.
+    #[tokio::test]
+    async fn evidence_extension_unknown_field_survives_store_round_trip() {
+        let path = tmp_db_path("evidence-extension-unknown-field");
+        let store = Store::open(&path).await.expect("open db");
+
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "s8".into(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: Some("Bash".into()),
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        store.insert_event(&event).await.expect("insert event");
+
+        let mut extension = fornax_types::ExtensionEnvelope::new(
+            Provider::ClaudeCode,
+            "claude-adapter-0.3.0",
+            fornax_types::ContentClass::ToolTelemetry,
+            serde_json::json!({"cache_read_tokens": 7}),
+        );
+        extension
+            .unknown
+            .insert("future_field".into(), serde_json::json!("keep me"));
+
+        let evidence = Evidence {
+            id: Uuid::new_v4(),
+            session_id: "s8".into(),
+            source_event_id: event.id,
+            kind: EvidenceKind::ExitCode,
+            observed_at: "2026-01-01T00:00:01Z".into(),
+            payload: serde_json::json!({"command": [], "exit_code": 0}),
+            provenance: "test".into(),
+            source: None,
+            extension: Some(extension),
+        };
+        store
+            .insert_evidence(&evidence)
+            .await
+            .expect("insert evidence");
+
+        let fetched = store
+            .evidence_for_session("s8")
+            .await
+            .expect("query evidence");
+        assert_eq!(fetched.len(), 1);
+        let got = fetched[0].extension.as_ref().expect("extension present");
+        assert_eq!(
+            got.unknown.get("future_field"),
+            Some(&serde_json::json!("keep me")),
+            "unknown extension field must not be dropped across the store round trip"
+        );
+        assert_eq!(got.fields["cache_read_tokens"], serde_json::json!(7));
 
         std::fs::remove_file(&path).ok();
     }

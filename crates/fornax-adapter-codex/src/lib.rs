@@ -238,6 +238,7 @@ impl EvidenceSensor for CodexExecCommandEndSensor {
                 self.trust_class(),
                 Some(Provider::Codex),
             )),
+            extension: None,
         }])
     }
 }
@@ -329,6 +330,7 @@ impl EvidenceSensor for CodexCustomToolCallOutputSensor {
                 self.trust_class(),
                 Some(Provider::Codex),
             )),
+            extension: None,
         }])
     }
 }

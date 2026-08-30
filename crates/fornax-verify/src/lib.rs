@@ -220,6 +220,7 @@ mod tests {
             payload: serde_json::json!({"command": ["pytest"], "exit_code": code}),
             provenance: "codex:rollout:exec_command_end".into(),
             source: None,
+            extension: None,
         }
     }
 

@@ -335,6 +335,7 @@ mod tests {
                 payload: serde_json::json!({"command": ["pytest"], "exit_code": 1}),
                 provenance: "codex:rollout:exec_command_end".into(),
                 source: None,
+                extension: None,
             };
             store
                 .insert_evidence(&evidence)
@@ -492,6 +493,7 @@ mod tests {
                     collected_at: "2026-01-01T00:00:01Z".into(),
                     provider: Some(Provider::Codex),
                 }),
+                extension: None,
             };
             store
                 .insert_evidence(&evidence)
@@ -521,6 +523,88 @@ mod tests {
             );
             assert_eq!(v["source"]["trust_class"], "agent_adjacent");
             assert_eq!(v["source"]["provider"], "codex");
+
+            std::fs::remove_file(&db_path).ok();
+            std::fs::remove_dir_all(&out_dir).ok();
+        }
+
+        /// FORNX-158 AC: provider-extension data must survive the same
+        /// cloud-safe projection boundary as `EvidenceSource` above —
+        /// `Evidence` spools as-is, so the extension envelope (including a
+        /// preserved unknown field) should ship through unmodified.
+        #[tokio::test]
+        async fn evidence_envelope_carries_extension_data_through_export() {
+            let db_path = tmp_db_path("evidence-extension-export");
+            let store = fornax_store::Store::open(&db_path).await.expect("open db");
+
+            let event = fornax_types::AgentEvent {
+                id: Uuid::new_v4(),
+                session_id: "s-ext".into(),
+                provider: Provider::ClaudeCode,
+                kind: EventKind::PostToolUse,
+                observed_at: "2026-01-01T00:00:00Z".into(),
+                tool_name: Some("Bash".into()),
+                tool_input: Some(serde_json::json!({"command": ["pytest"]})),
+                tool_response: Some(serde_json::json!({"stdout": ""})),
+                raw: serde_json::json!({"hook_event_name": "PostToolUse"}),
+            };
+            store.insert_event(&event).await.expect("insert event");
+
+            let mut extension = fornax_types::ExtensionEnvelope::new(
+                Provider::ClaudeCode,
+                "claude-adapter-0.3.0",
+                fornax_types::ContentClass::ToolTelemetry,
+                serde_json::json!({"cache_read_tokens": 128}),
+            );
+            // Prove unknown-field preservation across the persistence +
+            // export boundary, not just an in-memory round trip.
+            extension
+                .unknown
+                .insert("retention_hint_days".into(), serde_json::json!(30));
+
+            let evidence = fornax_types::Evidence {
+                id: Uuid::new_v4(),
+                session_id: "s-ext".into(),
+                source_event_id: event.id,
+                kind: EvidenceKind::ExitCode,
+                observed_at: "2026-01-01T00:00:01Z".into(),
+                payload: serde_json::json!({"command": ["pytest"], "exit_code": 0}),
+                provenance: "claude_code:PostToolUse:Bash#heuristic:stderr_empty".into(),
+                source: None,
+                extension: Some(extension),
+            };
+            store
+                .insert_evidence(&evidence)
+                .await
+                .expect("insert evidence");
+
+            let out_dir = std::env::temp_dir().join(format!("fornax-spool-{}", Uuid::new_v4()));
+            export_spool_from_store(&store, "s-ext", &out_dir)
+                .await
+                .expect("export spool");
+
+            let pending_dir = out_dir.join("pending");
+            let evidence_file = std::fs::read_dir(&pending_dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .find(|p| {
+                    let v: serde_json::Value =
+                        serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
+                    v["type"] == "evidence"
+                })
+                .expect("evidence file exists");
+            let v: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&evidence_file).unwrap()).unwrap();
+            assert_eq!(
+                v["extension"]["schema_version"],
+                fornax_types::EXTENSION_SCHEMA_VERSION
+            );
+            assert_eq!(v["extension"]["content_class"], "tool_telemetry");
+            assert_eq!(v["extension"]["fields"]["cache_read_tokens"], 128);
+            assert_eq!(
+                v["extension"]["retention_hint_days"], 30,
+                "unknown extension field must survive the store + export round trip, not be dropped"
+            );
 
             std::fs::remove_file(&db_path).ok();
             std::fs::remove_dir_all(&out_dir).ok();
