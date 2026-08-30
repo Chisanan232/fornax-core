@@ -91,3 +91,22 @@ run_case() {
   run bash "$SCRIPT" --evidence-dir "${FIXTURES}/happy/evidence"
   [ "$status" -eq 2 ]
 }
+
+@test "docs gate is scoped to the exact-version ticket the manifest names, not any cross-cutting epic it mentions -> ready true (FORNX-279 follow-up)" {
+  # The docs gate's evidence ticket (PROJ-5) is Done and candidate-referenced
+  # for THIS version (v1.2.3), but its own text references a separate,
+  # still-open, cross-cutting docs epic (PROJ-9) covering later versions.
+  # PROJ-9 is never named by jira_key anywhere in the manifest, so it must
+  # never be consulted -- an unfinished cross-version epic must not block an
+  # otherwise-complete release just because the exact-version ticket happens
+  # to mention it in passing.
+  run_case docs_gate_scoped_to_exact_version
+  [ "$status" -eq 0 ]
+  ready="$(echo "$output" | jq -r '.ready')"
+  [ "$ready" = "true" ]
+  echo "$output" | jq -e '.checks[] | select(.name=="evidence.docs.PROJ-5.done" and .status=="pass")'
+  # PROJ-9 (the epic) must never appear as a check at all -- it isn't the
+  # manifest's docs jira_key, so the script has no reason to touch it.
+  epic_checks="$(echo "$output" | jq '[.checks[] | select(.name | test("PROJ-9"))] | length')"
+  [ "$epic_checks" -eq 0 ]
+}

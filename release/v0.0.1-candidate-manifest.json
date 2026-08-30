@@ -1,10 +1,11 @@
 {
   "version": "v0.0.1",
+  "release_notes_path": "docs/release/v0.0.1-release-notes.md",
   "repos": [
     {
       "name": "fornax-core",
       "owner": "horonomy",
-      "sha": "d22721b4e93deba46766b5ba0193e99ec38946fa",
+      "sha": "1c078ed31c23ffac8f515e8a46c97c1888c76457",
       "publishes_artifact": true
     },
     {
@@ -47,8 +48,8 @@
     },
     {
       "gate": "docs",
-      "jira_key": "FORNX-215",
-      "jira_url": "https://lightning-dust-mite.atlassian.net/browse/FORNX-215",
+      "jira_key": "FORNX-217",
+      "jira_url": "https://lightning-dust-mite.atlassian.net/browse/FORNX-217",
       "applies_to_repos": []
     },
     {

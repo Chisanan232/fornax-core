@@ -6,7 +6,7 @@
 use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
-use fornax_types::redact::redact_json;
+use fornax_types::redact::{redact_json, redact_text};
 use fornax_types::{IngestMessage, RuntimeCapabilities};
 use fornax_verify::{TestResultVerifier, Verifier};
 use std::collections::HashMap;
@@ -147,6 +147,10 @@ async fn handle_message(
             // Privacy boundary (FORNX-33): redact recognizable secrets from
             // raw tool output before it is ever persisted. Applied once,
             // here, not re-derived by every downstream reader.
+            // FORNX-280: tool_input carries attacker/agent-controlled command
+            // text exactly like tool_response and raw do (e.g. a secret typed
+            // into a shell command) — it must go through the same boundary.
+            ev.tool_input = ev.tool_input.as_ref().map(redact_json);
             ev.tool_response = ev.tool_response.as_ref().map(redact_json);
             ev.raw = redact_json(&ev.raw);
             state.store.insert_event(&ev).await?;
@@ -156,8 +160,14 @@ async fn handle_message(
             ev.payload = redact_json(&ev.payload);
             state.store.insert_evidence(&ev).await?;
         }
-        IngestMessage::Claim(claim) => {
+        IngestMessage::Claim(mut claim) => {
             *session_hint = Some(claim.session_id.clone());
+            // FORNX-280: claim text is derived from agent/user transcript
+            // content and had no redaction boundary at all — a secret
+            // pasted into a prompt or echoed by the agent reached storage,
+            // logs, and export-spool output unredacted. Apply the same
+            // privacy boundary as Event/Evidence, once, before persistence.
+            claim.text = redact_text(&claim.text);
             state.store.insert_claim(&claim).await?;
 
             let caps = state
@@ -243,4 +253,98 @@ fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fornax_types::{AgentEvent, Claim, EventKind, Provider};
+    use uuid::Uuid;
+
+    async fn test_state() -> AppState {
+        let db_path = std::env::temp_dir().join(format!("fornax-test-{}.db", Uuid::new_v4()));
+        let store = fornax_store::Store::open(&db_path)
+            .await
+            .expect("open test store");
+        AppState {
+            store,
+            caps: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// FORNX-280 regression: a high-entropy secret in `tool_input` or claim
+    /// text must never reach storage unredacted. Uses the same canary
+    /// technique as the manual gap-closure repro: a random-hex marker shaped
+    /// to trip `redact_json`/`redact_text`'s generic high-entropy detector,
+    /// not a human-readable string a detector would legitimately ignore.
+    #[tokio::test]
+    async fn tool_input_and_claim_text_are_redacted_before_storage() {
+        let state = test_state().await;
+        let mut hint = None;
+        let marker = format!("FORNAX-CANARY-{}-DO-NOT-LEAK", Uuid::new_v4().simple());
+        let session_id = "fornx-280-regression".to_string();
+
+        let event_id = Uuid::new_v4();
+        let event = AgentEvent {
+            id: event_id,
+            session_id: session_id.clone(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PreToolUse,
+            observed_at: "2026-08-30T00:00:00Z".to_string(),
+            tool_name: Some("Bash".to_string()),
+            tool_input: Some(serde_json::json!({"command": format!("echo {marker}")})),
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        handle_message(&state, IngestMessage::Event(event), &mut hint)
+            .await
+            .expect("handle event");
+
+        let claim = Claim {
+            id: Uuid::new_v4(),
+            session_id: session_id.clone(),
+            source_event_id: event_id,
+            text: format!("All tests passed. Session secret for audit: {marker}"),
+            subject: "test_result".to_string(),
+            claimed_at: "2026-08-30T00:00:00Z".to_string(),
+        };
+        handle_message(&state, IngestMessage::Claim(claim), &mut hint)
+            .await
+            .expect("handle claim");
+
+        let stored_events = state
+            .store
+            .events_for_session(&session_id)
+            .await
+            .expect("read back events");
+        let stored_input = stored_events[0]
+            .tool_input
+            .as_ref()
+            .expect("tool_input present")
+            .to_string();
+        assert!(
+            !stored_input.contains(&marker),
+            "raw canary marker leaked into stored tool_input: {stored_input}"
+        );
+        assert!(
+            stored_input.contains("REDACTED"),
+            "expected a redacted placeholder in stored tool_input: {stored_input}"
+        );
+
+        let stored_claims = state
+            .store
+            .claims_for_session(&session_id)
+            .await
+            .expect("read back claims");
+        assert!(
+            !stored_claims[0].text.contains(&marker),
+            "raw canary marker leaked into stored claim text: {}",
+            stored_claims[0].text
+        );
+        assert!(
+            stored_claims[0].text.contains("REDACTED"),
+            "expected a redacted placeholder in stored claim text: {}",
+            stored_claims[0].text
+        );
+    }
 }

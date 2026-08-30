@@ -44,6 +44,17 @@ sign-off content — it only points at the ticket that carries it. All four
 gates (`qa`, `security`, `docs`, `stage`) are required; a manifest missing
 any one of them fails closed.
 
+**The `docs` gate's `jira_key` must name the exact-version release-docs
+ticket for this candidate (e.g. `FORNX-217` for v0.0.1), never a
+cross-cutting, multi-version Epic (e.g. `FORNX-215`).** The checker only
+evaluates whatever ticket the manifest names — it has no concept of an
+"epic" and never walks parent/child links. Pointing the gate at an epic that
+also covers *other, unreleased* versions makes the gate permanently
+unpassable for a version whose own docs are done, since the epic can't
+close until every version under it does. See
+`tests/release-readiness/fixtures/docs_gate_scoped_to_exact_version/` for
+the regression covering this.
+
 ## Running it
 
 ```bash
