@@ -19,3 +19,4 @@ serde_json.workspace = true
 [dev-dependencies]
 fornax-adapter-claude = { path = "../fornax-adapter-claude" }
 fornax-adapter-codex = { path = "../fornax-adapter-codex" }
+fornax-adapter-opencode = { path = "../fornax-adapter-opencode" }
