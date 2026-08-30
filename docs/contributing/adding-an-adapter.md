@@ -126,10 +126,15 @@ transcript-based.
 
 ## 6. Wire into the conformance suite
 
-Add your crate as a `[dev-dependencies]` entry in
-`crates/fornax-adapter-conformance/Cargo.toml`, then add a fixture function
-and two tests to `crates/fornax-adapter-conformance/tests/conformance.rs`
-mirroring the existing `claude_*`/`codex_*` tests:
+`crates/fornax-adapter-conformance` (FORNX-156, extended into the full
+golden-fixture kit by FORNX-160) is the one place every adapter's conformance
+is proven, and the entry point a future third-party adapter author should
+copy from. Two things to add, both required:
+
+**a. The property suite** (`tests/conformance.rs`). Add your crate as a
+`[dev-dependencies]` entry in `crates/fornax-adapter-conformance/Cargo.toml`,
+then add a fixture function and two tests mirroring the existing
+`claude_*`/`codex_*` tests:
 
 - `<provider>_adapter_satisfies_the_conformance_contract` — runs the generic
   property checks (`probe_provider_matches_declared_provider`,
@@ -139,6 +144,30 @@ mirroring the existing `claude_*`/`codex_*` tests:
 - `<provider>_adapter_handles_an_unrecognized_native_event_per_policy` — a
   synthetic, never-seen shape must come back `Unrecognized` with a
   non-empty `discriminator`, never a panic.
+
+**b. Golden fixtures** (`fixtures/<provider>/*.json`, replayed by
+`tests/golden_fixtures.rs` and `tests/contract.rs`). Add at least:
+
+- One fixture per real, distinct native shape your adapter recognizes
+  (a "happy path" per event kind you translate), sanitized per
+  `fixtures/README.md`'s rule (no real usernames/paths/tokens/session data).
+- One `unrecognized_future_*.json` synthetic breaking-change probe — a
+  shape you fabricate, never observed live, that your adapter has no
+  mapping for. This is what proves a real future upstream break would come
+  back as an actionable `Unrecognized` error (see `breaking_change_is_reported_not_silently_dropped`
+  in `src/lib.rs`), not silent data loss.
+- Run your fixtures through the shared contract checks
+  (`capability_declaration_is_well_formed`, `evidence_sources_are_valid`,
+  `evidence_payloads_validate_against_their_canonical_schema`) the same way
+  `tests/contract.rs` does for Claude/Codex — these are generic over any
+  `AgentAdapter` and need no new harness code per provider.
+- If you ever discover a **real** shape your adapter previously assumed
+  wrong and had to fix (a genuine historical schema-drift bug, not a
+  hypothetical one), fixture the exact real shape and set
+  `historical_schema_drift_ticket` to the ticket that fixed it — see
+  `fixtures/codex/custom_tool_call_exec_pair.json` (FORNX-55) for a worked
+  example, and the "Detecting upstream schema drift" section below for how
+  a real one gets found in the first place. Never fabricate one.
 
 If your adapter needs a new `Provider` variant, add it to
 `fornax_types::Provider` (`crates/fornax-types/src/lib.rs`) — check first
@@ -155,3 +184,48 @@ cargo test -p fornax-adapter-<provider>
 cargo test -p fornax-adapter-conformance
 cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+## Detecting upstream schema drift
+
+Both Claude Code and Codex are actively-changing surfaces
+(`docs/research/adapter-capability-matrix.md`'s own header: "re-verify
+before an adapter hard-codes field names"). Neither ships a stable, versioned
+public schema, so Fornax cannot subscribe to a change notice — a maintainer
+has to notice drift by comparison. This is how:
+
+1. **Version-pin what "confirmed" means.** Every golden fixture in
+   `crates/fornax-adapter-conformance/fixtures/` carries the real
+   `provider_runtime_version` it was captured against
+   (`fixtures/README.md`). That is the baseline: "as of Claude Code
+   v2.1.238 / codex-cli 0.147.0, this is the exact shape this adapter
+   relies on."
+2. **Periodically re-capture against a live session.** When bumping to a
+   newer Claude Code or Codex CLI, capture one real session (a hook payload
+   dump, a fresh rollout JSONL) and diff its shapes against the checked-in
+   fixtures for the *same* event kinds — not just "does the adapter still
+   compile," but "does the real payload still have every field this
+   adapter's `normalize`/`EvidenceSensor`s read." A field silently renamed
+   or removed will not fail compilation; it fails a live diff or (if
+   unlucky) reads as `Unavailable`/`Unrecognized` in production first.
+3. **The explicit bump ritual.** If a re-capture confirms a real shape
+   change:
+   - Add a new fixture capturing the new real shape (do not overwrite the
+     old one if the old shape can still occur against an older installed
+     CLI version — keep both, distinguished by `provider_runtime_version`).
+   - Fix the adapter to handle the new shape (see FORNX-55's commit,
+     `4437c00`, for the shape of this fix: correlate/parse the new shape,
+     keep the old path working if the old shape can still occur, mark any
+     new heuristic as `heuristic: true` rather than inventing an
+     authoritative field).
+   - Add or update the corresponding `historical_schema_drift_ticket`
+     fixture and regression test once the fix lands, so a future regression
+     to the old (now-wrong) assumption is caught automatically.
+   - Update `docs/research/adapter-capability-matrix.md`'s confirmed-shape
+     tables to match.
+4. **Never guess a shape from secondary sources for a live parser.** The
+   capability matrix doc's own Codex table is explicit about this: research
+   from issues/PRs motivates *where to look*, but the adapter itself must be
+   coded against a real captured payload, and the golden fixture for that
+   payload is what proves it — see FORNX-55, where the shape assumed from
+   secondary research (`event_msg{type:exec_command_end}`) turned out to
+   never occur in the installed CLI at all.
