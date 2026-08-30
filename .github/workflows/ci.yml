@@ -35,6 +35,14 @@ jobs:
       - name: clippy
         if: steps.has_crates.outputs.present == 'true'
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: build workspace binaries
+        if: steps.has_crates.outputs.present == 'true'
+        # Some integration tests (e.g. fornax-daemon's) invoke sibling
+        # workspace binaries by their conventional target/<profile>/<bin>
+        # path rather than CARGO_BIN_EXE_<name> (which Cargo only sets for
+        # bins in the *same* crate as the test) — those binaries must exist
+        # on disk before `cargo test` runs, same as local dev convention.
+        run: cargo build --workspace
       - name: test
         if: steps.has_crates.outputs.present == 'true'
         run: cargo test --workspace
