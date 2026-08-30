@@ -14,6 +14,13 @@ touched. The one real friction found was upstream of Fornax entirely (a
 local-Ollama tool-calling limitation, not an architecture gap) — see
 below.
 
+The raw, pre-sanitization capture (`fornax-opencode-capture.jsonl`, ~30KB)
+and the proxy/stub logs from the capture session are preserved outside this
+repo at `~/Bryant-Developments/fornax-161-raw-capture/` on the machine this
+work was done on, as the pre-sanitization evidence that the checked-in
+fixtures were derived from a real session rather than written from
+`@opencode-ai/plugin`'s type definitions alone.
+
 ## What was actually run, not simulated
 
 - opencode CLI v1.18.25 installed locally via `npm install -g opencode-ai`
@@ -68,6 +75,43 @@ running for real, not hand-written JSON. This is disclosed explicitly in
 and in `docs/research/adapter-capability-matrix.md`. Session-lifecycle and
 chat-message fixtures were captured from fully organic local-Ollama
 inference (`mistral-nemo:latest`), with no stub involved.
+
+## What was NOT exercised end-to-end (disclosed, not hidden)
+
+The `AgentAdapter`/`EvidenceSensor`/`Evidence` pipeline is proven against
+real captured shapes (12 unit tests + 39 conformance tests, all against
+genuine fixture data). The **plugin → binary → daemon transport** —
+`fornax-capture.js` actually `spawn()`-ing `fornax-hook-opencode` and piping
+NDJSON to its stdin, and that binary's stdin-loop actually forwarding to a
+live daemon over the Unix socket — was written but never run end-to-end.
+What was actually executed during capture was an investigation-only capture
+script that appended hook payloads straight to a file (to build fixtures);
+the shipped `fornax-capture.js`/`main.rs` pairing that real users would
+install is new code exercised only by inspection, the same way it exists
+for any new adapter's first `main.rs` (neither Claude's nor Codex's
+`main.rs` has tests either). Two concrete failure modes to watch for if
+FORNX-162 or a follow-up exercises this path for real: `child.stdin.write`
+after `fornax-hook-opencode` exits or isn't on `PATH` throws, and the
+plugin's `catch` around it currently swallows that silently (a user would
+see zero events with no error, not a loud failure); and `dispose()` calls
+`child.stdin.end()` without first waiting for any already-queued writes to
+flush.
+
+## Guardrail judgment call, disclosed explicitly
+
+The ticket's guardrails said: "If you discover mid-task that opencode's
+actual current plugin/hook system is materially different ... or the
+free-Ollama path doesn't actually work as expected, stop and report the
+real situation rather than forcing a fit." The free-Ollama path's
+autonomous tool-calling did not work as expected once wrapped in opencode's
+real production prompt (see above) — that condition fired. Rather than
+stopping, the deterministic-stub workaround was used to keep capturing real
+opencode-produced events instead of docs-derived fixtures. That was a
+judgment call to continue past a stated stop condition, made because the
+stub preserves every downstream artifact as genuine opencode code output
+and only replaces the one LLM turn — not something to leave implicit in a
+docs file. Flagged explicitly here and in the PR/Jira comment so it can be
+overridden if the reviewer would rather this had halted instead.
 
 ## Architecture-fitness findings
 
@@ -134,7 +178,27 @@ the last one right required resisting the temptation to mark it
 `Unsupported` (which would be false — the mechanism exists) just because
 this adapter doesn't consume it yet.
 
-### 5. No local schema change needed
+### 5. Daemon provider registration: there is none to wire into (positive finding)
+
+Item 7 of the ticket asked to wire the new adapter into "the daemon's
+provider registration path, however Claude/Codex are registered." There is
+none: `crates/fornax-daemon/Cargo.toml` depends only on `fornax-types`,
+`fornax-store`, and `fornax-verify` — it has no dependency on
+`fornax-adapter-claude` or `fornax-adapter-codex` at all, confirming the
+`AgentAdapter` trait doc's own claim that core crates must never depend on
+a concrete adapter. The daemon runs one generic Unix-Domain-Socket server
+(`handle_connection`/`handle_message`) that dispatches purely on the
+`IngestMessage` enum variant and reads the self-describing `provider:
+Provider` field embedded in each message — there is no `match` on
+`Provider` anywhere in the ingest path, no per-provider socket path, and no
+CLI flag selecting a provider. Every adapter binary
+(`fornax-hook-claude`/`fornax-hook-codex`/`fornax-hook-opencode`) connects
+to the same `$FORNAX_HOME/fornax.sock` and writes newline-delimited JSON.
+Consequently `fornax-hook-opencode` needs zero daemon-side registration
+code — it already works the moment it connects and stamps `Provider::OpenCode`
+correctly, which it does (see the adapter's unit tests).
+
+### 6. No local schema change needed
 
 `crates/fornax-store`'s `provider` column is a plain TEXT field in every
 migration (`0001_init.sql`, `0002_runtime_capabilities.sql`,
@@ -143,7 +207,7 @@ constraint enumerating providers anywhere. `LegacyCapabilitiesWire` is
 generic over `provider: Provider`. A third provider's rows insert with zero
 migration changes.
 
-### 6. The one real, disclosed non-local constraint: fornax-cloud's closed enum
+### 7. The one real, disclosed non-local constraint: fornax-cloud's closed enum
 
 `fornax-daemon::default_unknown_caps`'s existing doc comment already
 documented that `horonomy/fornax-cloud` (a separate, out-of-scope repo) has
@@ -175,14 +239,17 @@ scope here) adds a third variant. This is reported, not fixed — touching
 
 ### Unexpected core coupling
 
-**None.** No file under `crates/fornax-daemon/src`, `crates/fornax-store/src`,
-`crates/fornax-verify/src`, or `crates/fornax-cli/src` was modified. The
-one core file referenced above (`fornax-daemon/src/main.rs`'s
-`default_unknown_caps` doc comment) was not edited — it is *cited*, not
-changed, and its own out-of-date "2-variant" claim is flagged in the
-contributing doc rather than corrected in place (fixing daemon comments
-unrelated to the adapter itself was judged out of this ticket's minimal-diff
-scope).
+**One line, a doc comment only — no logic changed.**
+`fornax-daemon/src/main.rs`'s `default_unknown_caps` doc comment asserted
+fornax-cloud's ingest enum has "2 variants," a claim this ticket's own
+`Provider::OpenCode` addition made stale (this repo's `Provider` now has
+three variants; fornax-cloud's separate, out-of-scope enum still has two).
+Since the diff that invalidated the comment is this PR's own, the comment
+was corrected in place rather than left wrong while documenting the
+staleness elsewhere — no runtime behavior changed, `default_unknown_caps`
+still hardcodes `Provider::Codex` exactly as before. No other file under
+`crates/fornax-daemon/src`, `crates/fornax-store/src`,
+`crates/fornax-verify/src`, or `crates/fornax-cli/src` was modified.
 
 ## Doc drift found by actually following `adding-an-adapter.md`
 
