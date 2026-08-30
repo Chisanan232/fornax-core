@@ -968,6 +968,34 @@ mod tests {
             "tamper boundary must not be reconstructed from trust_class alone"
         );
 
+        // Read-modify-write stability: re-persisting the deserialized
+        // Evidence (as a replay/migration pass would) must keep emitting
+        // the honest markers explicitly, not silently drop back to an
+        // absent key or acquire a real-looking value on the round trip.
+        let mut migrated = fetched[0].clone();
+        migrated.id = Uuid::new_v4();
+        store
+            .insert_evidence(&migrated)
+            .await
+            .expect("re-insert migrated evidence");
+        let refetched = store
+            .evidence_for_session("s6b")
+            .await
+            .expect("query evidence after re-insert");
+        let rewritten_source = refetched
+            .iter()
+            .find(|e| e.id == migrated.id)
+            .and_then(|e| e.source.as_ref())
+            .expect("re-persisted row must still carry a source");
+        assert_eq!(
+            rewritten_source.collection_method,
+            fornax_types::CollectionMethod::PreProvenance
+        );
+        assert_eq!(
+            rewritten_source.tamper_boundary.description,
+            "unknown (record predates tamper-boundary tracking)"
+        );
+
         std::fs::remove_file(&path).ok();
     }
 

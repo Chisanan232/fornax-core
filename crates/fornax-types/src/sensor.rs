@@ -301,6 +301,20 @@ impl TamperBoundary {
     /// detail via the returned value's `detail` field.
     pub fn for_trust_class(trust_class: &TrustClass, collection_method: &CollectionMethod) -> Self {
         let description = match (trust_class, collection_method) {
+            // Checked first, regardless of trust_class: a `PreProvenance`/
+            // `Unrecognized` collection method means this binary cannot
+            // vouch for *how* the evidence was collected, so it must not
+            // synthesize a confident boundary sentence from trust_class
+            // alone — that would fabricate exactly the specific-sounding
+            // description the FORNX-159 AC forbids for a record whose
+            // collection method genuinely is not known.
+            (_, CollectionMethod::PreProvenance) => {
+                "unknown (record predates collection-method tracking)"
+            }
+            (_, CollectionMethod::Unrecognized(_)) => {
+                "collection method not recognized by this binary — boundary unknown, see \
+                 the raw collection_method tag"
+            }
             (TrustClass::AgentAdjacent, CollectionMethod::HookCallback) => {
                 "captured via an in-process hook callback invoked by the coding agent \
                  itself — the agent's own account of what happened, running in-process \
@@ -758,6 +772,47 @@ mod tests {
         .with_detail("git status --porcelain");
         assert!(boundary.description.contains("measured directly"));
         assert_eq!(boundary.detail.as_deref(), Some("git status --porcelain"));
+    }
+
+    #[test]
+    fn for_trust_class_reports_honest_unknown_when_collection_method_is_not_known() {
+        // A known, high-confidence trust_class must not make `for_trust_class`
+        // synthesize a confident boundary sentence when the collection
+        // method itself is unknown — that would fabricate specifics this
+        // binary cannot actually vouch for (the exact failure mode FORNX-159's
+        // AC forbids).
+        let pre_provenance = TamperBoundary::for_trust_class(
+            &TrustClass::AgentAdjacent,
+            &CollectionMethod::PreProvenance,
+        );
+        assert_eq!(
+            pre_provenance.description,
+            "unknown (record predates collection-method tracking)"
+        );
+
+        let unrecognized = TamperBoundary::for_trust_class(
+            &TrustClass::HostObserved,
+            &CollectionMethod::Unrecognized("quantum_intercept".to_string()),
+        );
+        assert!(unrecognized.description.contains("not recognized"));
+    }
+
+    #[test]
+    fn pre_provenance_tag_serializes_to_itself_not_unrecognized() {
+        // Guards against the exact asymmetry `SignalAvailability::from_tag`'s
+        // doc warns about: `Unrecognized("pre_provenance")` round-trips fine,
+        // but the named `PreProvenance` variant must itself serialize back
+        // to the `"pre_provenance"` tag, not something that would re-parse
+        // as the catch-all.
+        let json = serde_json::to_string(&CollectionMethod::PreProvenance).unwrap();
+        assert_eq!(json, "\"pre_provenance\"");
+        let back: CollectionMethod = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, CollectionMethod::PreProvenance);
+
+        let json = serde_json::to_string(&ClockSource::PreProvenance).unwrap();
+        assert_eq!(json, "\"pre_provenance\"");
+        let back: ClockSource = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ClockSource::PreProvenance);
     }
 
     // --- SensorOutcome partial-availability combinations ------------------
