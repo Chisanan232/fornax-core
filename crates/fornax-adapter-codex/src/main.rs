@@ -30,15 +30,76 @@ fn sock_path() -> PathBuf {
 /// (opt-in feature flag, admin-suppressible, no input rewrite — see the
 /// capability matrix doc). Declared conservatively; never inferred as more
 /// capable than confirmed.
+///
+/// Formalized (FORNX-155) from six fixed bools into an explicit
+/// `fornax_types::SignalClass` -> `SignalAvailability` declaration.
+/// `ToolInvocation` and `SubagentLifecycle` are `Unsupported`, not merely
+/// absent: this adapter's chosen mechanism (rollout-tail, not Codex's
+/// opt-in/admin-suppressible hooks) fundamentally cannot expose pre-execution
+/// interception or subagent lifecycle events, which is a stronger, more
+/// useful claim than ordinary absence. `ProcessResult` is new — no literal
+/// exit code is exposed by the shapes this adapter parses today, so it is
+/// `Unavailable` (the class exists for Codex in principle via
+/// `exec_command_end.exit_code`, confirmed in the capability matrix doc; this
+/// adapter's primary rollout-tail path just hasn't observed it — see
+/// `translate_line`'s `custom_tool_call_output` handling).
 fn codex_capabilities() -> RuntimeCapabilities {
+    use fornax_types::{CapabilitySignal, SignalAvailability, SignalClass};
     RuntimeCapabilities {
+        schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
         provider: Provider::Codex,
-        supports_pre_tool_use: false,
-        supports_post_tool_use: true, // via rollout custom_tool_call/_output pairing, not hooks
-        supports_tool_response_capture: true,
-        supports_session_stop_event: true, // task_complete in rollout
-        supports_transcript_tail: true,
-        supports_subagent_lifecycle: false,
+        signals: vec![
+            CapabilitySignal {
+                class: SignalClass::ToolInvocation,
+                state: SignalAvailability::Unsupported,
+                detail: Some(
+                    "Codex hooks (the only pre-execution interception mechanism) are \
+                     opt-in and admin-suppressible, with no input-rewrite support \
+                     (see docs/research/adapter-capability-matrix.md)"
+                        .to_string(),
+                ),
+            },
+            CapabilitySignal {
+                class: SignalClass::ToolTrace,
+                state: SignalAvailability::Available,
+                detail: Some("via rollout custom_tool_call/_output pairing, not hooks".to_string()),
+            },
+            CapabilitySignal {
+                class: SignalClass::ToolResultPayload,
+                state: SignalAvailability::Available,
+                detail: None,
+            },
+            CapabilitySignal {
+                class: SignalClass::SessionLifecycle,
+                state: SignalAvailability::Available,
+                detail: Some("task_complete in rollout".to_string()),
+            },
+            CapabilitySignal {
+                class: SignalClass::FinalResponse,
+                state: SignalAvailability::Available,
+                detail: None,
+            },
+            CapabilitySignal {
+                class: SignalClass::SubagentLifecycle,
+                state: SignalAvailability::Unsupported,
+                detail: Some(
+                    "this adapter's rollout-tail mechanism surfaces no subagent lines; \
+                     Codex's own SubagentStart/Stop hooks exist but are opt-in/unstable/ \
+                     admin-suppressible, same as ToolInvocation above"
+                        .to_string(),
+                ),
+            },
+            CapabilitySignal {
+                class: SignalClass::ProcessResult,
+                state: SignalAvailability::Unavailable,
+                detail: Some(
+                    "exec_command_end (literal exit_code) not emitted by codex-cli 0.147.0; \
+                     only the heuristic script-completed marker via \
+                     custom_tool_call_output is observed today"
+                        .to_string(),
+                ),
+            },
+        ],
         notes: [(
             "mechanism".to_string(),
             "rollout JSONL tail, not Codex hooks (opt-in/unstable, see adapter-capability-matrix.md)".to_string(),

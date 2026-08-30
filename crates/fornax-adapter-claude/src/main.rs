@@ -59,16 +59,64 @@ async fn main() {
 /// never inferred as more capable than confirmed (D5, ADR 0001). Confirmed
 /// against a live Claude Code v2.1.238 session (2026-08-29): PostToolUse and
 /// Stop both fire with the shapes this adapter parses.
+///
+/// Formalized (FORNX-155) from six fixed bools into an explicit
+/// `fornax_types::SignalClass` -> `SignalAvailability` declaration. Every
+/// class this adapter previously declared `true` for stays `Available`;
+/// `ProcessResult` is new — Claude Code's Bash `tool_response` never carries
+/// a literal exit code, only a heuristic derived from
+/// stdout/stderr/interrupted (see the `PostToolUse` handling in `translate`
+/// below), so it is declared `Unsupported`, not `Available`.
 fn claude_capabilities(session_id: &str) -> fornax_types::RuntimeCapabilities {
+    use fornax_types::{CapabilitySignal, SignalAvailability, SignalClass};
     fornax_types::RuntimeCapabilities {
+        schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
         provider: Provider::ClaudeCode,
-        supports_pre_tool_use: true,
-        supports_post_tool_use: true,
-        supports_tool_response_capture: true,
-        supports_session_stop_event: true,
-        supports_transcript_tail: true,
-        supports_subagent_lifecycle: true,
+        signals: vec![
+            CapabilitySignal {
+                class: SignalClass::ToolInvocation,
+                state: SignalAvailability::Available,
+                detail: None,
+            },
+            CapabilitySignal {
+                class: SignalClass::ToolTrace,
+                state: SignalAvailability::Available,
+                detail: None,
+            },
+            CapabilitySignal {
+                class: SignalClass::ToolResultPayload,
+                state: SignalAvailability::Available,
+                detail: None,
+            },
+            CapabilitySignal {
+                class: SignalClass::SessionLifecycle,
+                state: SignalAvailability::Available,
+                detail: None,
+            },
+            CapabilitySignal {
+                class: SignalClass::FinalResponse,
+                state: SignalAvailability::Available,
+                detail: None,
+            },
+            CapabilitySignal {
+                class: SignalClass::SubagentLifecycle,
+                state: SignalAvailability::Available,
+                detail: None,
+            },
+            CapabilitySignal {
+                class: SignalClass::ProcessResult,
+                state: SignalAvailability::Unsupported,
+                detail: Some(
+                    "Bash tool_response carries no literal exit code as of v2.1.238; \
+                     ExitCode evidence is heuristic from stdout/stderr/interrupted"
+                        .to_string(),
+                ),
+            },
+        ],
         notes: [
+            // Reserved, machine-consumed transport field — see the doc
+            // comment on `RuntimeCapabilities::notes` in
+            // `fornax-types/src/capabilities.rs`. Not free-form.
             ("session_id".to_string(), session_id.to_string()),
             (
                 "exit_code".to_string(),

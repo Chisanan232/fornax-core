@@ -212,16 +212,31 @@ async fn handle_message(
 }
 
 /// Conservative default when an adapter hasn't announced capabilities yet —
-/// never assume a signal is observable (D4/D7).
+/// never assume a signal is observable (D4/D7). Every class reads back
+/// `Unknown` (ordinary absence, an empty `signals` list), which is
+/// behaviorally identical to today's all-`false` bools at every verifier
+/// gate — this fallback still never opens a gate it shouldn't.
+///
+/// FORNX-155 disclosure (found while formalizing this, not introduced by
+/// it): `provider` below is hardcoded to `Codex` regardless of which
+/// provider's session this actually is — a fabricated provider identity for
+/// a session whose adapter simply hasn't spoken yet. This is contained: this
+/// value is only ever passed into `Verifier::verify`, `Finding` carries no
+/// provider field, and this placeholder is never persisted or exported (a
+/// real `Capabilities` announcement, once it arrives, is what gets
+/// persisted). The two candidate fixes are each worse than the bug — a
+/// `Provider::Unknown` variant risks reaching fornax-cloud's closed
+/// 2-variant enum as a live 422 if this value were ever exported by
+/// mistake, and a session→provider store lookup here would put a DB round
+/// trip on the verify hot path the `caps` in-memory cache exists
+/// specifically to avoid. Left as-is; a proper fix needs either an open
+/// `Provider` enum or provider plumbing through the claim path — tracked as
+/// a FORNX-138 follow-up, not fixed in this ticket.
 fn default_unknown_caps() -> RuntimeCapabilities {
     RuntimeCapabilities {
+        schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
         provider: fornax_types::Provider::Codex,
-        supports_pre_tool_use: false,
-        supports_post_tool_use: false,
-        supports_tool_response_capture: false,
-        supports_session_stop_event: false,
-        supports_transcript_tail: false,
-        supports_subagent_lifecycle: false,
+        signals: vec![],
         notes: [(
             "reason".to_string(),
             "no capabilities announced by adapter yet".to_string(),
