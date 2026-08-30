@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Fake `cargo` for release-execute.sh bats tests. Never runs a real build —
+# see ~/.claude/CLAUDE.md shared-target-dir contention note for why bats
+# must not invoke real cargo. Controlled via FAKE_CARGO_FAIL, FAKE_CARGO_LOG.
+set -euo pipefail
+
+LOG="${FAKE_CARGO_LOG:-/dev/null}"
+echo "cargo $*" >> "$LOG"
+
+if [ "${FAKE_CARGO_FAIL:-false}" = "true" ]; then
+  echo "fake cargo: simulated build failure" >&2
+  exit 1
+fi
+
+mkdir -p target/release
+for b in fornax fornax-daemon fornax-hook-claude fornax-hook-codex; do
+  printf 'fake-binary-content-%s' "$b" > "target/release/${b}"
+done
+exit 0

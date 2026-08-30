@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Fake `gh` for release-execute.sh bats tests. Never touches the network.
+# Controlled via env vars: FAKE_TAG_EXISTS, FAKE_TAG_SHA, FAKE_RELEASE_EXISTS,
+# FAKE_RELEASE_CREATE_FAIL, FAKE_GH_LOG (append-only call log).
+set -euo pipefail
+
+LOG="${FAKE_GH_LOG:-/dev/null}"
+echo "gh $*" >> "$LOG"
+
+if [ "$1" = "api" ]; then
+  path="$2"
+  case "$path" in
+    repos/*/git/ref/tags/*)
+      if [ "${FAKE_TAG_EXISTS:-false}" = "true" ]; then
+        printf '{"object":{"type":"commit","sha":"%s"}}\n' "${FAKE_TAG_SHA:-deadbeefdeadbeefdeadbeefdeadbeefdeadbeef}"
+        exit 0
+      fi
+      exit 1
+      ;;
+    repos/*/git/tags)
+      # create tag object — script extracts this via --jq '.sha', so print the
+      # raw value it expects rather than a full JSON document.
+      echo "fake-tag-object-sha"
+      exit 0
+      ;;
+    repos/*/git/refs)
+      exit 0
+      ;;
+    *)
+      echo "fake gh: unhandled api path: $path" >&2
+      exit 99
+      ;;
+  esac
+elif [ "$1" = "release" ]; then
+  case "$2" in
+    view)
+      [ "${FAKE_RELEASE_EXISTS:-false}" = "true" ] && exit 0
+      exit 1
+      ;;
+    create)
+      [ "${FAKE_RELEASE_CREATE_FAIL:-false}" = "true" ] && exit 1
+      exit 0
+      ;;
+    edit)
+      exit 0
+      ;;
+    *)
+      echo "fake gh: unhandled release subcommand: $2" >&2
+      exit 99
+      ;;
+  esac
+else
+  echo "fake gh: unhandled command: $1" >&2
+  exit 99
+fi

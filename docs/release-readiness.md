@@ -4,9 +4,10 @@ Jira: FORNX-234. Turns release assurance into a mechanical chokepoint: a
 missing or stale QA/Security/Docs/Stage sign-off cannot be waved through by a
 narrative summary, because a script — not a person's paraphrase — decides.
 
-This is scoped to the checker itself. Wiring it into tag/publish/promotion
-automation as an enforced gate is FORNX-235 and is not done here; this doc
-covers what exists today.
+This is scoped to the checker itself. It is wired into tag/publish/promotion
+automation as an enforced gate by `scripts/release-execute.sh` (FORNX-235,
+see `docs/release-execute.md`), which calls this script as a hard
+precondition and refuses to proceed on anything but `ready: true`.
 
 ## The candidate manifest
 
@@ -139,7 +140,8 @@ malformed JSON, and the happy path.
 
 ## Known limitations (out of scope for FORNX-234)
 
-- Not wired into any CI/tag/publish workflow yet — FORNX-235.
+- Not wired into a CI pipeline trigger (it's invoked by `release-execute.sh`
+  as a library/precondition, not by a GitHub Actions workflow).
 - Doesn't validate version/schema/migration compatibility metadata or
   changelog consistency, and doesn't check a release-blocker list —
   these need FORNX-229/230/231/232/233/216 first, which don't exist yet.
