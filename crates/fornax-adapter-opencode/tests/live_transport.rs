@@ -243,7 +243,7 @@ fn plugin_binary_daemon_pipeline_delivers_real_evidence() {
             rt.block_on(async {
                 let store = fornax_store::Store::open(&db_path).await.ok()?;
                 let events = store.events_for_session(&session_id).await.ok()?;
-                let evidence = store.evidence_for_session(&session_id).await.ok()?;
+                let evidence = store.evidence_for_session(&session_id).await.ok()?.evidence;
                 if events.is_empty() {
                     None
                 } else {

@@ -124,7 +124,21 @@ async fn export_spool_from_store(
 ) -> anyhow::Result<()> {
     let events = store.events_for_session(session).await?;
     let claims = store.claims_for_session(session).await?;
-    let evidence = store.evidence_for_session(session).await?;
+    let evidence_read = store.evidence_for_session(session).await?;
+    if !evidence_read.failed.is_empty() {
+        eprintln!(
+            "fornax: {} of {} evidence rows for session {session} failed to deserialize and were not exported: {}",
+            evidence_read.failed.len(),
+            evidence_read.evidence.len() + evidence_read.failed.len(),
+            evidence_read
+                .failed
+                .iter()
+                .map(|f| format!("{} ({})", f.id, f.error))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let evidence = evidence_read.evidence;
     let capabilities = store.capabilities_for_session(session).await?;
 
     let pending_dir = out.join("pending");

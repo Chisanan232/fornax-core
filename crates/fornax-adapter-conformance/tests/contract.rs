@@ -15,8 +15,9 @@ use fornax_adapter_conformance::{
 };
 use fornax_adapter_opencode::OpenCodeAdapter;
 use fornax_types::{
-    AgentAdapter, CapabilityProbe, ContentClass, EventKind, ExtensionEnvelope, IngestMessage,
-    NormalizationOutcome, Provider, SignalAvailability, SignalClass,
+    validate_canonical_payload, AgentAdapter, CapabilityProbe, ContentClass, EventKind,
+    EvidenceKind, ExtensionEnvelope, IngestMessage, NormalizationOutcome, Provider,
+    SignalAvailability, SignalClass,
 };
 
 fn claude_native_events() -> Vec<serde_json::Value> {
@@ -279,6 +280,27 @@ fn opencode_evidence_payloads_validate_against_their_canonical_schema() {
         &mut adapter,
         "fixture-hint",
         &opencode_native_events(),
+    );
+}
+
+/// FORNX-289: proves the check wired above actually bites at this
+/// conformance-layer boundary, not just in `fornax-types`' own unit tests
+/// (`crates/fornax-types/src/lib.rs`) — a real `ExitCodePayload` shape
+/// (`#[serde(deny_unknown_fields)]`) with `exit_code` as a string instead of
+/// an integer must fail `validate_canonical_payload`, the same function
+/// `evidence_payloads_validate_against_their_canonical_schema` calls above.
+#[test]
+fn a_malformed_exit_code_payload_fails_canonical_validation_at_the_conformance_boundary() {
+    let bad_payload = serde_json::json!({
+        "command": ["ls"],
+        "exit_code": "0",
+        "heuristic": false
+    });
+    let err = validate_canonical_payload(EvidenceKind::ExitCode, &bad_payload)
+        .expect_err("a string exit_code must not validate as the canonical ExitCodePayload");
+    assert!(
+        !err.is_empty(),
+        "expected a non-empty type-mismatch error, got an empty string"
     );
 }
 
