@@ -1,0 +1,69 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/horonomy/fornax-core/release/candidate-manifest.schema.json",
+  "title": "Fornax Release Candidate Manifest",
+  "description": "Describes one release candidate across every repo it spans, plus pointers to the Jira tickets that carry QA/Security/Docs/Stage sign-off evidence. Jira is the evidence source of truth; this manifest never duplicates evidence content, only identifies where it lives and which exact candidate it must attest to.",
+  "type": "object",
+  "required": ["version", "repos", "evidence"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "type": "string",
+      "description": "The candidate release version, e.g. \"v0.0.1\". Used as the reference token for evidence pointers that are candidate-wide rather than scoped to one repo's SHA.",
+      "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+"
+    },
+    "repos": {
+      "type": "array",
+      "description": "Every repo this candidate spans. For a single-repo release this array has one entry.",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["name", "owner", "sha", "publishes_artifact"],
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string", "description": "Repo name, e.g. \"fornax-core\"." },
+          "owner": { "type": "string", "description": "GitHub owner/org, e.g. \"horonomy\"." },
+          "sha": {
+            "type": "string",
+            "description": "Exact commit SHA of this repo included in the candidate. Full 40-char SHA preferred; 7+ char short SHA accepted.",
+            "pattern": "^[0-9a-f]{7,40}$"
+          },
+          "publishes_artifact": {
+            "type": "boolean",
+            "description": "True if this repo's build at `sha` produces a versioned artifact that gets tagged/published/promoted as part of this release."
+          }
+        }
+      }
+    },
+    "evidence": {
+      "type": "array",
+      "description": "Sign-off pointers. At least one entry per required gate (qa, security, docs, stage) must be present or readiness fails closed.",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["gate", "jira_key", "jira_url", "applies_to_repos"],
+        "additionalProperties": false,
+        "properties": {
+          "gate": {
+            "type": "string",
+            "enum": ["qa", "security", "docs", "stage"],
+            "description": "Which required gate this sign-off satisfies."
+          },
+          "jira_key": {
+            "type": "string",
+            "description": "The Jira issue key carrying the sign-off, e.g. \"FORNX-238\"."
+          },
+          "jira_url": {
+            "type": "string",
+            "description": "Full browse URL for the ticket, for the audit trail in tool output."
+          },
+          "applies_to_repos": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Repo names (matching `repos[].name`) this sign-off attests to the exact SHA of. An empty array means the sign-off is candidate-wide and must instead reference the manifest `version` string, not a per-repo SHA."
+          }
+        }
+      }
+    }
+  }
+}

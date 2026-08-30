@@ -1,0 +1,61 @@
+{
+  "version": "v0.0.1",
+  "repos": [
+    {
+      "name": "fornax-core",
+      "owner": "horonomy",
+      "sha": "d22721b4e93deba46766b5ba0193e99ec38946fa",
+      "publishes_artifact": true
+    },
+    {
+      "name": "fornax-cloud",
+      "owner": "horonomy",
+      "sha": "84f02a0c8c0a14ca64176c22799ba9f4b50c1b4f",
+      "publishes_artifact": true
+    },
+    {
+      "name": "fornax-infra",
+      "owner": "horonomy",
+      "sha": "13f17453776dcfa63971e18b2b64bec4aa621abc",
+      "publishes_artifact": false
+    },
+    {
+      "name": "fornax-docs",
+      "owner": "horonomy",
+      "sha": "d7c42731c16b27caf2149817263ba78969ab5937",
+      "publishes_artifact": false
+    },
+    {
+      "name": "fornax-website",
+      "owner": "horonomy",
+      "sha": "e351cd579adc9d55362ee15a7b07c735223c9f74",
+      "publishes_artifact": false
+    }
+  ],
+  "evidence": [
+    {
+      "gate": "qa",
+      "jira_key": "FORNX-238",
+      "jira_url": "https://lightning-dust-mite.atlassian.net/browse/FORNX-238",
+      "applies_to_repos": ["fornax-core", "fornax-cloud", "fornax-infra", "fornax-docs", "fornax-website"]
+    },
+    {
+      "gate": "security",
+      "jira_key": "FORNX-238",
+      "jira_url": "https://lightning-dust-mite.atlassian.net/browse/FORNX-238",
+      "applies_to_repos": ["fornax-core", "fornax-cloud", "fornax-infra", "fornax-docs", "fornax-website"]
+    },
+    {
+      "gate": "docs",
+      "jira_key": "FORNX-215",
+      "jira_url": "https://lightning-dust-mite.atlassian.net/browse/FORNX-215",
+      "applies_to_repos": []
+    },
+    {
+      "gate": "stage",
+      "jira_key": "FORNX-34",
+      "jira_url": "https://lightning-dust-mite.atlassian.net/browse/FORNX-34",
+      "applies_to_repos": []
+    }
+  ]
+}
