@@ -1,7 +1,7 @@
-# Adapter capability matrix — Claude Code vs. Codex CLI
+# Adapter capability matrix — Claude Code vs. Codex CLI vs. opencode
 
 Status: living doc, empirically grounded. Re-verify hook schemas against the
-installed CLI version before an adapter hard-codes field names — both
+installed CLI version before an adapter hard-codes field names — all three
 surfaces are actively changing.
 
 ## Claude Code
@@ -106,6 +106,57 @@ provenance `codex:rollout:exec_command_end`. `aggregated_output` is command
 stdout+stderr merged — treat as sensitive-by-default for the privacy
 classifier (FORNX-33), same as Claude Code's `tool_response`.
 
+## opencode (FORNX-161)
+
+Source: `@opencode-ai/plugin` v1.18.25's shipped TypeScript definitions
+(`dist/index.d.ts`, read directly — no secondary sources), confirmed against
+a real, live opencode v1.18.25 session on this machine (2026-08-30) with a
+plugin logging every hook invocation verbatim.
+
+opencode's integration point is a `Plugin` function
+(`(input: PluginInput, options?) => Promise<Hooks>`) that opencode's own
+runtime loads **in-process** and invokes synchronously — genuinely distinct
+from both Claude Code (external hook-script process, spawned per event) and
+Codex (poll/tail of a file the provider writes on its own schedule).
+
+| Hook | Fields | Evidence obtainable |
+|---|---|---|
+| `tool.execute.before` | `input: {tool, sessionID, callID}`, `output: {args}` (mutable) | Exact tool name + args before execution; can rewrite `args` (this adapter only observes, never rewrites) |
+| `tool.execute.after` | `input: {tool, sessionID, callID, args}`, `output: {title, output, metadata: {output, exit, truncated}}` | **`metadata.exit` is a literal integer exit code** — confirmed real (bash tool), no heuristic needed. First of the three providers to expose this. |
+| `event` (event-bus passthrough) | `{id, type, properties}` — many `type`s (`session.created`, `session.idle`, `session.updated`, `message.updated`, `message.part.updated`, ...) | `session.created`/`session.idle` give session-lifecycle start/end. `message.part.updated` with `part.type === "tool"` mirrors the `tool.execute.*` hooks' state machine (`running` → `completed`) — confirmed present but not translated by this adapter (scoped out per FORNX-161's single-event-path AC). `message.updated`/text parts genuinely carry the agent's final response — same scope note. |
+| `chat.message` | `input: {sessionID, agent, model}`, `output: {message, parts}` | The user's own turn content — recognized, deliberately `Ignored` |
+| `permission.ask` | `Permission` in, `{status}` out | Can allow/deny/ask on a pending action — not translated by this adapter (out of FORNX-161's scope) |
+
+### Explicit UNSUPPORTED / capability gaps for opencode (report, never infer around)
+
+- No subagent-specific hook anywhere in the Hooks interface — genuinely
+  structural, not merely unobserved (`SignalClass::SubagentLifecycle`:
+  `Unsupported`).
+- No reasoning-summary/raw-reasoning hook or message-part type observed for
+  a local tool-calling model session, and no logprobs field anywhere in the
+  Hooks interface (`ReasoningSummary`/`RawReasoning`/`TokenLogprobs`:
+  `Unsupported`).
+
+### A real, reproducible local-Ollama tool-calling limitation (2026-08-30)
+
+Every locally available Ollama tool-calling model
+(`qwen2.5-coder:7b`/`:14b`, `mistral-nemo:latest`) reliably degrades a real
+`tool_calls` response into plain-text JSON once the request carries
+opencode's actual production system prompt (~20k tokens, ~10 tool
+definitions) — reproduced directly against Ollama v0.32.11's HTTP API
+(`/v1/chat/completions` and `/api/chat`, streaming and non-streaming),
+independent of opencode. The same models emit well-formed `tool_calls`
+against a minimal (~160-token, 1-tool) prompt. This means the "genuinely
+distinct integration mechanism, zero-cost local-Ollama path" premise
+FORNX-161 was scoped around holds for the *integration mechanism* (the
+in-process plugin API is real and works), but not, on this machine/Ollama
+version, for driving that mechanism through fully autonomous local
+tool-calling at opencode's real prompt size — see
+`docs/research/0002-third-provider-fitness-report.md` for how the golden
+fixtures were captured despite this (a deterministic stub standing in for
+only the LLM turn; every tool-execution event downstream of it is
+opencode's own genuine code).
+
 ## Formalized capability taxonomy (FORNX-155)
 
 The per-adapter capability declarations this doc's tables describe (Claude
@@ -119,6 +170,13 @@ e.g. `fornax-adapter-codex` declares `ToolInvocation`/`SubagentLifecycle` as
 `Unsupported` (Codex hooks are opt-in/admin-suppressible per this doc) and
 `ProcessResult` as `Unavailable` (the confirmed `exec_command_end.exit_code`
 field above exists for Codex in principle; this adapter's primary
-rollout-tail path just hasn't wired an evidence path for it yet). See that
+rollout-tail path just hasn't wired an evidence path for it yet).
+`fornax-adapter-opencode` (FORNX-161) is the sharpest illustration of the
+three-state design paying off: it declares `ProcessResult` `Available` (a
+genuine literal exit code, no heuristic) while declaring
+`SubagentLifecycle` `Unsupported` (no such hook exists at all) and
+`FinalResponse` `Unavailable` (the signal exists in the real event stream,
+this adapter version just doesn't translate it yet) — three different
+states for three materially different reasons, on one adapter. See that
 module's doc comments for the full taxonomy and each adapter's
-`*_capabilities()` function for the field-by-field mapping.
+`*_capabilities()`/`probe()` function for the field-by-field mapping.
