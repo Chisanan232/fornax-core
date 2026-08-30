@@ -9,12 +9,13 @@
 use fornax_adapter_claude::ClaudeAdapter;
 use fornax_adapter_codex::CodexAdapter;
 use fornax_adapter_conformance::{
-    capability_declaration_is_well_formed,
+    capability_declaration_is_well_formed, every_message_round_trips_through_the_wire_protocol,
     evidence_payloads_validate_against_their_canonical_schema, evidence_sources_are_valid,
     load_fixtures, replay_fixture,
 };
 use fornax_types::{
-    AgentAdapter, ContentClass, ExtensionEnvelope, IngestMessage, NormalizationOutcome, Provider,
+    AgentAdapter, CapabilityProbe, ContentClass, EventKind, ExtensionEnvelope, IngestMessage,
+    NormalizationOutcome, Provider, SignalAvailability, SignalClass,
 };
 
 fn claude_native_events() -> Vec<serde_json::Value> {
@@ -26,9 +27,12 @@ fn claude_native_events() -> Vec<serde_json::Value> {
 }
 
 fn codex_native_events() -> Vec<serde_json::Value> {
-    // Excludes the call/output pairing fixture: these generic per-event
-    // checks replay a fresh adapter per native event, which would break the
-    // call_id correlation. The pairing itself is covered end-to-end by
+    // Excludes the call/output pairing fixture: `session_meta` latches a
+    // discovered session id onto the adapter, and the call/output pair only
+    // correlates correctly when replayed in order — mixing its two events
+    // into this flat, order-agnostic list (used across several independent
+    // checks below) would either desync the session id or split the pair.
+    // The pairing itself is covered end-to-end, in order, by
     // `golden_fixtures.rs`'s FORNX-55 regression test.
     load_fixtures("codex")
         .into_iter()
@@ -47,6 +51,90 @@ fn claude_capability_declaration_is_well_formed() {
 #[test]
 fn codex_capability_declaration_is_well_formed() {
     capability_declaration_is_well_formed(&CodexAdapter::new());
+}
+
+/// Declaration-vs-reality cross-check, not just shape validation: Claude
+/// declares `ProcessResult: Unsupported` (`ClaudeAdapter::probe`'s doc — Bash
+/// `tool_response` carries no literal exit code). If any real Claude fixture
+/// ever produced a *non*-heuristic `ExitCode` Evidence, that would directly
+/// contradict this adapter's own capability declaration — a conformance bug
+/// the tautological "does probe() equal probe()" checks above cannot catch.
+#[test]
+fn claude_declares_process_result_unsupported_and_never_emits_a_literal_exit_code() {
+    let adapter = ClaudeAdapter;
+    assert_eq!(
+        adapter.probe().state_of(&SignalClass::ProcessResult),
+        SignalAvailability::Unsupported,
+        "this test's other assertion depends on this declaration staying Unsupported"
+    );
+
+    let mut adapter = ClaudeAdapter;
+    for native in claude_native_events() {
+        if let NormalizationOutcome::Messages(msgs) = adapter.normalize("fixture-hint", &native) {
+            for msg in msgs {
+                if let IngestMessage::Evidence(ev) = msg {
+                    assert_eq!(
+                        ev.payload["heuristic"],
+                        serde_json::json!(true),
+                        "ClaudeAdapter declares ProcessResult Unsupported, so every ExitCode \
+                         Evidence it emits must be heuristic, never a literal exit code"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Same kind of cross-check for Codex: `ToolInvocation` is declared
+/// `Unsupported` (rollout-tail cannot intercept pre-execution) — no golden
+/// fixture replay may ever yield a `PreToolUse` event, which would
+/// contradict that declaration.
+#[test]
+fn codex_declares_tool_invocation_unsupported_and_never_emits_pre_tool_use() {
+    let adapter = CodexAdapter::new();
+    assert_eq!(
+        adapter.probe().state_of(&SignalClass::ToolInvocation),
+        SignalAvailability::Unsupported,
+        "this test's other assertion depends on this declaration staying Unsupported"
+    );
+
+    let mut adapter = CodexAdapter::new();
+    for native in codex_native_events() {
+        if let NormalizationOutcome::Messages(msgs) = adapter.normalize("fixture-hint", &native) {
+            for msg in msgs {
+                if let IngestMessage::Event(ev) = msg {
+                    assert_ne!(
+                        ev.kind,
+                        EventKind::PreToolUse,
+                        "CodexAdapter declares ToolInvocation Unsupported, so it must never \
+                         emit a PreToolUse event"
+                    );
+                }
+            }
+        }
+    }
+}
+
+// --- FORNX-156 wire-protocol property, exercised against golden fixtures --
+
+#[test]
+fn claude_golden_fixtures_round_trip_through_the_wire_protocol() {
+    let mut adapter = ClaudeAdapter;
+    every_message_round_trips_through_the_wire_protocol(
+        &mut adapter,
+        "fixture-hint",
+        &claude_native_events(),
+    );
+}
+
+#[test]
+fn codex_golden_fixtures_round_trip_through_the_wire_protocol() {
+    let mut adapter = CodexAdapter::new();
+    every_message_round_trips_through_the_wire_protocol(
+        &mut adapter,
+        "fixture-hint",
+        &codex_native_events(),
+    );
 }
 
 // --- Provenance correctness (FORNX-157) ------------------------------------

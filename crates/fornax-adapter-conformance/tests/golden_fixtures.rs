@@ -1,5 +1,5 @@
 //! Golden-fixture kit (FORNX-160): both real Claude/Codex adapters proven
-//! against real (sanitized) sanitized captured event shapes, a genuine
+//! against real, sanitized captured event shapes, a genuine
 //! historical schema-drift regression (FORNX-55), and a synthetic
 //! breaking-change probe per provider, all through the
 //! [`fornax_adapter_conformance::replay_fixture`] harness — this is the

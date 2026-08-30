@@ -1,7 +1,7 @@
 {
   "provider": "codex",
-  "provider_runtime_version": "confirmed-schema-2026-08-28",
-  "description": "Confirmed exec_command_end rollout payload shape from docs/research/adapter-capability-matrix.md's empirical field dump — the one Codex shape confirmed to carry a literal (non-heuristic) exit_code.",
+  "provider_runtime_version": "unconfirmed",
+  "description": "exec_command_end rollout payload shape from docs/research/adapter-capability-matrix.md's empirical field dump (confirmed against real local rollout files 2026-08-28, exact emitting codex-cli version not recorded in that pass) — the one Codex shape confirmed to carry a literal (non-heuristic) exit_code. FORNX-55 later established that codex-cli 0.147.0 does NOT emit this shape at all for shell exec (see custom_tool_call_exec_pair.json); kept as a separate fixture because the matrix doc's empirical capture proves this shape is real for *some* codex-cli version, even though this adapter's primary rollout-tail path has not observed it live end-to-end (see CodexAdapter::probe's ProcessResult: Unavailable declaration).",
   "sanitized": true,
   "historical_schema_drift_ticket": null,
   "native_events": [

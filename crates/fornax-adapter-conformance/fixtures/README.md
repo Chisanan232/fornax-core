@@ -21,8 +21,12 @@ live adapter by `fornax_adapter_conformance::replay_fixture` (see
 - `provider` — `claude_code` or `codex`, matching `fornax_types::Provider`'s wire tag.
 - `provider_runtime_version` — the real provider CLI/runtime version this
   shape was confirmed against (see `docs/research/adapter-capability-matrix.md`),
-  or `"synthetic"` for a deliberately fabricated breaking-change fixture that
-  was never observed live (see the `unrecognized_future_*` fixtures).
+  `"synthetic"` for a deliberately fabricated breaking-change fixture that
+  was never observed live (see the `unrecognized_future_*` fixtures), or
+  `"unconfirmed"` for a shape that is real (not fabricated) but whose exact
+  emitting provider version was not recorded at capture time — say so
+  honestly in `description` rather than inventing a version number (see
+  `codex/exec_command_end.json`).
 - `sanitized` — must be `true`. `load_fixtures` panics on any fixture
   missing this or set to `false` — a fixture that cannot prove it was
   sanitized must never load silently. Sanitizing means: no real usernames,
