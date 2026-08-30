@@ -186,7 +186,18 @@ impl Store {
 
     /// All evidence rows for a session, oldest first — the input a verifier
     /// needs alongside a claim.
-    pub async fn evidence_for_session(&self, session_id: &str) -> Result<Vec<Evidence>> {
+    ///
+    /// FORNX-289: one row that fails to deserialize (e.g. an `extension`
+    /// blob stamped with a `schema_version` this binary no longer/doesn't
+    /// yet support, see `ExtensionEnvelope`'s `TryFrom`) must not take down
+    /// the whole session's evidence read — a verifier still needs the N-1
+    /// good rows. The failure is not silently dropped either: it comes back
+    /// in `failed`, named by row id, so the caller can decide what "N of M
+    /// evidence rows for this session failed to deserialize" means for it
+    /// (log, surface to an operator, etc). This is deliberately scoped to
+    /// *this* session-wide query — a direct single-row read/version-check
+    /// elsewhere still fails loudly per FORNX-158's original design.
+    pub async fn evidence_for_session(&self, session_id: &str) -> Result<EvidenceReadOutcome> {
         let rows = sqlx::query_as::<_, EvidenceRow>(
             "SELECT id, session_id, source_event_id, kind, observed_at, payload, provenance, source, extension
              FROM evidence WHERE session_id = ?1 ORDER BY observed_at ASC",
@@ -194,7 +205,19 @@ impl Store {
         .bind(session_id)
         .fetch_all(&self.pool)
         .await?;
-        rows.into_iter().map(TryInto::try_into).collect()
+        let mut evidence = Vec::with_capacity(rows.len());
+        let mut failed = Vec::new();
+        for row in rows {
+            let id = row.id.clone();
+            match Evidence::try_from(row) {
+                Ok(ev) => evidence.push(ev),
+                Err(e) => failed.push(EvidenceReadFailure {
+                    id,
+                    error: e.to_string(),
+                }),
+            }
+        }
+        Ok(EvidenceReadOutcome { evidence, failed })
     }
 
     /// All events for a session, oldest first (FORNX-60: needed alongside
@@ -307,6 +330,26 @@ impl Store {
         .await?;
         Ok(rows)
     }
+}
+
+/// Result of `Store::evidence_for_session`: the rows that deserialized
+/// successfully, plus an explicit account of the ones that didn't (M minus
+/// `evidence.len()` gives the failed count; see `evidence_for_session`'s
+/// doc comment for why a bad row is reported rather than either silently
+/// dropped or failing the whole query).
+#[derive(Debug, Clone, Default)]
+pub struct EvidenceReadOutcome {
+    pub evidence: Vec<Evidence>,
+    pub failed: Vec<EvidenceReadFailure>,
+}
+
+/// One evidence row that could not be deserialized, named by its (opaque,
+/// unparsed — a bad row is not a place to introduce a second failure mode)
+/// id, with the deserialization error that was reported.
+#[derive(Debug, Clone)]
+pub struct EvidenceReadFailure {
+    pub id: String,
+    pub error: String,
 }
 
 #[derive(sqlx::FromRow)]
@@ -615,7 +658,8 @@ mod tests {
         let fetched_evidence = store
             .evidence_for_session("s1")
             .await
-            .expect("query evidence");
+            .expect("query evidence")
+            .evidence;
         assert_eq!(fetched_evidence.len(), 1);
         assert_eq!(fetched_evidence[0].id, evidence.id);
         assert_eq!(fetched_evidence[0].payload["exit_code"], 1);
@@ -654,7 +698,8 @@ mod tests {
         let evidence = store
             .evidence_for_session("s2")
             .await
-            .expect("query after restart");
+            .expect("query after restart")
+            .evidence;
         assert!(
             evidence.is_empty(),
             "no evidence was inserted, only an event"
@@ -869,7 +914,8 @@ mod tests {
         let fetched = store
             .evidence_for_session("s6")
             .await
-            .expect("query evidence");
+            .expect("query evidence")
+            .evidence;
         assert_eq!(fetched.len(), 1);
         assert_eq!(fetched[0].source, None);
 
@@ -933,7 +979,8 @@ mod tests {
         let fetched = store
             .evidence_for_session("s6b")
             .await
-            .expect("query evidence");
+            .expect("query evidence")
+            .evidence;
         assert_eq!(fetched.len(), 1);
         let source = fetched[0]
             .source
@@ -981,7 +1028,8 @@ mod tests {
         let refetched = store
             .evidence_for_session("s6b")
             .await
-            .expect("query evidence after re-insert");
+            .expect("query evidence after re-insert")
+            .evidence;
         let rewritten_source = refetched
             .iter()
             .find(|e| e.id == migrated.id)
@@ -1035,7 +1083,8 @@ mod tests {
         let fetched = store
             .evidence_for_session("s7")
             .await
-            .expect("query evidence");
+            .expect("query evidence")
+            .evidence;
         assert_eq!(fetched.len(), 1);
         assert_eq!(fetched[0].extension, None);
 
@@ -1095,7 +1144,8 @@ mod tests {
         let fetched = store
             .evidence_for_session("s8")
             .await
-            .expect("query evidence");
+            .expect("query evidence")
+            .evidence;
         assert_eq!(fetched.len(), 1);
         let got = fetched[0].extension.as_ref().expect("extension present");
         assert_eq!(
@@ -1104,6 +1154,95 @@ mod tests {
             "unknown extension field must not be dropped across the store round trip"
         );
         assert_eq!(got.fields["cache_read_tokens"], serde_json::json!(7));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// FORNX-289: a session with one good evidence row and one row whose
+    /// `extension` blob carries an incompatible `schema_version` (per
+    /// `ExtensionEnvelope`'s `TryFrom`, see `extension.rs`) must not fail
+    /// the whole session read — the caller still needs the good row, plus
+    /// an explicit account of the bad one (not a silent drop, and not a
+    /// fabricated success).
+    #[tokio::test]
+    async fn one_bad_extension_row_does_not_fail_the_whole_session_read() {
+        let path = tmp_db_path("evidence-partial-failure");
+        let store = Store::open(&path).await.expect("open db");
+
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "s9".into(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: Some("Bash".into()),
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        store.insert_event(&event).await.expect("insert event");
+
+        // Good row, inserted via the normal API.
+        let good = Evidence {
+            id: Uuid::new_v4(),
+            session_id: "s9".into(),
+            source_event_id: event.id,
+            kind: EvidenceKind::ExitCode,
+            observed_at: "2026-01-01T00:00:01Z".into(),
+            payload: serde_json::json!({"command": [], "exit_code": 0}),
+            provenance: "test".into(),
+            source: None,
+            extension: None,
+        };
+        store.insert_evidence(&good).await.expect("insert good row");
+
+        // Bad row: hand-inserted directly (bypassing `insert_evidence`,
+        // which would require a valid `ExtensionEnvelope` to serialize in
+        // the first place) with an `extension` blob whose `schema_version`
+        // is outside `SUPPORTED_EXTENSION_SCHEMA_VERSIONS`.
+        let bad_id = Uuid::new_v4();
+        let bad_extension = serde_json::json!({
+            "schema_version": 999,
+            "provider": "claude_code",
+            "adapter_version": "claude-adapter-0.3.0",
+            "content_class": "tool_telemetry",
+            "fields": {}
+        })
+        .to_string();
+        sqlx::query(
+            "INSERT INTO evidence (id, session_id, source_event_id, kind, observed_at, payload, provenance, extension)
+             VALUES (?1, 's9', ?2, 'exit_code', '2026-01-01T00:00:02Z', '{\"exit_code\":0}', 'legacy', ?3)",
+        )
+        .bind(bad_id.to_string())
+        .bind(event.id.to_string())
+        .bind(&bad_extension)
+        .execute(&store.pool)
+        .await
+        .expect("hand-insert row with an incompatible extension schema_version");
+
+        let outcome = store
+            .evidence_for_session("s9")
+            .await
+            .expect("session read must succeed despite one bad row");
+
+        assert_eq!(
+            outcome.evidence.len(),
+            1,
+            "the good row must still come back"
+        );
+        assert_eq!(outcome.evidence[0].id, good.id);
+
+        assert_eq!(
+            outcome.failed.len(),
+            1,
+            "the bad row must be reported, not silently dropped"
+        );
+        assert_eq!(outcome.failed[0].id, bad_id.to_string());
+        assert!(
+            outcome.failed[0].error.contains("incompatible"),
+            "failure reason must name the FORNX-158 incompatibility, got: {}",
+            outcome.failed[0].error
+        );
 
         std::fs::remove_file(&path).ok();
     }
