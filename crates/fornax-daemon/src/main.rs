@@ -197,7 +197,16 @@ async fn handle_message(
                 .get(&claim.session_id)
                 .cloned()
                 .unwrap_or_else(default_unknown_caps);
-            let evidence = state.store.evidence_for_session(&claim.session_id).await?;
+            let evidence_read = state.store.evidence_for_session(&claim.session_id).await?;
+            if !evidence_read.failed.is_empty() {
+                tracing::warn!(
+                    session_id = %claim.session_id,
+                    failed = evidence_read.failed.len(),
+                    total = evidence_read.evidence.len() + evidence_read.failed.len(),
+                    "skipping evidence rows that failed to deserialize"
+                );
+            }
+            let evidence = evidence_read.evidence;
 
             let verifiers: Vec<Box<dyn Verifier + Send + Sync>> =
                 vec![Box::new(TestResultVerifier)];
