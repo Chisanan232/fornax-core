@@ -231,23 +231,38 @@ fn plugin_binary_daemon_pipeline_delivers_real_evidence() {
         .expect("run node harness");
     assert!(node_status.success(), "node harness exited non-zero");
 
-    // Give the daemon's serialized-processing pipeline a moment, then poll
-    // the actual on-disk SQLite store -- the same store the daemon itself
-    // reads/writes -- rather than trusting the plugin's own exit code.
+    // Poll the actual on-disk SQLite store -- the same store the daemon
+    // itself reads/writes -- rather than trusting the plugin's own exit
+    // code. The plugin/hook sends four messages (session.created,
+    // tool.execute.before, tool.execute.after, session.idle) over a
+    // fire-and-forget socket with no ack, and the daemon ingests them one at
+    // a time, so the store can legitimately contain a partial prefix (e.g.
+    // only `SessionStart`, or all three events but not yet the evidence
+    // derived from `PostToolUse`) for a little while after the harness
+    // process exits. Waiting for merely a *non-empty* event list races that
+    // ingestion: on a loaded runner it can observe the store between
+    // messages rather than after all of them have landed. Wait for the
+    // exact end state the assertions below check instead, so `poll_until`
+    // keeps polling until the daemon has actually finished, rather than
+    // stopping at the first sign of partial progress.
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let (events, evidence) = poll_until(
         Duration::from_secs(5),
-        "waiting for the daemon to persist the real session's events",
+        "waiting for the daemon to persist the real session's events and evidence",
         || tail_log(&daemon_log_path),
         || {
             rt.block_on(async {
                 let store = fornax_store::Store::open(&db_path).await.ok()?;
                 let events = store.events_for_session(&session_id).await.ok()?;
                 let evidence = store.evidence_for_session(&session_id).await.ok()?.evidence;
-                if events.is_empty() {
-                    None
-                } else {
+                let kinds: Vec<_> = events.iter().map(|e| e.kind).collect();
+                let has_all_events = kinds.contains(&fornax_types::EventKind::SessionStart)
+                    && kinds.contains(&fornax_types::EventKind::PreToolUse)
+                    && kinds.contains(&fornax_types::EventKind::PostToolUse);
+                if has_all_events && !evidence.is_empty() {
                     Some((events, evidence))
+                } else {
+                    None
                 }
             })
         },
