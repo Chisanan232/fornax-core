@@ -105,3 +105,20 @@ directly to `EvidenceKind::ExitCode` / `EvidenceKind::ToolResult` with
 provenance `codex:rollout:exec_command_end`. `aggregated_output` is command
 stdout+stderr merged — treat as sensitive-by-default for the privacy
 classifier (FORNX-33), same as Claude Code's `tool_response`.
+
+## Formalized capability taxonomy (FORNX-155)
+
+The per-adapter capability declarations this doc's tables describe (Claude
+Code's/Codex's confirmed-vs-gap signal availability) are now expressed in
+code as `fornax_types::capabilities::{SignalClass, SignalAvailability}`
+(`crates/fornax-types/src/capabilities.rs`) rather than the six fixed
+`RuntimeCapabilities` bools this doc originally motivated. `Unsupported`
+("this runtime fundamentally cannot expose this") and `Unavailable` ("exists
+in principle, not observed this session/version") are now distinct states —
+e.g. `fornax-adapter-codex` declares `ToolInvocation`/`SubagentLifecycle` as
+`Unsupported` (Codex hooks are opt-in/admin-suppressible per this doc) and
+`ProcessResult` as `Unavailable` (the confirmed `exec_command_end.exit_code`
+field above exists for Codex in principle; this adapter's primary
+rollout-tail path just hasn't wired an evidence path for it yet). See that
+module's doc comments for the full taxonomy and each adapter's
+`*_capabilities()` function for the field-by-field mapping.

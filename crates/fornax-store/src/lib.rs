@@ -3,7 +3,9 @@
 //! verifiers (FORNX-49) from this store alone, with no network/adapter
 //! dependency.
 
-use fornax_types::{AgentEvent, Claim, Evidence, Finding, RuntimeCapabilities};
+use fornax_types::{
+    AgentEvent, Claim, Evidence, Finding, LegacyCapabilitiesWire, RuntimeCapabilities,
+};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
 use std::path::Path;
@@ -205,17 +207,24 @@ impl Store {
     /// for `session_id` (FORNX-62). Unlike `insert_*`, this is an upsert on
     /// `(session_id, provider)` — see `migrations/0002_runtime_capabilities.sql`
     /// for why capabilities don't follow the insert-only convention.
+    ///
+    /// Writes both the formalized `signals`/`schema_version` columns
+    /// (FORNX-155, source of truth) and the six legacy `supports_*` bool
+    /// columns (write-only compatibility mirror, derived via
+    /// `LegacyCapabilitiesWire` — see `migrations/0003_capability_signals.sql`).
     pub async fn upsert_capabilities(
         &self,
         session_id: &str,
         caps: &RuntimeCapabilities,
     ) -> Result<()> {
+        let legacy = LegacyCapabilitiesWire::from(caps);
         sqlx::query(
             "INSERT INTO runtime_capabilities
                 (session_id, provider, supports_pre_tool_use, supports_post_tool_use,
                  supports_tool_response_capture, supports_session_stop_event,
-                 supports_transcript_tail, supports_subagent_lifecycle, notes, observed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                 supports_transcript_tail, supports_subagent_lifecycle, notes,
+                 schema_version, signals, observed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
              ON CONFLICT(session_id, provider) DO UPDATE SET
                 supports_pre_tool_use = excluded.supports_pre_tool_use,
                 supports_post_tool_use = excluded.supports_post_tool_use,
@@ -224,17 +233,21 @@ impl Store {
                 supports_transcript_tail = excluded.supports_transcript_tail,
                 supports_subagent_lifecycle = excluded.supports_subagent_lifecycle,
                 notes = excluded.notes,
+                schema_version = excluded.schema_version,
+                signals = excluded.signals,
                 observed_at = excluded.observed_at",
         )
         .bind(session_id)
         .bind(tag(&caps.provider)?)
-        .bind(caps.supports_pre_tool_use)
-        .bind(caps.supports_post_tool_use)
-        .bind(caps.supports_tool_response_capture)
-        .bind(caps.supports_session_stop_event)
-        .bind(caps.supports_transcript_tail)
-        .bind(caps.supports_subagent_lifecycle)
+        .bind(legacy.supports_pre_tool_use)
+        .bind(legacy.supports_post_tool_use)
+        .bind(legacy.supports_tool_response_capture)
+        .bind(legacy.supports_session_stop_event)
+        .bind(legacy.supports_transcript_tail)
+        .bind(legacy.supports_subagent_lifecycle)
         .bind(serde_json::to_string(&caps.notes)?)
+        .bind(caps.schema_version as i64)
+        .bind(serde_json::to_string(&caps.signals)?)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -250,7 +263,8 @@ impl Store {
         let rows = sqlx::query_as::<_, CapabilitiesRow>(
             "SELECT provider, supports_pre_tool_use, supports_post_tool_use,
                     supports_tool_response_capture, supports_session_stop_event,
-                    supports_transcript_tail, supports_subagent_lifecycle, notes
+                    supports_transcript_tail, supports_subagent_lifecycle, notes,
+                    schema_version, signals
              FROM runtime_capabilities WHERE session_id = ?1 ORDER BY provider ASC",
         )
         .bind(session_id)
@@ -380,21 +394,43 @@ struct CapabilitiesRow {
     supports_transcript_tail: bool,
     supports_subagent_lifecycle: bool,
     notes: String,
+    /// `NULL` for any row written before FORNX-155's 0003 migration.
+    schema_version: Option<i64>,
+    /// `NULL` for any row written before FORNX-155's 0003 migration —
+    /// reconstruct from the six bool columns above in that case. Non-NULL
+    /// rows are authoritative and complete; the bool columns are then only a
+    /// write-only compatibility mirror (see 0003's migration comment).
+    signals: Option<String>,
 }
 
 impl TryFrom<CapabilitiesRow> for RuntimeCapabilities {
     type Error = StoreError;
     fn try_from(r: CapabilitiesRow) -> Result<Self> {
-        Ok(RuntimeCapabilities {
-            provider: from_tag(&r.provider)?,
-            supports_pre_tool_use: r.supports_pre_tool_use,
-            supports_post_tool_use: r.supports_post_tool_use,
-            supports_tool_response_capture: r.supports_tool_response_capture,
-            supports_session_stop_event: r.supports_session_stop_event,
-            supports_transcript_tail: r.supports_transcript_tail,
-            supports_subagent_lifecycle: r.supports_subagent_lifecycle,
-            notes: serde_json::from_str(&r.notes)?,
-        })
+        // Route both the pre-0003 (bools only) and post-0003 (signals JSON)
+        // row shapes through `RuntimeCapabilities`'s own tolerant
+        // `Deserialize` impl (`fornax_types::capabilities`), rather than
+        // duplicating its legacy-bool-reconstruction rule here — one
+        // reconstruction rule, exercised by both the wire path and this
+        // store path, cannot drift apart.
+        let mut value = serde_json::json!({});
+        value["provider"] = serde_json::Value::String(r.provider.clone());
+        value["supports_pre_tool_use"] = serde_json::Value::Bool(r.supports_pre_tool_use);
+        value["supports_post_tool_use"] = serde_json::Value::Bool(r.supports_post_tool_use);
+        value["supports_tool_response_capture"] =
+            serde_json::Value::Bool(r.supports_tool_response_capture);
+        value["supports_session_stop_event"] =
+            serde_json::Value::Bool(r.supports_session_stop_event);
+        value["supports_transcript_tail"] = serde_json::Value::Bool(r.supports_transcript_tail);
+        value["supports_subagent_lifecycle"] =
+            serde_json::Value::Bool(r.supports_subagent_lifecycle);
+        value["notes"] = serde_json::from_str(&r.notes)?;
+        if let Some(schema_version) = r.schema_version {
+            value["schema_version"] = serde_json::Value::Number(schema_version.into());
+        }
+        if let Some(signals) = &r.signals {
+            value["signals"] = serde_json::from_str(signals)?;
+        }
+        Ok(serde_json::from_value(value)?)
     }
 }
 
@@ -588,14 +624,42 @@ mod tests {
     }
 
     fn sample_capabilities() -> RuntimeCapabilities {
+        use fornax_types::{CapabilitySignal, SignalAvailability, SignalClass};
         RuntimeCapabilities {
+            schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
             provider: Provider::ClaudeCode,
-            supports_pre_tool_use: true,
-            supports_post_tool_use: true,
-            supports_tool_response_capture: true,
-            supports_session_stop_event: false,
-            supports_transcript_tail: true,
-            supports_subagent_lifecycle: false,
+            signals: vec![
+                CapabilitySignal {
+                    class: SignalClass::ToolInvocation,
+                    state: SignalAvailability::Available,
+                    detail: None,
+                },
+                CapabilitySignal {
+                    class: SignalClass::ToolTrace,
+                    state: SignalAvailability::Available,
+                    detail: None,
+                },
+                CapabilitySignal {
+                    class: SignalClass::ToolResultPayload,
+                    state: SignalAvailability::Available,
+                    detail: None,
+                },
+                CapabilitySignal {
+                    class: SignalClass::SessionLifecycle,
+                    state: SignalAvailability::Unknown,
+                    detail: None,
+                },
+                CapabilitySignal {
+                    class: SignalClass::FinalResponse,
+                    state: SignalAvailability::Available,
+                    detail: None,
+                },
+                CapabilitySignal {
+                    class: SignalClass::SubagentLifecycle,
+                    state: SignalAvailability::Unknown,
+                    detail: None,
+                },
+            ],
             notes: [("session_id".to_string(), "s3".to_string())].into(),
         }
     }
@@ -622,8 +686,8 @@ mod tests {
             .expect("query capabilities after restart");
         assert_eq!(fetched.len(), 1);
         assert_eq!(fetched[0].provider, Provider::ClaudeCode);
-        assert!(fetched[0].supports_pre_tool_use);
-        assert!(!fetched[0].supports_session_stop_event);
+        assert!(fetched[0].is_observable(&fornax_types::SignalClass::ToolInvocation));
+        assert!(!fetched[0].is_observable(&fornax_types::SignalClass::SessionLifecycle));
         assert_eq!(fetched[0].notes.get("session_id").unwrap(), "s3");
 
         std::fs::remove_file(&path).ok();
@@ -644,7 +708,13 @@ mod tests {
             .expect("first announcement");
 
         let mut updated = sample_capabilities();
-        updated.supports_session_stop_event = true;
+        if let Some(s) = updated
+            .signals
+            .iter_mut()
+            .find(|s| s.class == fornax_types::SignalClass::SessionLifecycle)
+        {
+            s.state = fornax_types::SignalAvailability::Available;
+        }
         store
             .upsert_capabilities("s4", &updated)
             .await
@@ -659,7 +729,7 @@ mod tests {
             1,
             "re-announcement must overwrite, not add a row"
         );
-        assert!(fetched[0].supports_session_stop_event);
+        assert!(fetched[0].is_observable(&fornax_types::SignalClass::SessionLifecycle));
 
         std::fs::remove_file(&path).ok();
     }
@@ -674,6 +744,50 @@ mod tests {
             .await
             .expect("query capabilities");
         assert!(fetched.is_empty());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// FORNX-155: a row written before the 0003 migration (bool columns
+    /// populated, `schema_version`/`signals` both NULL) must still read back
+    /// correctly, reconstructed via the exact same legacy rule the wire path
+    /// uses. Simulates that shape by hand-inserting directly rather than via
+    /// `upsert_capabilities` (which always writes the new columns).
+    #[tokio::test]
+    async fn pre_migration_row_with_null_signals_reconstructs_from_legacy_bools() {
+        let path = tmp_db_path("caps-pre-migration");
+        let store = Store::open(&path).await.expect("open db");
+
+        sqlx::query(
+            "INSERT INTO runtime_capabilities
+                (session_id, provider, supports_pre_tool_use, supports_post_tool_use,
+                 supports_tool_response_capture, supports_session_stop_event,
+                 supports_transcript_tail, supports_subagent_lifecycle, notes)
+             VALUES ('s5', 'codex', 0, 1, 1, 1, 1, 0, '{}')",
+        )
+        .execute(&store.pool)
+        .await
+        .expect("hand-insert pre-migration row");
+
+        let fetched = store
+            .capabilities_for_session("s5")
+            .await
+            .expect("query capabilities");
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(
+            fetched[0].schema_version,
+            fornax_types::CAPABILITY_SCHEMA_VERSION
+        );
+        assert!(!fetched[0].is_observable(&fornax_types::SignalClass::ToolInvocation));
+        assert!(fetched[0].is_observable(&fornax_types::SignalClass::ToolTrace));
+        assert!(fetched[0].is_observable(&fornax_types::SignalClass::SessionLifecycle));
+        assert!(!fetched[0].is_observable(&fornax_types::SignalClass::SubagentLifecycle));
+        // A class the old bools never covered is ordinary absence, not a
+        // fabricated Unsupported/Unavailable claim.
+        assert_eq!(
+            fetched[0].state_of(&fornax_types::SignalClass::ProcessResult),
+            fornax_types::SignalAvailability::Unknown
+        );
 
         std::fs::remove_file(&path).ok();
     }
