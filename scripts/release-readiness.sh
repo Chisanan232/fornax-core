@@ -166,6 +166,18 @@ contains_ci() {
   esac
 }
 
+# explicit BLOCK verdict token: case-sensitive, whole word only.
+# A naive case-insensitive substring match on "block" false-positives on
+# ordinary English ("blocking", "blocker", "should block done") that shows
+# up in routine ticket prose and would make this check permanently
+# unsatisfiable for any well-written ticket. Sign-off verdicts are written
+# as an uppercase token (see tests/release-readiness/fixtures/block_verdict),
+# so match only that.
+has_block_verdict() {
+  local haystack="$1"
+  printf '%s' "$haystack" | grep -qE '(^|[^A-Za-z])BLOCK([^A-Za-z]|$)'
+}
+
 # ---------------------------------------------------------------------------
 # Load manifest
 # ---------------------------------------------------------------------------
@@ -269,7 +281,7 @@ while IFS= read -r ev_json; do
   fi
 
   text="$(evidence_field "$key" '.text // ""')"
-  if contains_ci "$text" "block"; then
+  if has_block_verdict "$text"; then
     add_check "${prefix}.not_blocked" "fail" "ticket ${key} records a BLOCK verdict"
   else
     add_check "${prefix}.not_blocked" "pass" "no BLOCK verdict found"
