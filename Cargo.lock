@@ -555,6 +555,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fornax-adapter-conformance"
+version = "0.0.1"
+dependencies = [
+ "fornax-adapter-claude",
+ "fornax-adapter-codex",
+ "fornax-types",
+ "serde_json",
+]
+
+[[package]]
 name = "fornax-cli"
 version = "0.0.1"
 dependencies = [

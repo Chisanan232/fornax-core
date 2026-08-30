@@ -12,10 +12,12 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub mod adapter;
 pub mod capabilities;
 pub mod privacy;
 pub mod redact;
 
+pub use adapter::{AgentAdapter, NormalizationOutcome};
 pub use capabilities::{
     CapabilityProbe, CapabilitySignal, LegacyCapabilitiesWire, RuntimeCapabilities,
     SignalAvailability, SignalClass, CAPABILITY_SCHEMA_VERSION,
