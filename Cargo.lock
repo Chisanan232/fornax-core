@@ -561,6 +561,7 @@ dependencies = [
  "fornax-adapter-claude",
  "fornax-adapter-codex",
  "fornax-types",
+ "serde",
  "serde_json",
 ]
 
