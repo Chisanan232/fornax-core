@@ -213,11 +213,19 @@ pub fn evidence_sources_are_valid<A: AgentAdapter>(
 /// typed shape. This gives `validate_canonical_payload` a real caller
 /// exercising live adapter output, not just the hand-built fixtures in its
 /// own unit tests.
+///
+/// FORNX-289: asserts at least one `Evidence` message was actually produced
+/// and validated. Without this, a fixture set that happens to emit zero
+/// `Evidence` messages would make the check above vacuously true — the
+/// exact "wiring a call that never actually validates anything real"
+/// failure mode the ticket called out — and the test suite would report
+/// green having exercised nothing.
 pub fn evidence_payloads_validate_against_their_canonical_schema<A: AgentAdapter>(
     adapter: &mut A,
     session_hint: &str,
     native_events: &[serde_json::Value],
 ) {
+    let mut validated = 0usize;
     for native in native_events {
         if let NormalizationOutcome::Messages(msgs) = adapter.normalize(session_hint, native) {
             for msg in msgs {
@@ -230,10 +238,18 @@ pub fn evidence_payloads_validate_against_their_canonical_schema<A: AgentAdapter
                             )
                         },
                     );
+                    validated += 1;
                 }
             }
         }
     }
+    assert!(
+        validated > 0,
+        "expected at least one Evidence message from {:?}'s fixtures to exercise \
+         canonical-payload validation against — got zero, which would make this \
+         check vacuously true",
+        adapter.provider()
+    );
 }
 
 /// FORNX-156/158 boundary property, and the AC's "a breaking provider-event
