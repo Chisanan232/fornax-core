@@ -119,10 +119,24 @@ your provider actually exposes events) and writing `IngestMessage`s to the
 daemon's Unix Domain Socket. It calls `normalize()` and switches on the
 `NormalizationOutcome` to decide what to send; it contains no field-name
 literals from the provider's native shape. Model it on
-`crates/fornax-adapter-claude/src/main.rs` (stateless, one-shot) or
-`crates/fornax-adapter-codex/src/main.rs` (long-lived, tailing) depending on
-whether your provider's integration point is invocation-based or
-transcript-based.
+`crates/fornax-adapter-claude/src/main.rs` (stateless, one-shot per
+invocation via stdin) or `crates/fornax-adapter-codex/src/main.rs`
+(long-lived, tailing a transcript file) depending on whether your provider's
+integration point is invocation-based or transcript-based.
+
+**Gap found by FORNX-161 (opencode):** neither template above fits a
+provider whose real integration point is an in-process plugin/callback API
+(the provider's own runtime loads your code and invokes it directly, rather
+than spawning your binary per event or leaving a file for you to tail). For
+that shape, use a **third pattern**: a small companion script in the
+provider's own plugin language that the provider loads in-process, which
+spawns your adapter's binary *once* as a long-lived child process and pipes
+one line per real hook invocation to its stdin for the life of that process
+— see `crates/fornax-adapter-opencode/plugin/fornax-capture.js` and
+`crates/fornax-adapter-opencode/src/main.rs` for the worked example. Your
+binary's `main.rs` still contains no field-name literals and still only
+calls `normalize()` — only the framing (loop over stdin lines instead of one
+stdin read) and the process's lifetime differ.
 
 ## 6. Wire into the conformance suite
 
@@ -170,12 +184,26 @@ then add a fixture function and two tests mirroring the existing
   a real one gets found in the first place. Never fabricate one.
 
 If your adapter needs a new `Provider` variant, add it to
-`fornax_types::Provider` (`crates/fornax-types/src/lib.rs`) — check first
-whether anything downstream (`fornax-cli export-spool`,
-`LegacyCapabilitiesWire`) assumes exactly two variants, since that
-assumption is documented but not compiler-enforced (see
-`fornax-daemon::default_unknown_caps`'s doc comment for one place this
-already matters).
+`fornax_types::Provider` (`crates/fornax-types/src/lib.rs`). **Confirmed by
+FORNX-161** (the first adapter to actually add a third variant, `OpenCode`):
+`cargo check --workspace` and `cargo clippy --workspace --all-targets -- -D
+warnings` both pass with zero changes required anywhere outside
+`fornax-types/src/lib.rs` itself — there is no exhaustive `match` over
+`Provider` anywhere in `fornax-daemon`, `fornax-store`, `fornax-verify`, or
+`fornax-cli`; every reference is a literal constructor
+(`Provider::ClaudeCode`/`Provider::Codex`), never a switch that would fail
+to compile on a third variant. `LegacyCapabilitiesWire` is likewise generic
+over `provider: Provider`, not hardcoded to two.
+
+The one real constraint is **not** in this repo: `horonomy/fornax-cloud`'s
+ingest boundary enforces a closed, 2-variant `Provider` enum (see
+`fornax-daemon::default_unknown_caps`'s doc comment). Nothing in this repo
+needs fornax-cloud's enum extended to add a local adapter — the local
+daemon, store, and CLI never consult it — but `fornax export-spool` will
+produce a `provider` value fornax-cloud's ingest API will reject with a
+real 422 if a session from your new provider is ever exported there. Adding
+support for your provider on the fornax-cloud side (a separate, out-of-scope
+repo) is a prerequisite for cloud sync, not for local monitoring.
 
 ## 7. Verify
 

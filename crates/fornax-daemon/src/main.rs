@@ -226,8 +226,11 @@ async fn handle_message(
 /// real `Capabilities` announcement, once it arrives, is what gets
 /// persisted). The two candidate fixes are each worse than the bug — a
 /// `Provider::Unknown` variant risks reaching fornax-cloud's closed
-/// 2-variant enum as a live 422 if this value were ever exported by
-/// mistake, and a session→provider store lookup here would put a DB round
+/// enum (2 variants as of FORNX-155/156; a third, `OpenCode`, was added to
+/// this repo's own `Provider` in FORNX-161, but fornax-cloud's separate,
+/// out-of-scope ingest enum was not) as a live 422 if this value were ever
+/// exported by mistake, and a session→provider store lookup here would put
+/// a DB round
 /// trip on the verify hot path the `caps` in-memory cache exists
 /// specifically to avoid. Left as-is; a proper fix needs either an open
 /// `Provider` enum or provider plumbing through the claim path — tracked as

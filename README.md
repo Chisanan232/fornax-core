@@ -1,6 +1,7 @@
 # Fornax
 
-Evidence-first agent-integrity system for coding agents (Claude Code, Codex).
+Evidence-first agent-integrity system for coding agents (Claude Code, Codex,
+opencode).
 
 **What should I believe about what this agent is telling me, given the
 evidence currently available?**
@@ -66,6 +67,16 @@ daemon's HTTP port work the same way — see
 `docs/research/adapter-capability-matrix.md` for the Codex hook payload
 shape and `crates/fornax-adapter-codex` for that adapter's translation
 logic.
+
+opencode monitoring uses a third, distinct mechanism: an in-process
+`@opencode-ai/plugin` (`crates/fornax-adapter-opencode/plugin/fornax-capture.js`)
+that opencode's own runtime invokes synchronously, forwarding each hook
+event to the long-lived `fornax-hook-opencode` binary over stdin. Enable it
+by adding the plugin path to an opencode project's `opencode.json`
+(`{"plugin": ["<path>/fornax-capture.js"]}`) with `fornax-hook-opencode` on
+`PATH` — see `crates/fornax-adapter-opencode` and
+`docs/research/0002-third-provider-fitness-report.md` for the full design
+and its capability gaps versus Claude Code/Codex.
 
 ## Local storage, privacy and known limitations
 

@@ -132,6 +132,20 @@ mod tests {
     }
 
     #[test]
+    fn every_opencode_fixture_loads_and_is_sanitized() {
+        let fixtures = load_fixtures("opencode");
+        assert!(
+            !fixtures.is_empty(),
+            "expected at least one opencode fixture"
+        );
+        for f in &fixtures {
+            assert!(f.metadata.sanitized);
+            assert_eq!(f.metadata.provider, Provider::OpenCode);
+            assert!(!f.native_events.is_empty());
+        }
+    }
+
+    #[test]
     fn exactly_one_codex_fixture_is_tagged_as_the_fornx_55_regression() {
         let fixtures = load_fixtures("codex");
         let drift: Vec<_> = fixtures

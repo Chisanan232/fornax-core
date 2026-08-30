@@ -560,9 +560,23 @@ version = "0.0.1"
 dependencies = [
  "fornax-adapter-claude",
  "fornax-adapter-codex",
+ "fornax-adapter-opencode",
  "fornax-types",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "fornax-adapter-opencode"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "fornax-types",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
