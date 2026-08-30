@@ -145,7 +145,16 @@ async fn export_spool_from_store(
         // envelope id — see fornax-cloud's fornax-uploader::types::IngestMessage
         // ::canonical_id doc comment) — synthesize one purely for the spool
         // filename, matching that same convention.
-        write_envelope(&pending_dir, "capabilities", uuid::Uuid::new_v4(), caps)?;
+        //
+        // FORNX-155: the domain `RuntimeCapabilities` now carries
+        // `schema_version`/`signals`, which fornax-cloud's
+        // `fornax-uploader::types::RuntimeCapabilities` (a separate,
+        // out-of-scope repo) does not know about. Project to the frozen
+        // flat-bool wire shape at the export boundary so the spool envelope
+        // stays byte-for-byte wire-compatible — see
+        // `fornax_types::capabilities::LegacyCapabilitiesWire`'s doc comment.
+        let legacy = fornax_types::LegacyCapabilitiesWire::from(caps);
+        write_envelope(&pending_dir, "capabilities", uuid::Uuid::new_v4(), &legacy)?;
     }
 
     println!(
@@ -251,7 +260,10 @@ mod tests {
     // already established in fornax-verify's test suite.
     mod export_spool_capabilities {
         use super::*;
-        use fornax_types::{EventKind, EvidenceKind, Provider, RuntimeCapabilities};
+        use fornax_types::{
+            CapabilitySignal, EventKind, EvidenceKind, Provider, RuntimeCapabilities,
+            SignalAvailability, SignalClass,
+        };
         use uuid::Uuid;
 
         fn tmp_db_path(name: &str) -> std::path::PathBuf {
@@ -260,13 +272,40 @@ mod tests {
 
         fn aha_scenario_capabilities() -> RuntimeCapabilities {
             RuntimeCapabilities {
+                schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
                 provider: Provider::Codex,
-                supports_pre_tool_use: true,
-                supports_post_tool_use: true,
-                supports_tool_response_capture: true,
-                supports_session_stop_event: true,
-                supports_transcript_tail: true,
-                supports_subagent_lifecycle: false,
+                signals: vec![
+                    CapabilitySignal {
+                        class: SignalClass::ToolInvocation,
+                        state: SignalAvailability::Available,
+                        detail: None,
+                    },
+                    CapabilitySignal {
+                        class: SignalClass::ToolTrace,
+                        state: SignalAvailability::Available,
+                        detail: None,
+                    },
+                    CapabilitySignal {
+                        class: SignalClass::ToolResultPayload,
+                        state: SignalAvailability::Available,
+                        detail: None,
+                    },
+                    CapabilitySignal {
+                        class: SignalClass::SessionLifecycle,
+                        state: SignalAvailability::Available,
+                        detail: None,
+                    },
+                    CapabilitySignal {
+                        class: SignalClass::FinalResponse,
+                        state: SignalAvailability::Available,
+                        detail: None,
+                    },
+                    CapabilitySignal {
+                        class: SignalClass::SubagentLifecycle,
+                        state: SignalAvailability::Unsupported,
+                        detail: None,
+                    },
+                ],
                 notes: [("session_id".to_string(), "s-aha".to_string())].into(),
             }
         }
