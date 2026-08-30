@@ -37,6 +37,18 @@ struct AppState {
     /// live-session verdict computation never pays a DB round trip on the
     /// claim-verification hot path.
     caps: Arc<Mutex<HashMap<String, RuntimeCapabilities>>>,
+    /// FORNX-281: each hook invocation is a fresh UDS connection handled by
+    /// its own spawned task, with no ack from the daemon back to the hook —
+    /// so nothing guarantees an earlier event (e.g. PostToolUse, carrying
+    /// the exit-code Evidence a claim needs) finishes its DB write before a
+    /// later message (e.g. Stop's Claim, which verifies against whatever
+    /// Evidence already exists) starts processing on a different task. This
+    /// is a single local daemon serving one user's sequential agent
+    /// actions (ADR 0001) — not a system that needs concurrent throughput —
+    /// so the correct fix is to make message *processing* strictly
+    /// serialized in arrival order, not to make verification tolerant of
+    /// partial evidence. Held for the full duration of `handle_message`.
+    processing: Arc<Mutex<()>>,
 }
 
 #[tokio::main]
@@ -57,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         store,
         caps: Arc::new(Mutex::new(HashMap::new())),
+        processing: Arc::new(Mutex::new(())),
     };
 
     let uds_state = state.clone();
@@ -125,6 +138,13 @@ async fn handle_message(
     msg: IngestMessage,
     session_hint: &mut Option<String>,
 ) -> anyhow::Result<()> {
+    // FORNX-281: serialize processing across every connection/task so a
+    // later message's read of already-persisted state (e.g. a Claim
+    // reading Evidence written by an earlier Event) can never race an
+    // earlier message's still-in-flight write. See the `processing` field
+    // doc comment for why this is the correct fix for a single local
+    // daemon rather than making verification tolerant of partial evidence.
+    let _serialize = state.processing.lock().await;
     match msg {
         IngestMessage::Capabilities(caps) => {
             // Capabilities may arrive before any Event sets `session_hint`
@@ -269,6 +289,7 @@ mod tests {
         AppState {
             store,
             caps: Arc::new(Mutex::new(HashMap::new())),
+            processing: Arc::new(Mutex::new(())),
         }
     }
 
