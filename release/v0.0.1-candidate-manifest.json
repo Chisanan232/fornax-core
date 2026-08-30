@@ -1,5 +1,6 @@
 {
   "version": "v0.0.1",
+  "release_notes_path": "docs/release/v0.0.1-release-notes.md",
   "repos": [
     {
       "name": "fornax-core",
