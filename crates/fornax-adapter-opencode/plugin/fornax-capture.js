@@ -19,6 +19,25 @@ import { spawn } from "node:child_process";
 export const FornaxCapture = async () => {
   const child = spawn("fornax-hook-opencode", [], { stdio: ["pipe", "ignore", "ignore"] });
 
+  // FORNX-291 live-run finding: an unhandled 'error' event on a spawned
+  // ChildProcess is a fatal, uncaught exception in the *parent* process --
+  // and the parent here is opencode itself, since this plugin runs
+  // in-process. Confirmed by reproduction: with `fornax-hook-opencode` not
+  // on PATH, the original code (no 'error' listener) crashed the entire
+  // opencode process on this line, not just the capture pipeline. A
+  // best-effort integration can never take down its host on a missing/dead
+  // binary -- listen and swallow, exactly like the write-path's existing
+  // best-effort intent below.
+  child.on("error", () => {
+    // Best-effort: a dead/missing fornax-hook-opencode process must never
+    // fail or slow down the agent's own turn.
+  });
+  // Same reasoning for the stdin pipe itself (e.g. EPIPE after the child
+  // has already exited) -- an unhandled stream 'error' event is also fatal.
+  child.stdin.on("error", () => {
+    // ignore
+  });
+
   function send(hook, payload) {
     const line = JSON.stringify({ hook, at: new Date().toISOString(), payload });
     try {
@@ -31,11 +50,24 @@ export const FornaxCapture = async () => {
 
   return {
     dispose: async () => {
-      try {
-        child.stdin.end();
-      } catch {
-        // ignore
-      }
+      // FORNX-291: wait for `end()` to actually flush any writes still
+      // queued in the stream before resolving, instead of firing `end()`
+      // and returning immediately -- otherwise a fast opencode shutdown can
+      // race the flush and drop the last queued event. Bounded so a
+      // dead/hung child can never delay opencode's own shutdown.
+      await new Promise((resolve) => {
+        const done = () => resolve();
+        const timer = setTimeout(done, 200);
+        try {
+          child.stdin.end(() => {
+            clearTimeout(timer);
+            done();
+          });
+        } catch {
+          clearTimeout(timer);
+          done();
+        }
+      });
     },
     event: async ({ event }) => {
       send("event", event);
