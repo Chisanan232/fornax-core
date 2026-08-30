@@ -349,6 +349,7 @@ mod tests {
             payload: serde_json::json!({"exit_code": 0}),
             provenance: "test:partial".into(),
             source: None,
+            extension: None,
         };
         let outcome = SensorOutcome {
             evidence: vec![ev.clone()],

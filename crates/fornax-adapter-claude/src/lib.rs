@@ -267,6 +267,7 @@ impl EvidenceSensor for ClaudeBashExitCodeSensor {
                 self.trust_class(),
                 Some(Provider::ClaudeCode),
             )),
+            extension: None,
         }])
     }
 }
