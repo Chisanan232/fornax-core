@@ -8,7 +8,8 @@
 
 use fornax_types::{
     AgentAdapter, AgentEvent, CapabilityProbe, Claim, EventKind, Evidence, EvidenceKind,
-    IngestMessage, NormalizationOutcome, Provider, RuntimeCapabilities,
+    EvidenceSensor, EvidenceSource, IngestMessage, NormalizationOutcome, Provider,
+    RuntimeCapabilities, SensorOutcome, SignalAvailability, SignalClass, TrustClass,
 };
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -175,6 +176,163 @@ pub fn stamped_capabilities(adapter: &CodexAdapter, session_id: &str) -> Runtime
     caps
 }
 
+/// FORNX-157: formalizes `exec_command_end`'s literal `exit_code` field
+/// extraction — the only Codex shape confirmed to carry a real (non-
+/// heuristic) exit code — as an `EvidenceSensor`. Unchanged heuristic from
+/// before this migration; see the `tests` module's existing
+/// `exec_command_end`-shape tests, whose assertions were left untouched as
+/// the before/after regression proof.
+struct CodexExecCommandEndSensor;
+
+impl EvidenceSensor for CodexExecCommandEndSensor {
+    fn name(&self) -> &'static str {
+        "codex_exec_command_end_sensor_v1"
+    }
+
+    fn required_capabilities(&self) -> &'static [SignalClass] {
+        &[SignalClass::ToolResultPayload]
+    }
+
+    fn trust_class(&self) -> TrustClass {
+        // Codex's own rollout JSONL is the provider's account of what
+        // happened, not something Fornax measured itself.
+        TrustClass::AgentAdjacent
+    }
+
+    // `caps` is intentionally unused — see `ClaudeBashExitCodeSensor::collect`'s
+    // note (fornax-adapter-claude) on why gating on it here would be a
+    // behavior change this migration must not introduce.
+    fn collect(&self, event: &AgentEvent, _caps: &RuntimeCapabilities) -> SensorOutcome {
+        if event.kind != EventKind::PostToolUse {
+            return SensorOutcome::not_collected(
+                SignalAvailability::Unknown,
+                Some("not a PostToolUse event".to_string()),
+            );
+        }
+        let Some(resp) = &event.tool_response else {
+            return SensorOutcome::not_collected(
+                SignalAvailability::Unavailable,
+                Some("no tool_response present on this event".to_string()),
+            );
+        };
+        let Some(code) = resp.get("exit_code").and_then(|v| v.as_i64()) else {
+            return SensorOutcome::not_collected(
+                SignalAvailability::Unavailable,
+                Some("no literal exit_code field on this exec_command_end payload".to_string()),
+            );
+        };
+
+        SensorOutcome::collected(vec![Evidence {
+            id: Uuid::new_v4(),
+            session_id: event.session_id.clone(),
+            source_event_id: event.id,
+            kind: EvidenceKind::ExitCode,
+            observed_at: event.observed_at.clone(),
+            payload: serde_json::json!({
+                "command": resp.get("command").cloned().unwrap_or_default(),
+                "exit_code": code,
+            }),
+            provenance: format!("codex:{v}:rollout:exec_command_end", v = ADAPTER_VERSION),
+            source: Some(EvidenceSource::now(
+                self.name(),
+                self.trust_class(),
+                Some(Provider::Codex),
+            )),
+        }])
+    }
+}
+
+/// FORNX-157: formalizes the `custom_tool_call_output` "Script completed"
+/// heuristic (no literal exit code exposed in this shape at all — see the
+/// doc comment at its original call site) as an `EvidenceSensor`. Unchanged
+/// heuristic; see the `tests` module's existing tests for the before/after
+/// regression proof.
+struct CodexCustomToolCallOutputSensor;
+
+impl EvidenceSensor for CodexCustomToolCallOutputSensor {
+    fn name(&self) -> &'static str {
+        "codex_custom_tool_call_output_sensor_v1"
+    }
+
+    fn required_capabilities(&self) -> &'static [SignalClass] {
+        &[SignalClass::ToolResultPayload]
+    }
+
+    fn trust_class(&self) -> TrustClass {
+        TrustClass::AgentAdjacent
+    }
+
+    // `caps` is intentionally unused — see `ClaudeBashExitCodeSensor::collect`'s
+    // note (fornax-adapter-claude) on why gating on it here would be a
+    // behavior change this migration must not introduce.
+    fn collect(&self, event: &AgentEvent, _caps: &RuntimeCapabilities) -> SensorOutcome {
+        if event.kind != EventKind::PostToolUse {
+            return SensorOutcome::not_collected(
+                SignalAvailability::Unknown,
+                Some("not a PostToolUse event".to_string()),
+            );
+        }
+        let Some(resp) = &event.tool_response else {
+            return SensorOutcome::not_collected(
+                SignalAvailability::Unavailable,
+                Some("no tool_response present on this event".to_string()),
+            );
+        };
+        let output_text: String = resp
+            .get("output")
+            .and_then(|v| v.as_array())
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .unwrap_or_default();
+
+        // "Script completed" is the only confirmed real success marker
+        // observed so far; a real failing-command capture to confirm the
+        // failure-path marker is still outstanding (residual FORNX-55
+        // follow-up) — so an unrecognized shape produces no Evidence rather
+        // than a guessed verdict in either direction.
+        if !output_text.contains("Script completed") {
+            return SensorOutcome::not_collected(
+                SignalAvailability::Unavailable,
+                Some("output text has no recognized completion marker".to_string()),
+            );
+        }
+
+        let command = event
+            .tool_input
+            .as_ref()
+            .and_then(|ti| ti.get("command"))
+            .cloned()
+            .unwrap_or_default();
+
+        SensorOutcome::collected(vec![Evidence {
+            id: Uuid::new_v4(),
+            session_id: event.session_id.clone(),
+            source_event_id: event.id,
+            kind: EvidenceKind::ExitCode,
+            observed_at: event.observed_at.clone(),
+            payload: serde_json::json!({
+                "command": command,
+                "exit_code": 0,
+                "heuristic": true,
+            }),
+            provenance: format!(
+                "codex:{v}:rollout:custom_tool_call_output#heuristic:script_completed",
+                v = ADAPTER_VERSION
+            ),
+            source: Some(EvidenceSource::now(
+                self.name(),
+                self.trust_class(),
+                Some(Provider::Codex),
+            )),
+        }])
+    }
+}
+
 fn translate_line(
     entry: &serde_json::Value,
     session_id: &str,
@@ -232,17 +390,6 @@ fn translate_line(
                     };
                 };
                 let command = pending_calls.remove(call_id).unwrap_or_default();
-                let output_text: String = payload
-                    .get("output")
-                    .and_then(|v| v.as_array())
-                    .map(|blocks| {
-                        blocks
-                            .iter()
-                            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-                            .collect::<Vec<_>>()
-                            .join("")
-                    })
-                    .unwrap_or_default();
 
                 let now = chrono::Utc::now().to_rfc3339();
                 let event_id = Uuid::new_v4();
@@ -257,35 +404,16 @@ fn translate_line(
                     tool_response: Some(payload.clone()),
                     raw: entry.clone(),
                 };
-                let mut out = vec![IngestMessage::Event(event)];
+                let mut out = vec![IngestMessage::Event(event.clone())];
 
-                // No literal exit code is exposed in this shape at all
-                // (unlike exec_command_end, which at least had the field
-                // even if this adapter's earlier guess for it was moot).
-                // "Script completed" is the only confirmed real success
-                // marker observed so far; a real failing-command capture
-                // to confirm the failure-path marker is still outstanding
-                // (tracked as residual FORNX-55 follow-up) — so an
-                // unrecognized shape produces no Evidence rather than a
-                // guessed verdict in either direction.
-                if output_text.contains("Script completed") {
-                    out.push(IngestMessage::Evidence(Evidence {
-                        id: Uuid::new_v4(),
-                        session_id: session_id.to_string(),
-                        source_event_id: event_id,
-                        kind: EvidenceKind::ExitCode,
-                        observed_at: now,
-                        payload: serde_json::json!({
-                            "command": command,
-                            "exit_code": 0,
-                            "heuristic": true,
-                        }),
-                        provenance: format!(
-                            "codex:{v}:rollout:custom_tool_call_output#heuristic:script_completed",
-                            v = ADAPTER_VERSION
-                        ),
-                    }));
-                }
+                // FORNX-157: formalized as `CodexCustomToolCallOutputSensor`
+                // — see that type for the unchanged "Script completed"
+                // heuristic (a real failing-command capture to confirm the
+                // failure-path marker is still outstanding, residual
+                // FORNX-55 follow-up).
+                let sensor = CodexCustomToolCallOutputSensor;
+                let outcome = sensor.collect(&event, &CodexAdapter::new().probe());
+                out.extend(outcome.evidence.into_iter().map(IngestMessage::Evidence));
                 NormalizationOutcome::Messages(out)
             }
             other => NormalizationOutcome::Unrecognized {
@@ -331,21 +459,12 @@ fn translate_line(
                 tool_response: Some(payload.clone()),
                 raw: entry.clone(),
             };
-            let mut out = vec![IngestMessage::Event(event)];
-            if let Some(code) = payload.get("exit_code").and_then(|v| v.as_i64()) {
-                out.push(IngestMessage::Evidence(Evidence {
-                    id: Uuid::new_v4(),
-                    session_id: session_id.to_string(),
-                    source_event_id: event_id,
-                    kind: EvidenceKind::ExitCode,
-                    observed_at: now,
-                    payload: serde_json::json!({
-                        "command": payload.get("command").cloned().unwrap_or_default(),
-                        "exit_code": code,
-                    }),
-                    provenance: format!("codex:{v}:rollout:exec_command_end", v = ADAPTER_VERSION),
-                }));
-            }
+            let mut out = vec![IngestMessage::Event(event.clone())];
+            // FORNX-157: formalized as `CodexExecCommandEndSensor` — see
+            // that type for the unchanged literal-exit_code extraction.
+            let sensor = CodexExecCommandEndSensor;
+            let outcome = sensor.collect(&event, &CodexAdapter::new().probe());
+            out.extend(outcome.evidence.into_iter().map(IngestMessage::Evidence));
             NormalizationOutcome::Messages(out)
         }
         "task_complete" => {
@@ -470,6 +589,72 @@ mod tests {
             IngestMessage::Evidence(ev) => {
                 assert_eq!(ev.kind, EvidenceKind::ExitCode);
                 assert_eq!(ev.payload["exit_code"], 1);
+            }
+            other => panic!("expected Evidence, got {other:?}"),
+        }
+    }
+
+    /// FORNX-157: proves the migrated `exec_command_end` path now also
+    /// carries structured `EvidenceSource`/trust-class metadata, on top of
+    /// the unmodified assertions above (the before/after behavior-
+    /// preservation proof for `CodexExecCommandEndSensor`).
+    #[test]
+    fn exec_command_end_evidence_carries_sensor_source_metadata() {
+        let entry = serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "exec_command_end",
+                "command": ["pytest"],
+                "exit_code": 1
+            }
+        });
+        let msgs = normalize(&mut CodexAdapter::new(), &entry).into_messages();
+        match &msgs[1] {
+            IngestMessage::Evidence(ev) => {
+                let source = ev
+                    .source
+                    .as_ref()
+                    .expect("sensor-produced evidence must carry source");
+                assert_eq!(source.sensor_name, "codex_exec_command_end_sensor_v1");
+                assert_eq!(source.trust_class, TrustClass::AgentAdjacent);
+                assert_eq!(source.provider, Some(Provider::Codex));
+            }
+            other => panic!("expected Evidence, got {other:?}"),
+        }
+    }
+
+    /// FORNX-157: same proof for the `custom_tool_call_output` "Script
+    /// completed" heuristic path (`CodexCustomToolCallOutputSensor`).
+    #[test]
+    fn custom_tool_call_output_evidence_carries_sensor_source_metadata() {
+        let mut adapter = CodexAdapter::new();
+        let call = serde_json::json!({
+            "type": "response_item",
+            "payload": {"type": "custom_tool_call", "name": "exec", "call_id": "c1", "input": "echo hi"}
+        });
+        let _ = normalize(&mut adapter, &call);
+
+        let output = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "c1",
+                "output": [{"text": "Script completed"}]
+            }
+        });
+        let msgs = normalize(&mut adapter, &output).into_messages();
+        match &msgs[1] {
+            IngestMessage::Evidence(ev) => {
+                let source = ev
+                    .source
+                    .as_ref()
+                    .expect("sensor-produced evidence must carry source");
+                assert_eq!(
+                    source.sensor_name,
+                    "codex_custom_tool_call_output_sensor_v1"
+                );
+                assert_eq!(source.trust_class, TrustClass::AgentAdjacent);
+                assert_eq!(source.provider, Some(Provider::Codex));
             }
             other => panic!("expected Evidence, got {other:?}"),
         }
