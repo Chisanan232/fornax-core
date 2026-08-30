@@ -38,6 +38,7 @@ pub use sensor::{
 pub enum Provider {
     ClaudeCode,
     Codex,
+    OpenCode,
 }
 
 /// Normalized lifecycle event kind. One variant per canonical concept a
