@@ -334,6 +334,7 @@ mod tests {
                 observed_at: "2026-01-01T00:00:01Z".into(),
                 payload: serde_json::json!({"command": ["pytest"], "exit_code": 1}),
                 provenance: "codex:rollout:exec_command_end".into(),
+                source: None,
             };
             store
                 .insert_evidence(&evidence)
@@ -447,6 +448,79 @@ mod tests {
                 "expected no capabilities envelope, got: {types:?}"
             );
             assert!(types.contains(&"event".to_string()));
+
+            std::fs::remove_file(&db_path).ok();
+            std::fs::remove_dir_all(&out_dir).ok();
+        }
+
+        /// FORNX-157 AC: "Provenance/trust metadata survives ... cloud-safe
+        /// projection." Unlike `RuntimeCapabilities` (which projects through
+        /// `LegacyCapabilitiesWire` to a frozen bool set for wire-compat with
+        /// an out-of-repo consumer), `Evidence` has no such frozen-shape
+        /// contract — it is spooled as-is (see `export_spool_from_store`).
+        /// So "cloud-safe projection" for `Evidence::source` means: the
+        /// structured metadata ships through unmodified, not stripped.
+        #[tokio::test]
+        async fn evidence_envelope_carries_source_metadata_through_export() {
+            let db_path = tmp_db_path("evidence-source-export");
+            let store = fornax_store::Store::open(&db_path).await.expect("open db");
+
+            let event = fornax_types::AgentEvent {
+                id: Uuid::new_v4(),
+                session_id: "s-source".into(),
+                provider: Provider::Codex,
+                kind: EventKind::PostToolUse,
+                observed_at: "2026-01-01T00:00:00Z".into(),
+                tool_name: Some("exec_command".into()),
+                tool_input: Some(serde_json::json!(["pytest"])),
+                tool_response: Some(serde_json::json!({"exit_code": 0})),
+                raw: serde_json::json!({"type": "exec_command_end"}),
+            };
+            store.insert_event(&event).await.expect("insert event");
+
+            let evidence = fornax_types::Evidence {
+                id: Uuid::new_v4(),
+                session_id: "s-source".into(),
+                source_event_id: event.id,
+                kind: EvidenceKind::ExitCode,
+                observed_at: "2026-01-01T00:00:01Z".into(),
+                payload: serde_json::json!({"command": ["pytest"], "exit_code": 0}),
+                provenance: "codex:rollout:exec_command_end".into(),
+                source: Some(fornax_types::EvidenceSource {
+                    sensor_name: "codex_exec_command_end_sensor_v1".into(),
+                    trust_class: fornax_types::TrustClass::AgentAdjacent,
+                    collected_at: "2026-01-01T00:00:01Z".into(),
+                    provider: Some(Provider::Codex),
+                }),
+            };
+            store
+                .insert_evidence(&evidence)
+                .await
+                .expect("insert evidence");
+
+            let out_dir = std::env::temp_dir().join(format!("fornax-spool-{}", Uuid::new_v4()));
+            export_spool_from_store(&store, "s-source", &out_dir)
+                .await
+                .expect("export spool");
+
+            let pending_dir = out_dir.join("pending");
+            let evidence_file = std::fs::read_dir(&pending_dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .find(|p| {
+                    let v: serde_json::Value =
+                        serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
+                    v["type"] == "evidence"
+                })
+                .expect("evidence file exists");
+            let v: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&evidence_file).unwrap()).unwrap();
+            assert_eq!(
+                v["source"]["sensor_name"], "codex_exec_command_end_sensor_v1",
+                "structured sensor/trust metadata must survive the spool export projection"
+            );
+            assert_eq!(v["source"]["trust_class"], "agent_adjacent");
+            assert_eq!(v["source"]["provider"], "codex");
 
             std::fs::remove_file(&db_path).ok();
             std::fs::remove_dir_all(&out_dir).ok();
