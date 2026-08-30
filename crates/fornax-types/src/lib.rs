@@ -10,11 +10,16 @@
 //! `hook_event_name`, plus event-specific `tool_name`/`tool_input`/`tool_response`.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use uuid::Uuid;
 
+pub mod capabilities;
 pub mod privacy;
 pub mod redact;
+
+pub use capabilities::{
+    CapabilityProbe, CapabilitySignal, LegacyCapabilitiesWire, RuntimeCapabilities,
+    SignalAvailability, SignalClass, CAPABILITY_SCHEMA_VERSION,
+};
 
 /// Which coding-agent runtime an event/capability originated from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -139,19 +144,6 @@ pub enum IngestMessage {
     Capabilities(RuntimeCapabilities),
 }
 
-/// What a given provider integration can actually observe. Verifiers consult
-/// this before deciding `Unavailable` vs. attempting verification — a missing
-/// capability must never be silently treated as a pass.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RuntimeCapabilities {
-    pub provider: Provider,
-    pub supports_pre_tool_use: bool,
-    pub supports_post_tool_use: bool,
-    pub supports_tool_response_capture: bool,
-    pub supports_session_stop_event: bool,
-    pub supports_transcript_tail: bool,
-    pub supports_subagent_lifecycle: bool,
-    /// Free-form notes on partial/uncertain support, for the capability
-    /// matrix doc — not machine-consumed, kept for provenance in Findings.
-    pub notes: HashMap<String, String>,
-}
+// `RuntimeCapabilities` and its supporting taxonomy (`SignalClass`,
+// `SignalAvailability`, `CapabilitySignal`, `CapabilityProbe`) live in
+// `capabilities.rs` (FORNX-155) and are re-exported above.
