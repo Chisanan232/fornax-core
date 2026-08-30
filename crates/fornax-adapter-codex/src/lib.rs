@@ -7,8 +7,8 @@
 //! confirmed `RolloutLine` shapes into canonical `fornax_types::IngestMessage`s.
 
 use fornax_types::{
-    AgentAdapter, AgentEvent, CapabilityProbe, Claim, EventKind, Evidence, EvidenceKind,
-    EvidenceSensor, EvidenceSource, IngestMessage, NormalizationOutcome, Provider,
+    AgentAdapter, AgentEvent, CapabilityProbe, Claim, CollectionMethod, EventKind, Evidence,
+    EvidenceKind, EvidenceSensor, EvidenceSource, IngestMessage, NormalizationOutcome, Provider,
     RuntimeCapabilities, SensorOutcome, SignalAvailability, SignalClass, TrustClass,
 };
 use std::collections::HashMap;
@@ -199,6 +199,18 @@ impl EvidenceSensor for CodexExecCommandEndSensor {
         TrustClass::AgentAdjacent
     }
 
+    fn collection_method(&self) -> CollectionMethod {
+        // Codex's rollout JSONL is tailed/polled as an always-on file, not
+        // delivered via an in-process hook callback — distinct from Claude
+        // Code's PostToolUse sensor, which shares the same trust class (see
+        // `fornax_types::sensor`'s module docs' worked example).
+        CollectionMethod::FilePoll
+    }
+
+    fn collector_version(&self) -> Option<String> {
+        Some(ADAPTER_VERSION.to_string())
+    }
+
     // `caps` is intentionally unused — see `ClaudeBashExitCodeSensor::collect`'s
     // note (fornax-adapter-claude) on why gating on it here would be a
     // behavior change this migration must not introduce.
@@ -237,6 +249,8 @@ impl EvidenceSensor for CodexExecCommandEndSensor {
                 self.name(),
                 self.trust_class(),
                 Some(Provider::Codex),
+                self.collection_method(),
+                self.collector_version(),
             )),
             extension: None,
         }])
@@ -261,6 +275,15 @@ impl EvidenceSensor for CodexCustomToolCallOutputSensor {
 
     fn trust_class(&self) -> TrustClass {
         TrustClass::AgentAdjacent
+    }
+
+    fn collection_method(&self) -> CollectionMethod {
+        // Same rollout-file-poll mechanism as `CodexExecCommandEndSensor`.
+        CollectionMethod::FilePoll
+    }
+
+    fn collector_version(&self) -> Option<String> {
+        Some(ADAPTER_VERSION.to_string())
     }
 
     // `caps` is intentionally unused — see `ClaudeBashExitCodeSensor::collect`'s
@@ -329,6 +352,8 @@ impl EvidenceSensor for CodexCustomToolCallOutputSensor {
                 self.name(),
                 self.trust_class(),
                 Some(Provider::Codex),
+                self.collection_method(),
+                self.collector_version(),
             )),
             extension: None,
         }])

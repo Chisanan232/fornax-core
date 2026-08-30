@@ -346,4 +346,40 @@ mod tests {
         assert_eq!(first.rationale, replayed.rationale);
         assert_eq!(first.evidence_ids, replayed.evidence_ids);
     }
+
+    /// FORNX-159 AC: "Provenance fields remain stable under replay." Extends
+    /// `recomputing_from_the_same_persisted_inputs_is_deterministic` above
+    /// (FORNX-27's replay contract) with evidence that actually carries the
+    /// full FORNX-157/159 `EvidenceSource` — a verifier consumes `Evidence`
+    /// by shared reference and must not mutate, drop, or otherwise disturb
+    /// its provenance metadata while computing a finding, whether run once
+    /// or replayed.
+    #[test]
+    fn evidence_source_provenance_is_unchanged_by_verification_and_stable_under_replay() {
+        let v = TestResultVerifier;
+        let c = claim("All tests passed.");
+        let source = fornax_types::EvidenceSource::now(
+            "codex_exec_command_end_sensor_v1",
+            fornax_types::TrustClass::AgentAdjacent,
+            Some(fornax_types::Provider::Codex),
+            fornax_types::CollectionMethod::FilePoll,
+            Some("codex-adapter-0.1.0".to_string()),
+        );
+        let mut ev = evidence_with_exit_code(0);
+        ev.source = Some(source.clone());
+        let ev = vec![ev];
+        let capabilities = caps();
+
+        let first = v.verify(&c, &ev, &capabilities);
+        let replayed = v.verify(&c, &ev, &capabilities);
+
+        // The finding itself is deterministic (FORNX-27's existing
+        // guarantee, re-asserted here against provenance-bearing evidence).
+        assert_eq!(first.verdict, replayed.verdict);
+        assert_eq!(first.rationale, replayed.rationale);
+
+        // The provenance metadata on the input evidence is untouched by
+        // either verify() call — not mutated, not stripped to None.
+        assert_eq!(ev[0].source.as_ref(), Some(&source));
+    }
 }

@@ -492,6 +492,16 @@ mod tests {
                     trust_class: fornax_types::TrustClass::AgentAdjacent,
                     collected_at: "2026-01-01T00:00:01Z".into(),
                     provider: Some(Provider::Codex),
+                    collection_method: fornax_types::CollectionMethod::FilePoll,
+                    collector_version: Some("codex-adapter-0.1.0".into()),
+                    freshness: fornax_types::Freshness {
+                        clock_source: fornax_types::ClockSource::HostClock,
+                        caveat: None,
+                    },
+                    tamper_boundary: fornax_types::TamperBoundary::for_trust_class(
+                        &fornax_types::TrustClass::AgentAdjacent,
+                        &fornax_types::CollectionMethod::FilePoll,
+                    ),
                 }),
                 extension: None,
             };
@@ -523,6 +533,13 @@ mod tests {
             );
             assert_eq!(v["source"]["trust_class"], "agent_adjacent");
             assert_eq!(v["source"]["provider"], "codex");
+            // FORNX-159: collection_method/collector_version/freshness/
+            // tamper_boundary must survive the same cloud-safe projection
+            // boundary as the FORNX-157 fields above.
+            assert_eq!(v["source"]["collection_method"], "file_poll");
+            assert_eq!(v["source"]["collector_version"], "codex-adapter-0.1.0");
+            assert_eq!(v["source"]["freshness"]["clock_source"], "host_clock");
+            assert!(v["source"]["tamper_boundary"]["description"].is_string());
 
             std::fs::remove_file(&db_path).ok();
             std::fs::remove_dir_all(&out_dir).ok();

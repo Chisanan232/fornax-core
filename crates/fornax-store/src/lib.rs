@@ -570,6 +570,16 @@ mod tests {
                 trust_class: fornax_types::TrustClass::HostObserved,
                 collected_at: "2026-01-01T00:00:01Z".into(),
                 provider: Some(Provider::Codex),
+                collection_method: fornax_types::CollectionMethod::ProcessObservation,
+                collector_version: Some("test-sensor-0.1.0".into()),
+                freshness: fornax_types::Freshness {
+                    clock_source: fornax_types::ClockSource::HostClock,
+                    caveat: None,
+                },
+                tamper_boundary: fornax_types::TamperBoundary::for_trust_class(
+                    &fornax_types::TrustClass::HostObserved,
+                    &fornax_types::CollectionMethod::ProcessObservation,
+                ),
             }),
             extension: None,
         };
@@ -862,6 +872,129 @@ mod tests {
             .expect("query evidence");
         assert_eq!(fetched.len(), 1);
         assert_eq!(fetched[0].source, None);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// FORNX-159 AC: "Existing Stage 1/2 evidence is migrated with honest
+    /// defaults/unknowns where history lacks detail." Distinct from
+    /// `pre_migration_evidence_row_with_null_source_reads_back_as_none`
+    /// above: this row's `source` column is *not* NULL — it holds a
+    /// genuine FORNX-157-era `EvidenceSource` JSON blob (trust_class,
+    /// sensor_name, collected_at, provider all known and real), written
+    /// before FORNX-159's `collection_method`/`collector_version`/
+    /// `freshness`/`tamper_boundary` fields existed at all. No new
+    /// `fornax-store` column is added for these fields — they live inside
+    /// the same JSON blob (see `fornax_types::sensor`'s module docs' "no new
+    /// fornax-store column" design note) — so the honesty guarantee lives
+    /// entirely in `EvidenceSource`'s `#[serde(default)]`s, proven here
+    /// through the full store round trip (not just an in-memory serde
+    /// round trip, matching `evidence_extension_unknown_field_survives_store_round_trip`'s
+    /// precedent below).
+    #[tokio::test]
+    async fn pre_migration_evidence_source_reads_back_new_fields_as_honest_unknown() {
+        let path = tmp_db_path("evidence-source-pre-fornx-159");
+        let store = Store::open(&path).await.expect("open db");
+
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "s6b".into(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: Some("Bash".into()),
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        store.insert_event(&event).await.expect("insert event");
+
+        // The exact shape FORNX-157 persisted: sensor_name, trust_class,
+        // collected_at, provider — nothing more.
+        let legacy_source_json = serde_json::json!({
+            "sensor_name": "claude_bash_exit_code_sensor_v1",
+            "trust_class": "agent_adjacent",
+            "collected_at": "2026-01-01T00:00:01Z",
+            "provider": "claude_code",
+        })
+        .to_string();
+
+        sqlx::query(
+            "INSERT INTO evidence (id, session_id, source_event_id, kind, observed_at, payload, provenance, source)
+             VALUES (?1, 's6b', ?2, 'exit_code', '2026-01-01T00:00:01Z', '{\"exit_code\":0}', 'legacy', ?3)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(event.id.to_string())
+        .bind(&legacy_source_json)
+        .execute(&store.pool)
+        .await
+        .expect("hand-insert pre-FORNX-159 evidence row with a FORNX-157-shaped source blob");
+
+        let fetched = store
+            .evidence_for_session("s6b")
+            .await
+            .expect("query evidence");
+        assert_eq!(fetched.len(), 1);
+        let source = fetched[0]
+            .source
+            .as_ref()
+            .expect("legacy source blob must still deserialize, not become None");
+
+        // Known fields from FORNX-157 stay known — not touched by this
+        // migration.
+        assert_eq!(source.sensor_name, "claude_bash_exit_code_sensor_v1");
+        assert_eq!(source.trust_class, fornax_types::TrustClass::AgentAdjacent);
+        assert_eq!(source.provider, Some(Provider::ClaudeCode));
+
+        // New fields must read as an explicit pre-provenance/unknown
+        // marker, never a fabricated specific-sounding value (e.g. must not
+        // silently become `CollectionMethod::HookCallback`, even though
+        // that happens to be the real answer for this sensor — the point is
+        // this binary cannot know that from the persisted row alone).
+        assert_eq!(
+            source.collection_method,
+            fornax_types::CollectionMethod::PreProvenance,
+            "missing collection_method must not be fabricated"
+        );
+        assert_eq!(source.collector_version, None);
+        assert_eq!(
+            source.freshness.clock_source,
+            fornax_types::ClockSource::PreProvenance
+        );
+        assert_eq!(source.freshness.caveat, None);
+        assert_eq!(
+            source.tamper_boundary.description,
+            "unknown (record predates tamper-boundary tracking)",
+            "tamper boundary must not be reconstructed from trust_class alone"
+        );
+
+        // Read-modify-write stability: re-persisting the deserialized
+        // Evidence (as a replay/migration pass would) must keep emitting
+        // the honest markers explicitly, not silently drop back to an
+        // absent key or acquire a real-looking value on the round trip.
+        let mut migrated = fetched[0].clone();
+        migrated.id = Uuid::new_v4();
+        store
+            .insert_evidence(&migrated)
+            .await
+            .expect("re-insert migrated evidence");
+        let refetched = store
+            .evidence_for_session("s6b")
+            .await
+            .expect("query evidence after re-insert");
+        let rewritten_source = refetched
+            .iter()
+            .find(|e| e.id == migrated.id)
+            .and_then(|e| e.source.as_ref())
+            .expect("re-persisted row must still carry a source");
+        assert_eq!(
+            rewritten_source.collection_method,
+            fornax_types::CollectionMethod::PreProvenance
+        );
+        assert_eq!(
+            rewritten_source.tamper_boundary.description,
+            "unknown (record predates tamper-boundary tracking)"
+        );
 
         std::fs::remove_file(&path).ok();
     }

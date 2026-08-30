@@ -27,7 +27,10 @@ pub use capabilities::{
 pub use extension::{
     ContentClass, ExtensionEnvelope, EXTENSION_SCHEMA_VERSION, SUPPORTED_EXTENSION_SCHEMA_VERSIONS,
 };
-pub use sensor::{EvidenceSensor, EvidenceSource, SensorOutcome, TrustClass};
+pub use sensor::{
+    ClockSource, CollectionMethod, EvidenceSensor, EvidenceSource, Freshness, SensorOutcome,
+    TamperBoundary, TrustClass,
+};
 
 /// Which coding-agent runtime an event/capability originated from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -245,6 +248,13 @@ pub struct Finding {
 /// extraction/verification happens daemon-side.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+// `Evidence` (via `EvidenceSource`'s FORNX-159 provenance fields) is now
+// meaningfully larger than the other variants. Boxing it would touch ~13
+// construction/match sites across both adapter crates and the daemon for a
+// stack-size optimization with no behavior change; `IngestMessage` values
+// are short-lived (constructed, sent over one UDS message, dropped), so the
+// extra stack space per unused-variant slot is not worth that churn.
+#[allow(clippy::large_enum_variant)]
 pub enum IngestMessage {
     Event(AgentEvent),
     Claim(Claim),

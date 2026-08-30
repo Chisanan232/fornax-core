@@ -1,4 +1,4 @@
-# Evidence sensor/source contract (FORNX-157)
+# Evidence sensor/source contract (FORNX-157, extended FORNX-159)
 
 Status: living doc, describes a shipped contract (`fornax_types::sensor`).
 See `crates/fornax-types/src/sensor.rs` for the authoritative, compiled
@@ -111,3 +111,112 @@ class is an explicit non-goal of this ticket.
   sensor is a concrete Rust type an adapter constructs and calls directly,
   same as before this ticket.
 - No evidence weighting or fusion by trust class.
+
+## FORNX-159: collection method, collector version, freshness, tamper boundary
+
+FORNX-157 gave `EvidenceSource` an identity, a trust rating, a collection
+timestamp, and an optional provider. FORNX-159 adds four more fields to that
+*same* struct (not a new wrapper type — see "Design: why extend
+`EvidenceSource`" below):
+
+| Field | Type | Meaning |
+|---|---|---|
+| `collection_method` | `CollectionMethod` | *How* a sensor observed something — a different axis from `trust_class` ("how much"). `HookCallback`, `FilePoll`, `HttpWebhook`, `ProcessObservation`, `Reconstructed`, plus `PreProvenance`/`Unrecognized` (see "Honesty on old data" below). |
+| `collector_version` | `Option<String>` | The producing sensor implementation's own version. Distinct from `ExtensionEnvelope::adapter_version` — see the type's doc comment for why these don't collapse into one field. |
+| `freshness` | `Freshness { clock_source, caveat }` | Which clock a timestamp came from: `HostClock`, `ProviderReported`, `Reconstructed`, or `PreProvenance`, plus a free-text `caveat` for clock disagreement. |
+| `tamper_boundary` | `TamperBoundary { description, detail }` | A human/UI-readable explanation of the trust boundary crossed, e.g. "captured via Claude Code's PostToolUse hook, running in-process with the agent, not independently verifiable." `description` comes from a small canned set keyed by `(TrustClass, CollectionMethod)` (`TamperBoundary::for_trust_class`), not freeform text a sensor author writes ad hoc. |
+
+### Worked proof that collection method is a distinct axis from trust class
+
+`ClaudeBashExitCodeSensor` and Codex's `CodexExecCommandEndSensor`/
+`CodexCustomToolCallOutputSensor` are all `TrustClass::AgentAdjacent` — none
+is independently verified, all report the provider's own account of what
+happened. But Claude Code's sensor is `CollectionMethod::HookCallback` (an
+in-process `PostToolUse` callback) and Codex's sensors are
+`CollectionMethod::FilePoll` (tailing the always-on rollout JSONL file).
+Trust class alone cannot tell those apart; `sensor.rs`'s
+`hook_callback_and_file_poll_are_distinct_collection_methods_for_the_same_trust_class`
+test proves the two axes vary independently and produce distinct canned
+`tamper_boundary` text.
+
+### Design: why extend `EvidenceSource`, not `ExtensionEnvelope`
+
+FORNX-159's AC requires *every* evidence record to carry enough provenance
+to explain who/what observed it. `ExtensionEnvelope` (FORNX-158) is `None`
+in the common case by design — an opt-in escape hatch for provider-specific
+data, not a place for metadata every record needs. `EvidenceSource` is
+already the canonical "what produced this" home, so these fields extend it
+directly.
+
+### Design: no new `fornax-store` column
+
+All of `EvidenceSource` — old fields and these new ones — persists as one
+JSON blob in the `evidence.source` column added by `0004_evidence_source.sql`.
+Adding named fields to a struct that already round-trips through one TEXT
+column needs no new column: this is exactly the "additive change within a
+version is the same shape, extra keys" reasoning `0005-schema-evolution.md`
+already established for `ExtensionEnvelope`'s unknown-field tolerance. A new
+column would duplicate data already inside the existing blob.
+
+### Honesty on old data (FORNX-159 AC: "existing evidence is migrated with honest defaults/unknowns where history lacks detail")
+
+`Evidence::source == None` (a pre-FORNX-157 record, or code never migrated
+onto the sensor contract) is unaffected — still reads back as `None`, same
+as before.
+
+The new case FORNX-159 introduces: a record where `source` is *not* `None`
+— trust class, sensor name, etc. are genuinely known (written by
+FORNX-157-era code) — but the FORNX-159 fields didn't exist yet when it was
+written. Each new field's `#[serde(default)]` produces an explicit,
+distinctly-named unknown value on deserialize, never a fabricated
+specific-sounding guess:
+
+- `collection_method` defaults to `CollectionMethod::PreProvenance` — a
+  *domain* fact ("no sensor declared a method when this record was
+  written"), kept deliberately distinct from `Unrecognized` (a *parse-time*
+  fact: "this binary doesn't know what this tag means"), mirroring
+  `SignalAvailability::Unknown` vs. `Unrecognized`'s existing precedent
+  (`crates/fornax-types/src/capabilities.rs`).
+- `freshness.clock_source` defaults to `ClockSource::PreProvenance` the same
+  way.
+- `tamper_boundary` defaults to the literal description `"unknown (record
+  predates tamper-boundary tracking)"` — not reconstructed from
+  `trust_class`/`collection_method` even when those happen to be known,
+  since a plausible-looking reconstruction is exactly what this AC forbids.
+- `collector_version` defaults to `None`, which needed no special sentinel:
+  an absent version has no fabricated-looking value to be confused with.
+
+`fornax-store`'s
+`pre_migration_evidence_source_reads_back_new_fields_as_honest_unknown` test
+hand-inserts a genuine FORNX-157-shaped `source` JSON blob (no FORNX-159 keys
+at all) and proves the full store round trip reads the old fields as known
+and the new fields as the explicit pre-provenance markers above — not a
+query error, not a fabricated value.
+
+### Cloud-safe projection and replay
+
+`fornax-cli`'s `evidence_envelope_carries_source_metadata_through_export`
+test was extended to assert `collection_method`/`collector_version`/
+`freshness`/`tamper_boundary` survive the same spool-export projection
+boundary as the original FORNX-157 fields (evidence spools as-is — see the
+FORNX-158 section above). `fornax-verify`'s
+`evidence_source_provenance_is_unchanged_by_verification_and_stable_under_replay`
+test proves a `Verifier` neither mutates nor drops this metadata while
+computing a finding, across a first run and a replayed run.
+
+### UI-distinguishability status
+
+Neither `fornax-cli`'s `detail` command nor the daemon's `/dashboard` render
+`Evidence` directly today — both operate on `Finding` rows joined to
+`Claim`s (`fornax-daemon/src/main.rs::dashboard`,
+`fornax-cli/src/main.rs`'s `Commands::Detail` -> `/api/findings/recent`).
+There is currently no rendering surface where `trust_class`/
+`collection_method` would even appear, so "UI can distinguish independent
+external evidence from agent-adjacent evidence" has no code path to wire
+today. The data model exposes everything a future renderer needs
+(`Evidence::source.trust_class`, `.collection_method`,
+`.tamper_boundary.description`, all preserved end to end per the sections
+above). Follow-up (not in this ticket's scope): once evidence itself is
+rendered anywhere (a future finding-detail or evidence-list view), route
+`trust_class`/`tamper_boundary.description` into that view rather than
+inventing a new evidence-rendering surface just for this ticket.
