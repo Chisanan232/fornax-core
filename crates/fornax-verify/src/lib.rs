@@ -230,12 +230,15 @@ impl Verifier for CommandExecutedVerifier {
 
 /// Third claim class (FORNX-14): an agent claims a command succeeded (or
 /// failed), as distinct from merely claiming it ran at all. Deterministically
-/// checks the same `EvidenceKind::ExitCode` evidence's `exit_code` field.
+/// checks the same `EvidenceKind::ExitCode` evidence's `exit_code` field for
+/// the literal command the claim names.
 ///
-/// When the claim names a literal command, only evidence for that command is
-/// consulted; a generic claim ("the command succeeded") falls back to the
-/// most recent command-execution evidence observed, mirroring
-/// [`TestResultVerifier`]'s "most recent test-runner invocation" fallback.
+/// Unlike [`TestResultVerifier`] (which may fall back to "the most recent
+/// test-runner invocation" because all test-runner commands are the same
+/// claim subject), a claim naming no specific command is `Unverified`, not
+/// bound to whatever command happened to run most recently — that command
+/// may be unrelated, and reporting its exit code as this claim's evidence
+/// would risk a false `Contradicted` against unrelated evidence.
 pub struct CommandSuccessVerifier;
 
 impl CommandSuccessVerifier {
@@ -274,14 +277,32 @@ impl Verifier for CommandSuccessVerifier {
             );
         }
 
-        let claimed =
-            CommandExecutedVerifier::extract_command_literal(&claim.text).map(|s| s.to_lowercase());
+        // A generic claim with no named command ("the command succeeded")
+        // must not bind to whatever command happened to run most recently —
+        // that command may be entirely unrelated, and reporting its exit
+        // code as this claim's evidence would risk a false `Contradicted`
+        // against unrelated evidence (AC: "missing evidence does not become
+        // contradiction"; also "do not label ordinary mismatch as
+        // intentional lying"). Only a claim naming a specific command can be
+        // checked at all.
+        let Some(claimed) =
+            CommandExecutedVerifier::extract_command_literal(&claim.text).map(|s| s.to_lowercase())
+        else {
+            return Finding {
+                id: Uuid::new_v4(),
+                claim_id: claim.id,
+                verdict: Verdict::Unverified,
+                evidence_ids: vec![],
+                verifier_name: self.name().to_string(),
+                rationale:
+                    "claim names no specific command; cannot bind to unrelated command evidence"
+                        .to_string(),
+                computed_at: now,
+            };
+        };
 
         let command_evidence = evidence.iter().rev().find(|e| {
-            e.kind == EvidenceKind::ExitCode
-                && claimed
-                    .as_ref()
-                    .is_none_or(|claimed| command_text(&e.payload).contains(claimed))
+            e.kind == EvidenceKind::ExitCode && command_text(&e.payload).contains(&claimed)
         });
 
         let Some(ev) = command_evidence else {
@@ -291,7 +312,9 @@ impl Verifier for CommandSuccessVerifier {
                 verdict: Verdict::Unverified,
                 evidence_ids: vec![],
                 verifier_name: self.name().to_string(),
-                rationale: "no command-execution evidence observed in this session".to_string(),
+                rationale: format!(
+                    "no evidence of a command matching \"{claimed}\" observed in this session"
+                ),
                 computed_at: now,
             };
         };
@@ -832,16 +855,28 @@ mod command_success_verifier_tests {
     }
 
     #[test]
-    fn generic_claim_without_named_command_uses_most_recent_evidence() {
+    fn generic_claim_without_named_command_is_unverified_even_with_evidence_present() {
         let v = CommandSuccessVerifier;
         let c = crate::tests::claim_for("command_succeeded", "The command succeeded.");
-        let ev = vec![
-            crate::tests::evidence_for_command(&["pytest"], 1),
-            crate::tests::evidence_for_command(&["npm", "install"], 0),
-        ];
+        let ev = vec![crate::tests::evidence_for_command(&["npm", "install"], 0)];
         let f = v.verify(&c, &ev, &caps());
-        assert_eq!(f.verdict, Verdict::Verified);
-        assert_eq!(f.evidence_ids, vec![ev[1].id]);
+        assert_eq!(f.verdict, Verdict::Unverified);
+        assert!(f.evidence_ids.is_empty());
+    }
+
+    /// Regression: a generic claim must never bind to unrelated evidence
+    /// just because it is the most recent in the session — that would
+    /// produce a false `Contradicted` against a command the claim never
+    /// named (e.g. an unrelated failing `pytest` run "contradicting" a claim
+    /// about "the deploy").
+    #[test]
+    fn generic_claim_does_not_bind_to_unrelated_failing_evidence() {
+        let v = CommandSuccessVerifier;
+        let c = crate::tests::claim_for("command_succeeded", "The command succeeded.");
+        let ev = vec![crate::tests::evidence_for_command(&["pytest"], 1)];
+        let f = v.verify(&c, &ev, &caps());
+        assert_eq!(f.verdict, Verdict::Unverified);
+        assert!(f.evidence_ids.is_empty());
     }
 
     #[test]
