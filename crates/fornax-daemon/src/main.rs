@@ -3,7 +3,7 @@
 //! status line, detail command, and dashboard (FORNX-30/31/32). No cloud
 //! dependency on the critical path (D2, ADR 0001).
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use fornax_types::redact::{redact_json, redact_text};
@@ -150,6 +150,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/status", get(api_status))
         .route("/api/findings/recent", get(api_findings_recent))
         .route("/dashboard", get(dashboard))
+        .route("/dashboard/session/:session_id", get(dashboard_session))
+        .route("/dashboard/finding/:finding_id", get(dashboard_finding))
         .with_state(state);
 
     let port: u16 = std::env::var("FORNAX_HTTP_PORT")
@@ -351,28 +353,276 @@ async fn api_findings_recent(State(state): State<AppState>) -> Json<serde_json::
     }
 }
 
+/// Shared page chrome (FORNX-18): every dashboard page gets the same dark
+/// monospace look the original flat-table dashboard established, plus the
+/// provider badge styling used by session list/detail. Provider badges are
+/// styled generically by a `data-provider` attribute holding the raw
+/// snake_case tag (`claude_code`, `codex`, `open_code`, `unknown`, ...) —
+/// new colors can be added here without any Rust branch on `Provider`, and
+/// an unrecognized future provider still renders (falls through to the
+/// default badge style) rather than needing a code change (FORNX-18 AC:
+/// "distinguishable without provider-specific UI forks").
+const PAGE_STYLE: &str = "body{font-family:monospace;margin:2rem;background:#0b0e14;color:#d6dee8}\
+     table{border-collapse:collapse;width:100%}td,th{padding:.4rem .6rem;border-bottom:1px solid #2a3140;text-align:left}\
+     a{color:#4a9dd6}\
+     .verified{color:#4caf50}.contradicted{color:#e5534b}.unverified{color:#c9a227}.review{color:#4a9dd6}.unavailable{color:#7d8798}\
+     .badge{display:inline-block;padding:.1rem .5rem;border-radius:.75rem;font-size:.85em;border:1px solid #4a9dd6;color:#4a9dd6}\
+     .badge[data-provider=\"claude_code\"]{border-color:#c9a227;color:#c9a227}\
+     .badge[data-provider=\"codex\"]{border-color:#4a9dd6;color:#4a9dd6}\
+     .badge[data-provider=\"open_code\"]{border-color:#4caf50;color:#4caf50}\
+     .badge[data-provider=\"unknown\"]{border-color:#7d8798;color:#7d8798}\
+     .section{margin-top:1.5rem}\
+     .empty{color:#7d8798;font-style:italic}\
+     .breadcrumb{margin-bottom:1rem}\
+     code{color:#c9a227}";
+
+fn page(title: &str, body: &str) -> axum::response::Html<String> {
+    axum::response::Html(format!(
+        "<html><head><title>{title}</title><style>{PAGE_STYLE}</style></head><body>{body}</body></html>",
+        title = html_escape(title),
+    ))
+}
+
+fn provider_badge(provider: &str) -> String {
+    format!(
+        "<span class=\"badge\" data-provider=\"{tag}\">{label}</span>",
+        tag = html_escape(provider),
+        label = html_escape(&provider.replace('_', " "))
+    )
+}
+
+/// Session-list/overview page (FORNX-18 AC: "session list/overview").
 async fn dashboard(State(state): State<AppState>) -> axum::response::Html<String> {
-    let rows = state.store.recent_findings(50).await.unwrap_or_default();
-    let mut body = String::from(
-        "<html><head><title>Fornax — local evidence dashboard</title>\
-         <style>body{font-family:monospace;margin:2rem;background:#0b0e14;color:#d6dee8}\
-         table{border-collapse:collapse;width:100%}td,th{padding:.4rem .6rem;border-bottom:1px solid #2a3140;text-align:left}\
-         .verified{color:#4caf50}.contradicted{color:#e5534b}.unverified{color:#c9a227}.review{color:#4a9dd6}.unavailable{color:#7d8798}\
-         </style></head><body><h2>🛡 Fornax — recent findings</h2><table>\
-         <tr><th>Verdict</th><th>Claim</th><th>Verifier</th><th>Rationale</th><th>When</th></tr>",
+    let sessions = state.store.sessions_overview().await.unwrap_or_default();
+    let mut body = String::from("<h2>🛡 Fornax — sessions</h2>");
+    if sessions.is_empty() {
+        body.push_str("<p class=\"empty\">No sessions recorded yet.</p>");
+    } else {
+        body.push_str(
+            "<table><tr><th>Session</th><th>Provider</th><th>Events</th><th>Claims</th>\
+             <th>Findings</th><th>Last activity</th></tr>",
+        );
+        for s in sessions {
+            body.push_str(&format!(
+                "<tr><td><a href=\"/dashboard/session/{id_enc}\">{id}</a></td><td>{provider}</td>\
+                 <td>{events}</td><td>{claims}</td><td>{findings}</td><td>{when}</td></tr>",
+                id_enc = html_escape(&s.session_id),
+                id = html_escape(&s.session_id),
+                provider = provider_badge(&s.provider),
+                events = s.event_count,
+                claims = s.claim_count,
+                findings = s.finding_count,
+                when = html_escape(&s.last_activity),
+            ));
+        }
+        body.push_str("</table>");
+    }
+    page("Fornax — sessions", &body)
+}
+
+/// Session-detail page (FORNX-18 AC: session detail, host/runtime
+/// capability availability).
+async fn dashboard_session(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> axum::response::Html<String> {
+    let claims = state
+        .store
+        .claims_for_session(&session_id)
+        .await
+        .unwrap_or_default();
+    let findings = state
+        .store
+        .findings_for_session(&session_id)
+        .await
+        .unwrap_or_default();
+    let capabilities = state
+        .store
+        .capabilities_for_session(&session_id)
+        .await
+        .unwrap_or_default();
+
+    let mut body = format!(
+        "<div class=\"breadcrumb\"><a href=\"/dashboard\">&larr; sessions</a></div>\
+         <h2>Session <code>{id}</code></h2>",
+        id = html_escape(&session_id)
     );
-    for r in rows {
-        body.push_str(&format!(
-            "<tr><td class=\"{v}\">{v}</td><td>{claim}</td><td>{verifier}</td><td>{rationale}</td><td>{when}</td></tr>",
-            v = html_escape(&r.verdict),
-            claim = html_escape(&r.claim_text),
-            verifier = html_escape(&r.verifier_name),
-            rationale = html_escape(&r.rationale),
-            when = html_escape(&r.computed_at),
+
+    body.push_str("<div class=\"section\"><h3>Host/runtime capabilities</h3>");
+    if capabilities.is_empty() {
+        body.push_str("<p class=\"empty\">No capabilities announced for this session yet.</p>");
+    } else {
+        for caps in &capabilities {
+            body.push_str(&format!(
+                "<p>{badge}</p><table><tr><th>Signal</th><th>State</th><th>Detail</th></tr>",
+                badge = provider_badge(&provider_tag(&caps.provider)),
+            ));
+            for sig in &caps.signals {
+                body.push_str(&format!(
+                    "<tr><td>{class}</td><td>{state}</td><td>{detail}</td></tr>",
+                    class = html_escape(&format!("{:?}", sig.class)),
+                    state = html_escape(&format!("{:?}", sig.state)),
+                    detail = html_escape(sig.detail.as_deref().unwrap_or("")),
+                ));
+            }
+            body.push_str("</table>");
+        }
+    }
+    body.push_str("</div>");
+
+    body.push_str("<div class=\"section\"><h3>Claims &amp; findings</h3>");
+    if claims.is_empty() {
+        body.push_str("<p class=\"empty\">No claims recorded for this session.</p>");
+    } else {
+        body.push_str(
+            "<table><tr><th>Claim</th><th>Verdict</th><th>Verifier</th><th>When</th></tr>",
+        );
+        for c in &claims {
+            // A claim may have zero, one, or (if re-verified) more findings;
+            // render one row per finding, or one placeholder row if none
+            // exist yet — a claim is never silently omitted.
+            let claim_findings: Vec<_> = findings
+                .iter()
+                .filter(|f| f.claim_id == c.id.to_string())
+                .collect();
+            if claim_findings.is_empty() {
+                body.push_str(&format!(
+                    "<tr><td>{claim}</td><td class=\"empty\">no finding yet</td><td></td><td>{when}</td></tr>",
+                    claim = html_escape(&c.text),
+                    when = html_escape(&c.claimed_at),
+                ));
+            } else {
+                for f in claim_findings {
+                    body.push_str(&format!(
+                        "<tr><td>{claim}</td><td class=\"{v}\"><a href=\"/dashboard/finding/{fid}\">{v}</a></td>\
+                         <td>{verifier}</td><td>{when}</td></tr>",
+                        claim = html_escape(&c.text),
+                        v = html_escape(&f.verdict),
+                        fid = html_escape(&f.id),
+                        verifier = html_escape(&f.verifier_name),
+                        when = html_escape(&f.computed_at),
+                    ));
+                }
+            }
+        }
+        body.push_str("</table>");
+    }
+    body.push_str("</div>");
+
+    page(&format!("Fornax — session {session_id}"), &body)
+}
+
+/// Finding-detail page (FORNX-18 AC: "supporting/contradicting/missing/
+/// unavailable evidence with provenance"). The five-state verdict
+/// vocabulary (ADR 0001) maps 1:1 onto the evidence category shown: a
+/// verifier only ever attaches `evidence_ids` to support the verdict it
+/// actually reached, so which category applies falls out of `verdict`
+/// alone rather than needing separate classification logic.
+async fn dashboard_finding(
+    State(state): State<AppState>,
+    Path(finding_id): Path<String>,
+) -> axum::response::Html<String> {
+    let Ok(Some(finding)) = state.store.finding_by_id(&finding_id).await else {
+        return page(
+            "Fornax — finding not found",
+            "<p class=\"empty\">No such finding.</p>",
+        );
+    };
+
+    let linked_ids: Vec<String> = serde_json::from_str(&finding.evidence_ids).unwrap_or_default();
+    let session_evidence = state
+        .store
+        .evidence_for_session(&finding.session_id)
+        .await
+        .map(|o| o.evidence)
+        .unwrap_or_default();
+    let (linked, other): (Vec<_>, Vec<_>) = session_evidence
+        .into_iter()
+        .partition(|e| linked_ids.contains(&e.id.to_string()));
+
+    let evidence_label = match finding.verdict.as_str() {
+        "verified" => "Supporting evidence",
+        "contradicted" => "Contradicting evidence",
+        "review" => "Evidence requiring review",
+        "unverified" => "Missing evidence",
+        "unavailable" => "Unavailable evidence",
+        _ => "Linked evidence",
+    };
+
+    let mut body = format!(
+        "<div class=\"breadcrumb\"><a href=\"/dashboard/session/{sid_enc}\">&larr; session {sid}</a></div>\
+         <h2>Finding <code>{fid}</code></h2>\
+         <p><strong>Claim:</strong> {claim}</p>\
+         <p><strong>Verdict:</strong> <span class=\"{v}\">{v}</span></p>\
+         <p><strong>Verifier:</strong> {verifier}</p>\
+         <p><strong>Rationale:</strong> {rationale}</p>\
+         <p><strong>Computed at:</strong> {when}</p>",
+        sid_enc = html_escape(&finding.session_id),
+        sid = html_escape(&finding.session_id),
+        fid = html_escape(&finding.id),
+        claim = html_escape(&finding.claim_text),
+        v = html_escape(&finding.verdict),
+        verifier = html_escape(&finding.verifier_name),
+        rationale = html_escape(&finding.rationale),
+        when = html_escape(&finding.computed_at),
+    );
+
+    body.push_str(&format!("<div class=\"section\"><h3>{evidence_label}</h3>"));
+    body.push_str(&evidence_table(
+        &linked,
+        "No evidence is linked to this finding.",
+    ));
+    body.push_str("</div>");
+
+    body.push_str("<div class=\"section\"><h3>Other evidence observed in this session</h3>");
+    body.push_str(&evidence_table(
+        &other,
+        "No other evidence was observed for this session.",
+    ));
+    body.push_str("</div>");
+
+    page(&format!("Fornax — finding {finding_id}"), &body)
+}
+
+fn evidence_table(evidence: &[fornax_types::Evidence], empty_message: &str) -> String {
+    if evidence.is_empty() {
+        return format!("<p class=\"empty\">{}</p>", html_escape(empty_message));
+    }
+    let mut out = String::from(
+        "<table><tr><th>Kind</th><th>Payload</th><th>Provenance</th><th>Source</th><th>When</th></tr>",
+    );
+    for e in evidence {
+        let source = e
+            .source
+            .as_ref()
+            .map(|s| {
+                let trust_class = format!("{:?}", s.trust_class);
+                let collection_method = format!("{:?}", s.collection_method);
+                format!("{} / {trust_class} ({collection_method})", s.sensor_name)
+            })
+            .unwrap_or_else(|| "no sensor provenance recorded".to_string());
+        out.push_str(&format!(
+            "<tr><td>{kind}</td><td>{payload}</td><td>{provenance}</td><td>{source}</td><td>{when}</td></tr>",
+            kind = html_escape(&format!("{:?}", e.kind)),
+            payload = html_escape(&e.payload.to_string()),
+            provenance = html_escape(&e.provenance),
+            source = html_escape(&source),
+            when = html_escape(&e.observed_at),
         ));
     }
-    body.push_str("</table></body></html>");
-    axum::response::Html(body)
+    out.push_str("</table>");
+    out
+}
+
+/// Bare snake_case tag for a `Provider`, matching how it's stored/serialized
+/// elsewhere (`fornax_types::Provider`'s `#[serde(rename_all = "snake_case")]`)
+/// — used to drive `provider_badge`'s generic, data-attribute-based styling
+/// without a per-variant match arm.
+fn provider_tag(provider: &fornax_types::Provider) -> String {
+    match serde_json::to_value(provider) {
+        Ok(serde_json::Value::String(s)) => s,
+        _ => "unknown".to_string(),
+    }
 }
 
 fn html_escape(s: &str) -> String {
@@ -539,5 +789,208 @@ mod tests {
     fn default_unknown_caps_uses_unknown_provider() {
         let caps = default_unknown_caps();
         assert_eq!(caps.provider, Provider::Unknown);
+    }
+
+    // ---------------------------------------------------------------
+    // FORNX-18: dashboard session-list / session-detail / finding-detail
+    // ---------------------------------------------------------------
+
+    fn sample_capabilities(session_id: &str) -> RuntimeCapabilities {
+        use fornax_types::{CapabilitySignal, SignalAvailability, SignalClass};
+        RuntimeCapabilities {
+            schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
+            provider: Provider::ClaudeCode,
+            signals: vec![CapabilitySignal {
+                class: SignalClass::ToolTrace,
+                state: SignalAvailability::Available,
+                detail: None,
+            }],
+            notes: [("session_id".to_string(), session_id.to_string())].into(),
+        }
+    }
+
+    /// Drives a full PostToolUse(exit 0) + "All tests passed" claim through
+    /// `handle_message` exactly as a real adapter connection would (a
+    /// Capabilities announcement, then the Event, then the matching
+    /// Evidence, then the Claim) so a real `VERIFIED` finding exists to
+    /// render — this test module calls `handle_message` directly rather
+    /// than spawning a real daemon (that's what
+    /// `tests/adversarial_daemon_input.rs`/`tests/concurrent_hook_submission.rs`
+    /// are for); it only needs a durable finding to check the HTML against.
+    async fn seed_verified_session(state: &AppState, session_id: &str) -> String {
+        let mut hint = None;
+        handle_message(
+            state,
+            IngestMessage::Capabilities(sample_capabilities(session_id)),
+            &mut hint,
+        )
+        .await
+        .expect("handle capabilities");
+
+        let event_id = Uuid::new_v4();
+        let event = AgentEvent {
+            id: event_id,
+            session_id: session_id.to_string(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-08-31T00:00:00Z".to_string(),
+            tool_name: Some("Bash".to_string()),
+            tool_input: Some(serde_json::json!({"command": "cargo test --workspace"})),
+            tool_response: Some(serde_json::json!({"exit_code": 0})),
+            raw: serde_json::json!({}),
+        };
+        handle_message(state, IngestMessage::Event(event), &mut hint)
+            .await
+            .expect("handle event");
+
+        let evidence = fornax_types::Evidence {
+            id: Uuid::new_v4(),
+            session_id: session_id.to_string(),
+            source_event_id: event_id,
+            kind: fornax_types::EvidenceKind::ExitCode,
+            observed_at: "2026-08-31T00:00:01Z".to_string(),
+            payload: serde_json::json!({"command": "cargo test --workspace", "exit_code": 0}),
+            provenance: "claude_code:PostToolUse:Bash#tool_response".to_string(),
+            source: None,
+            extension: None,
+        };
+        handle_message(state, IngestMessage::Evidence(evidence), &mut hint)
+            .await
+            .expect("handle evidence");
+
+        let claim = Claim {
+            id: Uuid::new_v4(),
+            session_id: session_id.to_string(),
+            source_event_id: event_id,
+            text: "All tests passed.".to_string(),
+            subject: "test_result".to_string(),
+            claimed_at: "2026-08-31T00:00:02Z".to_string(),
+        };
+        handle_message(state, IngestMessage::Claim(claim), &mut hint)
+            .await
+            .expect("handle claim");
+
+        let findings = state
+            .store
+            .findings_for_session(session_id)
+            .await
+            .expect("findings for session");
+        assert_eq!(findings.len(), 1, "expected exactly one seeded finding");
+        assert_eq!(findings[0].verdict, "verified");
+        findings[0].id.clone()
+    }
+
+    #[tokio::test]
+    async fn dashboard_lists_the_session_with_its_provider_badge() {
+        let state = test_state().await;
+        let session_id = "fornx-18-session-list";
+        seed_verified_session(&state, session_id).await;
+
+        let html = dashboard(State(state)).await.0;
+        assert!(
+            html.contains(session_id),
+            "session list must show the session id: {html}"
+        );
+        assert!(
+            html.contains("data-provider=\"claude_code\""),
+            "session list must badge the session's provider: {html}"
+        );
+        assert!(html.contains(&format!("/dashboard/session/{session_id}")));
+    }
+
+    #[tokio::test]
+    async fn dashboard_session_links_to_its_finding() {
+        let state = test_state().await;
+        let session_id = "fornx-18-session-detail";
+        let finding_id = seed_verified_session(&state, session_id).await;
+
+        let html = dashboard_session(State(state), Path(session_id.to_string()))
+            .await
+            .0;
+        assert!(html.contains("All tests passed."));
+        assert!(html.contains(&format!("/dashboard/finding/{finding_id}")));
+        // Host/runtime capability availability (FORNX-18 AC).
+        assert!(html.contains("ToolTrace"));
+    }
+
+    #[tokio::test]
+    async fn dashboard_finding_shows_supporting_evidence_with_provenance_for_verified() {
+        let state = test_state().await;
+        let session_id = "fornx-18-finding-detail-verified";
+        let finding_id = seed_verified_session(&state, session_id).await;
+
+        let html = dashboard_finding(State(state), Path(finding_id)).await.0;
+        assert!(html.contains("Supporting evidence"));
+        assert!(html.contains("claude_code:PostToolUse:Bash#tool_response"));
+        assert!(html.contains("verified"));
+    }
+
+    #[tokio::test]
+    async fn dashboard_finding_shows_missing_evidence_label_for_unverified() {
+        let state = test_state().await;
+        let session_id = "fornx-18-finding-detail-unverified";
+        let mut hint = None;
+        // Capabilities announced, but no PostToolUse/Evidence at all — the
+        // TestResultVerifier's "no test-runner invocation observed" path.
+        handle_message(
+            &state,
+            IngestMessage::Capabilities(sample_capabilities(session_id)),
+            &mut hint,
+        )
+        .await
+        .expect("handle capabilities");
+
+        // `claims.source_event_id` is a foreign key into `agent_events` — a
+        // real UserPromptSubmit-style event exists even when there's no
+        // PostToolUse/Evidence for the verifier to find.
+        let event_id = Uuid::new_v4();
+        let event = AgentEvent {
+            id: event_id,
+            session_id: session_id.to_string(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::UserPromptSubmit,
+            observed_at: "2026-08-31T00:00:00Z".to_string(),
+            tool_name: None,
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        handle_message(&state, IngestMessage::Event(event), &mut hint)
+            .await
+            .expect("handle event");
+
+        let claim = Claim {
+            id: Uuid::new_v4(),
+            session_id: session_id.to_string(),
+            source_event_id: event_id,
+            text: "All tests passed.".to_string(),
+            subject: "test_result".to_string(),
+            claimed_at: "2026-08-31T00:00:01Z".to_string(),
+        };
+        handle_message(&state, IngestMessage::Claim(claim), &mut hint)
+            .await
+            .expect("handle claim");
+
+        let findings = state
+            .store
+            .findings_for_session(session_id)
+            .await
+            .expect("findings");
+        assert_eq!(findings[0].verdict, "unverified");
+
+        let html = dashboard_finding(State(state), Path(findings[0].id.clone()))
+            .await
+            .0;
+        assert!(html.contains("Missing evidence"));
+        assert!(html.contains("No evidence is linked to this finding."));
+    }
+
+    #[tokio::test]
+    async fn dashboard_finding_not_found_renders_a_placeholder_not_a_panic() {
+        let state = test_state().await;
+        let html = dashboard_finding(State(state), Path("no-such-finding".to_string()))
+            .await
+            .0;
+        assert!(html.contains("No such finding"));
     }
 }
