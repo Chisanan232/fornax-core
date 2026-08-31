@@ -6,7 +6,7 @@ where they conflict. See `CONTRIBUTING.md` for full development conventions
 
 ## Repository identity
 
-- Repo: `horonomy/fornax-core`. Fornax is a Horonomy product — canonical org
+- Repo: `horonomy/fornax-core`. Fornax is a Horonom product — canonical org
   is `horonomy`, not a dedicated Fornax org. Public OSS.
 - Language: Rust, edition 2021, workspace of crates under `crates/`.
 - Jira: project `FORNX`, epic FORNX-20, discovery thesis HVDL-15.
