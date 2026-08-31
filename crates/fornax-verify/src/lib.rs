@@ -228,6 +228,108 @@ impl Verifier for CommandExecutedVerifier {
     }
 }
 
+/// Third claim class (FORNX-14): an agent claims a command succeeded (or
+/// failed), as distinct from merely claiming it ran at all. Deterministically
+/// checks the same `EvidenceKind::ExitCode` evidence's `exit_code` field.
+///
+/// When the claim names a literal command, only evidence for that command is
+/// consulted; a generic claim ("the command succeeded") falls back to the
+/// most recent command-execution evidence observed, mirroring
+/// [`TestResultVerifier`]'s "most recent test-runner invocation" fallback.
+pub struct CommandSuccessVerifier;
+
+impl CommandSuccessVerifier {
+    /// Deliberately literal claim-text heuristic, mirroring
+    /// [`TestResultVerifier::claims_tests_passed`].
+    pub fn claims_command_succeeded(text: &str) -> bool {
+        let t = text.to_lowercase();
+        (t.contains("succeeded")
+            || t.contains("completed successfully")
+            || t.contains("ran successfully")
+            || t.contains("worked"))
+            && !t.contains("failed")
+    }
+}
+
+impl Verifier for CommandSuccessVerifier {
+    fn name(&self) -> &'static str {
+        "command_success_verifier_v1"
+    }
+
+    fn applies_to(&self, claim: &Claim) -> bool {
+        claim.subject == "command_succeeded"
+    }
+
+    fn verify(&self, claim: &Claim, evidence: &[Evidence], caps: &RuntimeCapabilities) -> Finding {
+        let now = chrono::Utc::now().to_rfc3339();
+
+        if !caps.is_observable(&SignalClass::ToolTrace)
+            && !caps.is_observable(&SignalClass::FinalResponse)
+        {
+            return unavailable(
+                claim.id,
+                self.name(),
+                "runtime does not expose tool-trace/transcript evidence needed to check command exit status",
+                now,
+            );
+        }
+
+        let claimed =
+            CommandExecutedVerifier::extract_command_literal(&claim.text).map(|s| s.to_lowercase());
+
+        let command_evidence = evidence.iter().rev().find(|e| {
+            e.kind == EvidenceKind::ExitCode
+                && claimed
+                    .as_ref()
+                    .is_none_or(|claimed| command_text(&e.payload).contains(claimed))
+        });
+
+        let Some(ev) = command_evidence else {
+            return Finding {
+                id: Uuid::new_v4(),
+                claim_id: claim.id,
+                verdict: Verdict::Unverified,
+                evidence_ids: vec![],
+                verifier_name: self.name().to_string(),
+                rationale: "no command-execution evidence observed in this session".to_string(),
+                computed_at: now,
+            };
+        };
+
+        let exit_code = ev.payload.get("exit_code").and_then(|v| v.as_i64());
+
+        match exit_code {
+            Some(0) => Finding {
+                id: Uuid::new_v4(),
+                claim_id: claim.id,
+                verdict: Verdict::Verified,
+                evidence_ids: vec![ev.id],
+                verifier_name: self.name().to_string(),
+                rationale: format!("observed command exit_code=0 ({})", ev.provenance),
+                computed_at: now,
+            },
+            Some(code) => Finding {
+                id: Uuid::new_v4(),
+                claim_id: claim.id,
+                verdict: Verdict::Contradicted,
+                evidence_ids: vec![ev.id],
+                verifier_name: self.name().to_string(),
+                rationale: format!(
+                    "claim states the command succeeded, but observed exit_code={code} ({})",
+                    ev.provenance
+                ),
+                computed_at: now,
+            },
+            None => unavailable(
+                claim.id,
+                self.name(),
+                "command evidence found but no exit_code field present",
+                now,
+            ),
+        }
+    }
+}
+
 /// Extract the substring between the first pair of `delim` characters in
 /// `text`, trimmed. Returns `None` when `delim` doesn't appear twice or the
 /// enclosed text is empty.
@@ -653,6 +755,129 @@ mod command_executed_verifier_tests {
         let v = CommandExecutedVerifier;
         let c = crate::tests::claim_for("command_executed", "I ran `npm install`.");
         let ev = vec![crate::tests::evidence_for_command(&["npm", "install"], 0)];
+        let capabilities = caps();
+
+        let first = v.verify(&c, &ev, &capabilities);
+        let replayed = v.verify(&c, &ev, &capabilities);
+
+        assert_eq!(first.verdict, replayed.verdict);
+        assert_eq!(first.rationale, replayed.rationale);
+        assert_eq!(first.evidence_ids, replayed.evidence_ids);
+    }
+}
+
+#[cfg(test)]
+mod command_success_verifier_tests {
+    use super::*;
+    use fornax_types::{CapabilitySignal, Provider, SignalAvailability};
+
+    fn caps() -> RuntimeCapabilities {
+        RuntimeCapabilities {
+            schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
+            provider: Provider::Codex,
+            signals: vec![
+                CapabilitySignal {
+                    class: SignalClass::ToolTrace,
+                    state: SignalAvailability::Available,
+                    detail: None,
+                },
+                CapabilitySignal {
+                    class: SignalClass::FinalResponse,
+                    state: SignalAvailability::Available,
+                    detail: None,
+                },
+            ],
+            notes: Default::default(),
+        }
+    }
+
+    fn no_caps() -> RuntimeCapabilities {
+        RuntimeCapabilities {
+            schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
+            provider: Provider::Codex,
+            signals: vec![
+                CapabilitySignal {
+                    class: SignalClass::ToolTrace,
+                    state: SignalAvailability::Unknown,
+                    detail: None,
+                },
+                CapabilitySignal {
+                    class: SignalClass::FinalResponse,
+                    state: SignalAvailability::Unknown,
+                    detail: None,
+                },
+            ],
+            notes: Default::default(),
+        }
+    }
+
+    #[test]
+    fn verified_when_named_command_exit_code_zero() {
+        let v = CommandSuccessVerifier;
+        let c = crate::tests::claim_for("command_succeeded", "The `npm install` succeeded.");
+        let ev = vec![crate::tests::evidence_for_command(&["npm", "install"], 0)];
+        let f = v.verify(&c, &ev, &caps());
+        assert_eq!(f.verdict, Verdict::Verified);
+        assert_eq!(f.evidence_ids, vec![ev[0].id]);
+    }
+
+    #[test]
+    fn contradicted_when_named_command_exit_code_nonzero() {
+        let v = CommandSuccessVerifier;
+        let c = crate::tests::claim_for("command_succeeded", "The `npm install` succeeded.");
+        let ev = vec![crate::tests::evidence_for_command(&["npm", "install"], 1)];
+        let f = v.verify(&c, &ev, &caps());
+        assert_eq!(f.verdict, Verdict::Contradicted);
+        assert_eq!(f.evidence_ids, vec![ev[0].id]);
+    }
+
+    #[test]
+    fn generic_claim_without_named_command_uses_most_recent_evidence() {
+        let v = CommandSuccessVerifier;
+        let c = crate::tests::claim_for("command_succeeded", "The command succeeded.");
+        let ev = vec![
+            crate::tests::evidence_for_command(&["pytest"], 1),
+            crate::tests::evidence_for_command(&["npm", "install"], 0),
+        ];
+        let f = v.verify(&c, &ev, &caps());
+        assert_eq!(f.verdict, Verdict::Verified);
+        assert_eq!(f.evidence_ids, vec![ev[1].id]);
+    }
+
+    #[test]
+    fn unverified_when_no_command_evidence_present() {
+        let v = CommandSuccessVerifier;
+        let c = crate::tests::claim_for("command_succeeded", "The command succeeded.");
+        let f = v.verify(&c, &[], &caps());
+        assert_eq!(f.verdict, Verdict::Unverified);
+    }
+
+    #[test]
+    fn unavailable_when_runtime_cannot_observe_tool_traces() {
+        let v = CommandSuccessVerifier;
+        let c = crate::tests::claim_for("command_succeeded", "The command succeeded.");
+        let f = v.verify(&c, &[], &no_caps());
+        assert_eq!(f.verdict, Verdict::Unavailable);
+    }
+
+    #[test]
+    fn claim_text_heuristic_matches_expected_phrasings() {
+        assert!(CommandSuccessVerifier::claims_command_succeeded(
+            "The build succeeded."
+        ));
+        assert!(CommandSuccessVerifier::claims_command_succeeded(
+            "It completed successfully."
+        ));
+        assert!(!CommandSuccessVerifier::claims_command_succeeded(
+            "The build failed."
+        ));
+    }
+
+    #[test]
+    fn recomputing_from_the_same_persisted_inputs_is_deterministic() {
+        let v = CommandSuccessVerifier;
+        let c = crate::tests::claim_for("command_succeeded", "The `pytest` succeeded.");
+        let ev = vec![crate::tests::evidence_for_command(&["pytest"], 1)];
         let capabilities = caps();
 
         let first = v.verify(&c, &ev, &capabilities);
