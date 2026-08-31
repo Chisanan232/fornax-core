@@ -300,28 +300,24 @@ async fn handle_message(
 /// behaviorally identical to today's all-`false` bools at every verifier
 /// gate — this fallback still never opens a gate it shouldn't.
 ///
-/// FORNX-155 disclosure (found while formalizing this, not introduced by
-/// it): `provider` below is hardcoded to `Codex` regardless of which
-/// provider's session this actually is — a fabricated provider identity for
-/// a session whose adapter simply hasn't spoken yet. This is contained: this
-/// value is only ever passed into `Verifier::verify`, `Finding` carries no
-/// provider field, and this placeholder is never persisted or exported (a
-/// real `Capabilities` announcement, once it arrives, is what gets
-/// persisted). The two candidate fixes are each worse than the bug — a
-/// `Provider::Unknown` variant risks reaching fornax-cloud's closed
-/// enum (2 variants as of FORNX-155/156; a third, `OpenCode`, was added to
-/// this repo's own `Provider` in FORNX-161, but fornax-cloud's separate,
-/// out-of-scope ingest enum was not) as a live 422 if this value were ever
-/// exported by mistake, and a session→provider store lookup here would put
-/// a DB round
-/// trip on the verify hot path the `caps` in-memory cache exists
-/// specifically to avoid. Left as-is; a proper fix needs either an open
-/// `Provider` enum or provider plumbing through the claim path — tracked as
-/// a FORNX-138 follow-up, not fixed in this ticket.
+/// FORNX-288 (found during FORNX-155's `RuntimeCapabilities` formalization,
+/// disclosed there, fixed here): `provider` used to be hardcoded to `Codex`
+/// regardless of which provider's session this actually is — a fabricated
+/// provider identity for a session whose adapter simply hasn't spoken yet.
+/// This now uses a real `Provider::Unknown` variant instead of guessing.
+/// That variant is deliberately narrow-purpose: it is never written by
+/// `Store::upsert_capabilities` (only a real announced `Capabilities`
+/// message reaches that path) and never exported to `fornax-cloud`'s
+/// separate, closed ingest enum, which doesn't know this variant — this
+/// value only ever flows into `Verifier::verify`, and `Finding` carries no
+/// provider field. A session→provider store lookup remains out of scope
+/// here: it would put a DB round trip on the verify hot path the `caps`
+/// in-memory cache exists specifically to avoid. Further provider plumbing
+/// through the claim path, if ever needed, is FORNX-138 scope.
 fn default_unknown_caps() -> RuntimeCapabilities {
     RuntimeCapabilities {
         schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
-        provider: fornax_types::Provider::Codex,
+        provider: fornax_types::Provider::Unknown,
         signals: vec![],
         notes: [(
             "reason".to_string(),
@@ -525,5 +521,14 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&sock_path);
+    }
+
+    /// FORNX-288 regression: a session that submits a Claim before any
+    /// Capabilities announcement must fall back to a real `Provider::Unknown`
+    /// value, not a fabricated guess at a specific provider.
+    #[test]
+    fn default_unknown_caps_uses_unknown_provider() {
+        let caps = default_unknown_caps();
+        assert_eq!(caps.provider, Provider::Unknown);
     }
 }
