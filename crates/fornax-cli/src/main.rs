@@ -44,6 +44,19 @@ enum Commands {
         #[arg(long)]
         out: std::path::PathBuf,
     },
+    /// Idempotently wire the Fornax hooks into `~/.claude/settings.json`
+    /// (FORNX-15), matching the `fornax-adapter-claude` doc comment's
+    /// documented hook set: SessionStart, UserPromptSubmit, PreToolUse,
+    /// PostToolUse, Stop. Safe to run more than once — never duplicates an
+    /// entry, and never touches unrelated hooks or settings already present
+    /// in the file.
+    InstallClaude,
+    /// Reverse of `install-claude`: removes only the Fornax hook entries
+    /// from `~/.claude/settings.json`, leaving every other hook and setting
+    /// untouched. Safe to run when nothing is installed — including when
+    /// `~/.claude/settings.json` does not exist, in which case it is left
+    /// absent rather than created.
+    UninstallClaude,
 }
 
 fn base_url() -> String {
@@ -67,6 +80,8 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::ExportSpool { session, out } => export_spool(&session, &out).await?,
+        Commands::InstallClaude => install_claude()?,
+        Commands::UninstallClaude => uninstall_claude()?,
     }
     Ok(())
 }
@@ -81,6 +96,194 @@ fn dirs_home() -> std::path::PathBuf {
     std::env::var("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::path::PathBuf::from("."))
+}
+
+/// The `command` value the `fornax-adapter-claude` doc comment documents for
+/// wiring into `~/.claude/settings.json` hooks.
+const FORNAX_HOOK_COMMAND: &str = "fornax-hook-claude";
+
+/// Hook event names the `fornax-adapter-claude` doc comment documents as
+/// the wired set. Kept in sync with that doc comment — see
+/// `crates/fornax-adapter-claude/src/main.rs`.
+const CLAUDE_HOOK_EVENTS: [&str; 5] = [
+    "SessionStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "Stop",
+];
+
+fn claude_settings_path() -> std::path::PathBuf {
+    dirs_home().join(".claude").join("settings.json")
+}
+
+fn load_settings(path: &std::path::Path) -> anyhow::Result<serde_json::Value> {
+    if !path.exists() {
+        return Ok(serde_json::json!({}));
+    }
+    let contents = std::fs::read_to_string(path)?;
+    if contents.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    let value: serde_json::Value = serde_json::from_str(&contents)?;
+    anyhow::ensure!(
+        value.is_object(),
+        "{} does not contain a JSON object at its root — refusing to touch it",
+        path.display()
+    );
+    Ok(value)
+}
+
+/// Atomically overwrites `path` with `settings` (write-to-temp then rename,
+/// same pattern `write_envelope` uses below) so a crash or concurrent read
+/// never observes a half-written `~/.claude/settings.json`.
+fn save_settings(path: &std::path::Path, settings: &serde_json::Value) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut json = serde_json::to_string_pretty(settings)?;
+    json.push('\n');
+    let tmp_path = path.with_extension("json.tmp");
+    std::fs::write(&tmp_path, json)?;
+    std::fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
+/// True if this hook group already carries a Fornax command entry.
+fn group_has_fornax_command(group: &serde_json::Value) -> bool {
+    group
+        .get("hooks")
+        .and_then(|h| h.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .any(|h| h.get("command").and_then(|c| c.as_str()) == Some(FORNAX_HOOK_COMMAND))
+        })
+        .unwrap_or(false)
+}
+
+/// Idempotently ensures each hook in `CLAUDE_HOOK_EVENTS` has one group
+/// running `fornax-hook-claude`, without touching any other group/event
+/// already present in `settings`.
+///
+/// `settings` must already be a JSON object (guaranteed by `load_settings`).
+/// If an existing `"hooks"` value, or an existing per-event value, is
+/// present but not the shape Claude Code expects (object / array
+/// respectively), this refuses to clobber it and returns an error instead —
+/// per the "safe failure mode rather than corrupting Claude Code config"
+/// constraint.
+fn install_claude_hooks(settings: &mut serde_json::Value) -> anyhow::Result<()> {
+    let root = settings
+        .as_object_mut()
+        .expect("caller guarantees settings is a JSON object");
+    let hooks = root.entry("hooks").or_insert_with(|| serde_json::json!({}));
+    anyhow::ensure!(
+        hooks.is_object(),
+        "existing \"hooks\" value in settings.json is not an object — refusing to overwrite it"
+    );
+    let hooks_obj = hooks.as_object_mut().expect("just checked is_object");
+
+    for event in CLAUDE_HOOK_EVENTS {
+        let entries = hooks_obj
+            .entry(event)
+            .or_insert_with(|| serde_json::json!([]));
+        anyhow::ensure!(
+            entries.is_array(),
+            "existing \"hooks.{event}\" value in settings.json is not an array — refusing to overwrite it"
+        );
+        let entries_arr = entries.as_array_mut().expect("just checked is_array");
+        let already_installed = entries_arr.iter().any(group_has_fornax_command);
+        if !already_installed {
+            entries_arr.push(serde_json::json!({
+                "hooks": [{ "type": "command", "command": FORNAX_HOOK_COMMAND }]
+            }));
+        }
+    }
+    Ok(())
+}
+
+/// Removes only Fornax hook entries from `settings`, leaving every other
+/// hook group, hook event, and top-level setting exactly as it was. Cleans
+/// up groups/events left empty by the removal, but never removes a group
+/// that still carries another tool's hook entry.
+fn uninstall_claude_hooks(settings: &mut serde_json::Value) {
+    let Some(hooks_obj) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
+        return;
+    };
+
+    for event in CLAUDE_HOOK_EVENTS {
+        let Some(entries) = hooks_obj.get_mut(event).and_then(|e| e.as_array_mut()) else {
+            continue;
+        };
+        for group in entries.iter_mut() {
+            if let Some(group_hooks) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+                group_hooks.retain(|h| {
+                    h.get("command").and_then(|c| c.as_str()) != Some(FORNAX_HOOK_COMMAND)
+                });
+            }
+        }
+        entries.retain(|group| {
+            group
+                .get("hooks")
+                .and_then(|h| h.as_array())
+                .map(|a| !a.is_empty())
+                .unwrap_or(true)
+        });
+    }
+
+    hooks_obj.retain(|_, v| v.as_array().map(|a| !a.is_empty()).unwrap_or(true));
+    if hooks_obj.is_empty() {
+        settings
+            .as_object_mut()
+            .expect("checked object above")
+            .remove("hooks");
+    }
+}
+
+fn install_claude_at(path: &std::path::Path) -> anyhow::Result<()> {
+    let before = load_settings(path)?;
+    let mut settings = before.clone();
+    install_claude_hooks(&mut settings)?;
+    if settings == before {
+        println!(
+            "Fornax Claude Code hooks already installed in {}",
+            path.display()
+        );
+        return Ok(());
+    }
+    save_settings(path, &settings)?;
+    println!("Installed Fornax Claude Code hooks in {}", path.display());
+    Ok(())
+}
+
+fn uninstall_claude_at(path: &std::path::Path) -> anyhow::Result<()> {
+    if !path.exists() {
+        // Nothing was ever installed — leave the machine exactly as it was
+        // rather than creating a settings.json the user never had.
+        println!(
+            "No Fornax Claude Code hooks to remove ({} does not exist)",
+            path.display()
+        );
+        return Ok(());
+    }
+    let before = load_settings(path)?;
+    let mut settings = before.clone();
+    uninstall_claude_hooks(&mut settings);
+    if settings == before {
+        println!("No Fornax Claude Code hooks found in {}", path.display());
+        return Ok(());
+    }
+    save_settings(path, &settings)?;
+    println!("Removed Fornax Claude Code hooks from {}", path.display());
+    Ok(())
+}
+
+fn install_claude() -> anyhow::Result<()> {
+    install_claude_at(&claude_settings_path())
+}
+
+fn uninstall_claude() -> anyhow::Result<()> {
+    uninstall_claude_at(&claude_settings_path())
 }
 
 /// Writes one envelope JSON file into `<out>/pending/<id>.json`, internally
