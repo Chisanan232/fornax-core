@@ -551,16 +551,19 @@ mod tests {
     }
 
     /// FORNX-17: `fornax status`/`fornax detail` (`/api/status` and
-    /// `/api/findings/recent`) must surface a Codex session's finding
-    /// exactly the way they already surface a Claude Code one — `Finding`
-    /// carries no `provider` field, so this requires no Codex-specific code
-    /// in the daemon at all, only a real Codex session driven through the
-    /// same `handle_message` pipeline the FORNX-280 Claude test above uses.
-    /// Also proves the CONTRADICTED rationale references the real evidence
-    /// (exit code + provenance), satisfying the AC's "contradiction detail
+    /// `/api/findings/recent`) must surface a Codex session's finding —
+    /// `Finding` carries no `provider` field, so no Codex-specific code
+    /// exists in the daemon to test; this drives a real Codex session
+    /// through the same `handle_message` pipeline the FORNX-280 Claude test
+    /// above uses and checks both API surfaces produced the expected
+    /// result. The parity claim with Claude Code is structural (same code
+    /// path, same `Finding` shape), not something this one test
+    /// demonstrates by comparison — it only exercises the Codex side. Also
+    /// proves the CONTRADICTED rationale references the real evidence (exit
+    /// code + provenance), satisfying the AC's "contradiction detail
     /// references the exact underlying evidence" for Codex specifically.
     #[tokio::test]
-    async fn codex_session_finding_is_surfaced_by_status_and_detail_identically_to_claude() {
+    async fn codex_session_finding_is_surfaced_by_status_and_detail() {
         use fornax_types::sensor::{CollectionMethod, EvidenceSource};
         use fornax_types::{
             CapabilitySignal, EventKind, Evidence, EvidenceKind, Provider, SignalAvailability,
@@ -571,9 +574,11 @@ mod tests {
         let mut hint = None;
         let session_id = "fornx-17-codex-session".to_string();
 
-        // A real Codex adapter capability announcement (mirrors
-        // `fornax_adapter_codex::CodexAdapter::probe`'s shape without
-        // pulling in that crate as a dependency here).
+        // A minimal Codex capability announcement — just enough to open
+        // `TestResultVerifier`'s `ToolTrace` gate (see its `verify` doc
+        // comment) — not a full reproduction of
+        // `fornax_adapter_codex::CodexAdapter::probe`'s real 7-signal
+        // shape, which this crate deliberately doesn't depend on.
         let caps = RuntimeCapabilities {
             schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
             provider: Provider::Codex,
