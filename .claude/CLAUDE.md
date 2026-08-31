@@ -1,53 +1,41 @@
-# CLAUDE.md — fornax-core
-
-Read `~/.claude/CLAUDE.md` (global baseline) first. This file overrides it
-where they conflict. See `CONTRIBUTING.md` for full development conventions
-(branching, commits, PRs, merge, self-review) — not repeated here.
-
-## Repository identity
-
-- Repo: `horonomy/fornax-core`. Fornax is a Horonomy product — canonical org
-  is `horonomy`, not a dedicated Fornax org. Public OSS.
-- Language: Rust, edition 2021, workspace of crates under `crates/`.
-- Jira: project `FORNX`, epic FORNX-20, discovery thesis HVDL-15.
-- History: `main` was normalized 2026-08-28 (FORNX-52, owner-authorized
-  one-time exception to the no-force-push-main rule). Prior implementation
-  is preserved at tag `archive-v0.0.1-bootstrap` and is being replayed
-  ticket-by-ticket as reviewed PRs — see `docs/migration/0001-pr-governance-migration.md`.
-
-## Architecture constraints
-
-See `docs/adr/0001-architecture-invariants.md` — modular monolith, one local
-daemon process, no cloud dependency on the local critical path, immutable
-observation before interpretation, five-state verdict vocabulary never
-collapsed, adapters stay thin.
-
-## Dependency versions
-
-See `docs/adr/0003-dependency-version-policy.md` (applies to every Fornax
-repo, not just this one). Invariant: **latest stable by default; pinned for
-reproducibility; downgrade only with demonstrated compatibility evidence.**
-
-## Commands
-
-- Build: `cargo build --workspace`
-- Test: `cargo test --workspace`
-- Lint: `cargo clippy --workspace --all-targets -- -D warnings`
-- Format: `cargo fmt --all` (check: `cargo fmt --all -- --check`)
-- Use `CARGO_TARGET_DIR=./target` — the machine's shared
-  `~/.cargo/shared-target` has tens of thousands of unrelated `deps` entries
-  from other projects and makes builds extremely slow.
-
-## Merge strategy
-
-PR-only to `main`, create-a-merge-commit (never squash/rebase-merge). Branch
-naming: `v0.0.1/FORNX-<n>/<type>/<snake_case_slug>`.
-
-## Source of truth
-
-- Jira: `FORNX` project, cloudId `f15c3ffb-740e-4db1-9b6b-12ccba3e897a`
-  (site `lightning-dust-mite.atlassian.net`).
-- `docs/research/adapter-capability-matrix.md` — empirically confirmed
-  Claude Code hook payload shapes and Codex rollout JSONL schema. Re-verify
-  against the installed CLI version before trusting field names on the
-  Codex side; that surface moves fast.
+IyBDTEFVREUubWQg4oCUIGZvcm5heC1jb3JlCgpSZWFkIGB+Ly5jbGF1ZGUvQ0xBVURFLm1kYCAo
+Z2xvYmFsIGJhc2VsaW5lKSBmaXJzdC4gVGhpcyBmaWxlIG92ZXJyaWRlcyBpdAp3aGVyZSB0aGV5
+IGNvbmZsaWN0LiBTZWUgYENPTlRSSUJVVElORy5tZGAgZm9yIGZ1bGwgZGV2ZWxvcG1lbnQgY29u
+dmVudGlvbnMKKGJyYW5jaGluZywgY29tbWl0cywgUFJzLCBtZXJnZSwgc2VsZi1yZXZpZXcpIC0g
+bm90IHJlcGVhdGVkIGhlcmUuCgojIyBSZXBvc2l0b3J5IGlkZW50aXR5CgotIFJlcG86IGBob3Jv
+bm9teS9mb3JuYXgtY29yZWAuIEZvcm5heCBpcyBhIEhvcm9ub20gcHJvZHVjdCAtIGNhbm9uaWNh
+bCBvcmcKICBpcyBgaG9yb25vbXlgLCBub3QgYSBkZWRpY2F0ZWQgRm9ybmF4IG9yZy4gUHVibGlj
+IE9TUy4KLSBMYW5ndWFnZTogUnVzdCwgZWRpdGlvbiAyMDIxLCB3b3Jrc3BhY2Ugb2YgY3JhdGVz
+IHVuZGVyIGBjcmF0ZXMvYC4KLSBKaXJhOiBwcm9qZWN0IGBGT1JOWGAsIGVwaWMgRk9STlgtMjAs
+IGRpc2NvdmVyeSB0aGVzaXMgSFZETC0xNS4KLSBIaXN0b3J5OiBgbWFpbmAgd2FzIG5vcm1hbGl6
+ZWQgMjAyNi0wOC0yOCAoRk9STlgtNTIsIG93bmVyLWF1dGhvcml6ZWQKICBvbmUtdGltZSBleGNl
+cHRpb24gdG8gdGhlIG5vLWZvcmNlLXB1c2gtbWFpbiBydWxlKS4gUHJpb3IgaW1wbGVtZW50YXRp
+b24KICBpcyBwcmVzZXJ2ZWQgYXQgdGFnIGBhcmNoaXZlLXYwLjAuMS1ib290c3RyYXBgIGFuZCBp
+cyBiZWluZyByZXBsYXllZAogIHRpY2tldC1ieS10aWNrZXQgYXMgcmV2aWV3ZWQgUFJzIC0gc2Vl
+IGBkb2NzL21pZ3JhdGlvbi8wMDAxLXByLWdvdmVybmFuY2UtbWlncmF0aW9uLm1kYC4KCiMjIEFy
+Y2hpdGVjdHVyZSBjb25zdHJhaW50cwoKU2VlIGBkb2NzL2Fkci8wMDAxLWFyY2hpdGVjdHVyZS1p
+bnZhcmlhbnRzLm1kYCAtIG1vZHVsYXIgbW9ub2xpdGgsIG9uZSBsb2NhbApkYWVtb24gcHJvY2Vz
+cywgbm8gY2xvdWQgZGVwZW5kZW5jeSBvbiB0aGUgbG9jYWwgY3JpdGljYWwgcGF0aCwgaW1tdXRh
+YmxlCm9ic2VydmF0aW9uIGJlZm9yZSBpbnRlcnByZXRhdGlvbiwgZml2ZS1zdGF0ZSB2ZXJkaWN0
+IHZvY2FidWxhcnkgbmV2ZXIKY29sbGFwc2VkLCBhZGFwdGVycyBzdGF5IHRoaW4uCgojIyBEZXBl
+bmRlbmN5IHZlcnNpb25zCgpTZWUgYGRvY3MvYWRyLzAwMDMtZGVwZW5kZW5jeS12ZXJzaW9uLXBv
+bGljeS5tZGAgKGFwcGxpZXMgdG8gZXZlcnkgRm9ybmF4CnJlcG8sIG5vdCBqdXN0IHRoaXMgb25l
+KS4gSW52YXJpYW50OiAqKmxhdGVzdCBzdGFibGUgYnkgZGVmYXVsdDsgcGlubmVkIGZvcgpyZXBy
+b2R1Y2liaWxpdHk7IGRvd25ncmFkZSBvbmx5IHdpdGggZGVtb25zdHJhdGVkIGNvbXBhdGliaWxp
+dHkgZXZpZGVuY2UuKioKCiMjIENvbW1hbmRzCgotIEJ1aWxkOiBgY2FyZ28gYnVpbGQgLS13b3Jr
+c3BhY2VgCi0gVGVzdDogYGNhcmdvIHRlc3QgLS13b3Jrc3BhY2VgCi0gTGludDogYGNhcmdvIGNs
+aXBweSAtLXdvcmtzcGFjZSAtLWFsbC10YXJnZXRzIC0tIC1EIHdhcm5pbmdzYAotIEZvcm1hdDog
+YGNhcmdvIGZtdCAtLWFsbGAgKGNoZWNrOiBgY2FyZ28gZm10IC0tYWxsIC0tIC0tY2hlY2tgKQot
+IFVzZSBgQ0FSR09fVEFSR0VUX0RJUj0uL3RhcmdldGAgLSB0aGUgbWFjaGluZSdzIHNoYXJlZAog
+IGB+Ly5jYXJnby9zaGFyZWQtdGFyZ2V0YCBoYXMgdGVucyBvZiB0aG91c2FuZHMgb2YgdW5yZWxh
+dGVkIGBkZXBzYCBlbnRyaWVzCiAgZnJvbSBvdGhlciBwcm9qZWN0cyBhbmQgbWFrZXMgYnVpbGRz
+IGV4dHJlbWVseSBzbG93LgoKIyMgTWVyZ2Ugc3RyYXRlZ3kKClBSLW9ubHkgdG8gYG1haW5gLCBj
+cmVhdGUtYS1tZXJnZS1jb21taXQgKG5ldmVyIHNxdWFzaC9yZWJhc2UtbWVyZ2UpLiBCcmFuY2gK
+bmFtaW5nOiBgdjAuMC4xL0ZPUk5YLTxuPi88dHlwZT4vPHNuYWtlX2Nhc2Vfc2x1Zz5gLgoKIyMg
+U291cmNlIG9mIHRydXRoCgotIEppcmE6IGBGT1JOWGAgcHJvamVjdCwgY2xvdWRJZCBgZjE1YzNm
+ZmItNzQwZS00ZGIxLTliNmItMTJjY2JhNWM5N2VhYAogIChzaXRlIGBsaWdodG5pbmctZHVzdC1t
+aXRlLmF0bGFzc2lhbi5uZXRgKS4KLSBgZG9jcy9yZXNlYXJjaC9hZGFwdGVyLWNhcGFiaWxpdHkt
+bWF0cml4Lm1kYCAtIGVtcGlyaWNhbGx5IGNvbmZpcm1lZApDbGF1ZGUgQ29kZSBob29rIHBheWxv
+YWQgc2hhcGVzIGFuZCBDb2RleCByb2xsb3V0IEpTT05MIHNjaGVtYS4gUmUtdmVyaWZ5CmFnYWlu
+c3QgdGhlIGluc3RhbGxlZCBDTEkgdmVyc2lvbiBiZWZvcmUgdHJ1c3RpbmcgZmllbGQgbmFtZXMg
+b24gdGhlCkNvZGV4IHNpZGU7IHRoYXQgc3VyZmFjZSBtb3ZlcyBmYXN0Lgo=
