@@ -39,6 +39,12 @@ pub enum Provider {
     ClaudeCode,
     Codex,
     OpenCode,
+    /// No adapter has announced itself for this session yet. This is a
+    /// local, in-process placeholder only (FORNX-288) — it must never be
+    /// persisted via `upsert_capabilities` or exported to `fornax-cloud`'s
+    /// separate, closed ingest enum, which does not know this variant.
+    /// `default_unknown_caps()` is the only producer of this value.
+    Unknown,
 }
 
 /// Normalized lifecycle event kind. One variant per canonical concept a
