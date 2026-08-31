@@ -330,6 +330,79 @@ impl Store {
         .await?;
         Ok(rows)
     }
+
+    /// One finding row by id, joined with its claim (FORNX-18: the
+    /// dashboard's finding-detail page). `None` if no such finding exists.
+    pub async fn finding_by_id(&self, id: &str) -> Result<Option<FindingRow>> {
+        let row = sqlx::query_as::<_, FindingRow>(
+            "SELECT f.id, f.claim_id, f.verdict, f.evidence_ids, f.verifier_name, f.rationale, f.computed_at,
+                    c.text as claim_text, c.session_id as session_id
+             FROM findings f JOIN claims c ON c.id = f.claim_id
+             WHERE f.id = ?1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// One overview row per session that has at least one event, newest
+    /// activity first (FORNX-18: the dashboard's session-list page). The
+    /// `provider` column comes straight from `agent_events` — a session's
+    /// events are always normalized by the one adapter connection that
+    /// produced them, so this needs no capability-table lookup and stays
+    /// correct even for a session that never explicitly announced
+    /// `RuntimeCapabilities`.
+    pub async fn sessions_overview(&self) -> Result<Vec<SessionSummary>> {
+        let rows = sqlx::query_as::<_, SessionSummary>(
+            "SELECT e.session_id as session_id,
+                    e.provider as provider,
+                    COUNT(DISTINCT e.id) as event_count,
+                    COUNT(DISTINCT c.id) as claim_count,
+                    COUNT(DISTINCT f.id) as finding_count,
+                    MAX(e.observed_at) as last_activity
+             FROM agent_events e
+             LEFT JOIN claims c ON c.session_id = e.session_id
+             LEFT JOIN findings f ON f.claim_id = c.id
+             GROUP BY e.session_id, e.provider
+             ORDER BY last_activity DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// All findings for one session, newest first (FORNX-18: the
+    /// dashboard's session-detail page — distinct from `recent_findings`,
+    /// which is cross-session).
+    pub async fn findings_for_session(&self, session_id: &str) -> Result<Vec<FindingRow>> {
+        let rows = sqlx::query_as::<_, FindingRow>(
+            "SELECT f.id, f.claim_id, f.verdict, f.evidence_ids, f.verifier_name, f.rationale, f.computed_at,
+                    c.text as claim_text, c.session_id as session_id
+             FROM findings f JOIN claims c ON c.id = f.claim_id
+             WHERE c.session_id = ?1
+             ORDER BY f.computed_at DESC",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+}
+
+/// One row of `Store::sessions_overview` — a session's activity summary for
+/// the dashboard's session-list page (FORNX-18). Not the canonical session
+/// concept (there is no `sessions` table; a session is implicitly whatever
+/// `session_id` its events/claims/findings share) — purely a read-side
+/// aggregate.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct SessionSummary {
+    pub session_id: String,
+    pub provider: String,
+    pub event_count: i64,
+    pub claim_count: i64,
+    pub finding_count: i64,
+    pub last_activity: String,
 }
 
 /// Result of `Store::evidence_for_session`: the rows that deserialized
