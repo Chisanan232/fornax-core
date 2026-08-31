@@ -471,6 +471,179 @@ mod tests {
         assert_eq!(verdict_icon("unavailable"), "🛡 —");
     }
 
+    // FORNX-15: install-claude / uninstall-claude must idempotently
+    // add/remove the documented Fornax hook entries in a
+    // `~/.claude/settings.json`-shaped fixture without disturbing anything
+    // else already in the file.
+    mod claude_hooks_install_uninstall {
+        use super::*;
+        use uuid::Uuid;
+
+        fn tmp_settings_path(name: &str) -> std::path::PathBuf {
+            std::env::temp_dir().join(format!(
+                "fornax-cli-test-settings-{name}-{}.json",
+                Uuid::new_v4()
+            ))
+        }
+
+        fn fornax_group_count(settings: &serde_json::Value, event: &str) -> usize {
+            settings["hooks"][event]
+                .as_array()
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter(|g| group_has_fornax_command(g))
+                        .count()
+                })
+                .unwrap_or(0)
+        }
+
+        #[test]
+        fn install_adds_all_documented_hooks_to_fresh_file() {
+            let path = tmp_settings_path("fresh-install");
+            // No file exists yet — install must create it from scratch.
+
+            install_claude_at(&path).expect("install");
+
+            let settings: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            for event in CLAUDE_HOOK_EVENTS {
+                assert_eq!(
+                    fornax_group_count(&settings, event),
+                    1,
+                    "expected exactly one fornax hook group for {event}"
+                );
+            }
+
+            std::fs::remove_file(&path).ok();
+        }
+
+        #[test]
+        fn install_is_idempotent_no_duplicate_entries() {
+            let path = tmp_settings_path("idempotent-install");
+
+            install_claude_at(&path).expect("first install");
+            install_claude_at(&path).expect("second install");
+
+            let settings: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            for event in CLAUDE_HOOK_EVENTS {
+                assert_eq!(
+                    fornax_group_count(&settings, event),
+                    1,
+                    "expected no duplicate fornax hook group for {event} after second install"
+                );
+            }
+
+            std::fs::remove_file(&path).ok();
+        }
+
+        #[test]
+        fn install_preserves_unrelated_settings_and_hooks() {
+            let path = tmp_settings_path("preserve-unrelated");
+            let existing = serde_json::json!({
+                "model": "opus",
+                "hooks": {
+                    "PreToolUse": [
+                        {
+                            "matcher": "Bash",
+                            "hooks": [{ "type": "command", "command": "some-other-tool" }]
+                        }
+                    ],
+                    "Notification": [
+                        { "hooks": [{ "type": "command", "command": "notify-tool" }] }
+                    ]
+                }
+            });
+            std::fs::write(&path, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
+
+            install_claude_at(&path).expect("install");
+
+            let settings: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(settings["model"], "opus");
+            // The unrelated PreToolUse group survives alongside the new one.
+            let pre_tool_use = settings["hooks"]["PreToolUse"].as_array().unwrap();
+            assert_eq!(pre_tool_use.len(), 2);
+            assert!(pre_tool_use
+                .iter()
+                .any(|g| g["hooks"][0]["command"] == "some-other-tool"));
+            assert_eq!(fornax_group_count(&settings, "PreToolUse"), 1);
+            // The unrelated Notification event is untouched entirely.
+            assert_eq!(
+                settings["hooks"]["Notification"][0]["hooks"][0]["command"],
+                "notify-tool"
+            );
+
+            std::fs::remove_file(&path).ok();
+        }
+
+        #[test]
+        fn uninstall_removes_fornax_hooks_and_leaves_everything_else() {
+            let path = tmp_settings_path("uninstall-clean");
+            let existing = serde_json::json!({
+                "model": "opus",
+                "hooks": {
+                    "PreToolUse": [
+                        {
+                            "matcher": "Bash",
+                            "hooks": [{ "type": "command", "command": "some-other-tool" }]
+                        }
+                    ]
+                }
+            });
+            std::fs::write(&path, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
+
+            install_claude_at(&path).expect("install");
+            uninstall_claude_at(&path).expect("uninstall");
+
+            let settings: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(settings["model"], "opus");
+            for event in CLAUDE_HOOK_EVENTS {
+                assert_eq!(
+                    fornax_group_count(&settings, event),
+                    0,
+                    "expected no fornax hook group left for {event}"
+                );
+            }
+            // The pre-existing, unrelated PreToolUse group must survive.
+            let pre_tool_use = settings["hooks"]["PreToolUse"].as_array().unwrap();
+            assert_eq!(pre_tool_use.len(), 1);
+            assert_eq!(pre_tool_use[0]["hooks"][0]["command"], "some-other-tool");
+
+            std::fs::remove_file(&path).ok();
+        }
+
+        #[test]
+        fn uninstall_on_never_installed_file_is_a_safe_no_op() {
+            let path = tmp_settings_path("uninstall-noop");
+            let existing = serde_json::json!({ "model": "opus" });
+            std::fs::write(&path, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
+
+            uninstall_claude_at(&path).expect("uninstall on file without fornax hooks");
+
+            let settings: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(settings, serde_json::json!({ "model": "opus" }));
+
+            std::fs::remove_file(&path).ok();
+        }
+
+        #[test]
+        fn uninstall_on_missing_file_is_a_safe_no_op_and_creates_nothing() {
+            let path = tmp_settings_path("uninstall-missing-file");
+            // No file exists.
+
+            uninstall_claude_at(&path).expect("uninstall on missing file");
+
+            assert!(
+                !path.exists(),
+                "uninstall must not create a settings.json the user never had"
+            );
+        }
+    }
+
     // FORNX-62: export-spool must emit a `capabilities` envelope for a
     // session that received a real Capabilities message, using the FORNX-53
     // aha-scenario fixture pattern (`caps()`/claim-with-exit-code style)
