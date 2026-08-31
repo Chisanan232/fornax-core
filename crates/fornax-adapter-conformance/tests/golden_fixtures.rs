@@ -163,6 +163,41 @@ fn fornx_55_historical_schema_drift_regression_still_produces_evidence() {
     }
 }
 
+/// FORNX-16: the real captured *failure*-marker shape (`tools.shell_command`
+/// with `unified_exec` disabled) must produce a literal (non-heuristic)
+/// nonzero exit code — the case `fornx_55_historical_schema_drift_regression`
+/// above deliberately does not cover, since that fixture is the
+/// zero-exit-code `unified_exec` heuristic shape.
+#[test]
+fn fornx_16_real_failure_marker_fixture_produces_nonzero_non_heuristic_exit_code() {
+    let fixture = load_fixtures("codex")
+        .into_iter()
+        .find(|f| f.name == "custom_tool_call_exec_pair_failure")
+        .expect("expected the custom_tool_call_exec_pair_failure fixture to exist");
+
+    let mut adapter = CodexAdapter::new();
+    let outcomes = replay_fixture(&mut adapter, "fixture-hint", &fixture);
+    assert_eq!(outcomes.len(), 2, "expected the call + output pair");
+
+    assert!(matches!(&outcomes[0], NormalizationOutcome::Ignored { .. }));
+
+    match &outcomes[1] {
+        NormalizationOutcome::Messages(msgs) => {
+            let evidence = msgs.iter().find_map(|m| match m {
+                IngestMessage::Evidence(ev) => Some(ev),
+                _ => None,
+            });
+            let ev = evidence.unwrap_or_else(|| {
+                panic!("FORNX-16 failure fixture: expected Evidence in {msgs:?}")
+            });
+            assert_eq!(ev.payload["exit_code"], 1);
+            assert_eq!(ev.payload["heuristic"], false);
+            assert!(ev.provenance.contains("exit_code_text"));
+        }
+        other => panic!("FORNX-16 failure fixture: expected Messages, got {other:?}"),
+    }
+}
+
 /// FORNX-161's flagship finding, pinned as a regression test: replaying the
 /// real captured tool.execute.before/after pair must produce a literal
 /// (non-heuristic) exit-code Evidence — the one thing neither Claude Code

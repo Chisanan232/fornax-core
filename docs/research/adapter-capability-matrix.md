@@ -106,6 +106,60 @@ provenance `codex:rollout:exec_command_end`. `aggregated_output` is command
 stdout+stderr merged — treat as sensitive-by-default for the privacy
 classifier (FORNX-33), same as Claude Code's `tool_response`.
 
+> **STALE — corrected by two later live captures against the same
+> codex-cli 0.147.0 install (FORNX-55, 2026-08-29; FORNX-16, 2026-08-31).**
+> The `exec_command_end` shape above was never actually reproduced from a
+> real `codex exec` turn on this machine. What a real session's rollout
+> JSONL actually contains for shell execution is a `response_item` pair —
+> `custom_tool_call` (`payload.name == "exec"`, the invocation, command
+> embedded in a JS snippet string under `payload.input`, matched to its
+> result by `payload.call_id`) followed later by `custom_tool_call_output`
+> (`payload.output`, an array of `{type, text}` blocks) — never the
+> `event_msg{type:"exec_command_end"}` shape documented above. See
+> `crates/fornax-adapter-codex/src/lib.rs::translate_line`'s
+> `response_item` handling (kept as a defensive fallback, not the primary
+> path).
+>
+> That `custom_tool_call_output` free-text shape itself has **two distinct
+> wire variants**, depending on which exec tool the model actually invoked
+> (both observed live, same codex-cli 0.147.0 binary, differing only by
+> whether the `unified_exec` feature is enabled):
+>
+> - `tools.exec_command` (the persistent/`unified_exec` shell — what a
+>   flagless `codex exec` chose on this install, no `features.*` set in
+>   `~/.codex/config.toml`; not verified as codex-cli's shipped default
+>   across every install/config): output text is always `"Script completed\n..."`
+>   regardless of the wrapped command's real exit status. Confirmed live
+>   with a genuinely failing command (`false`, `exit 1`) still reporting
+>   `"Script completed"` — **no exit code, no failure marker, no
+>   distinguishing signal at all is exposed by this shape**. This is a real,
+>   structural capability gap, not an unwired evidence path — there is
+>   nothing in the text to parse. `fornax-adapter-codex` correctly declares
+>   `SignalClass::ProcessResult` `Unavailable` for this reason and falls
+>   back to a zero-guess heuristic (`heuristic: true` in the Evidence
+>   payload) rather than inventing a verdict.
+> - `tools.shell_command` (a stateless one-shot exec tool, reached when
+>   `unified_exec` is disabled, e.g. `codex exec --disable unified_exec`):
+>   output text embeds a literal `"Exit code: <n>"` for **both** outcomes —
+>   `"Script completed\n..."` + `"Exit code: 0\n...Output:\n<stdout>"` on
+>   success, `"Script failed\n..."` + `"Script error:\nExit code: <n>\n...
+>   Output:\n<stdout>"` on failure. Live-captured 2026-08-31 running both a
+>   bare `exit 1`/`exit 42` and a real failing `pytest -q` (one deliberately
+>   failing assertion) through this exact tool — see
+>   `crates/fornax-adapter-conformance/fixtures/codex/custom_tool_call_exec_pair_failure.json`
+>   for the pinned real payload. `fornax-adapter-codex`'s
+>   `CodexCustomToolCallOutputSensor` now parses this literal `"Exit code:
+>   "` text first (real value, `heuristic: false`), falling back to the old
+>   zero-guess only when that text is absent — i.e. only on the
+>   `unified_exec` shape above.
+>
+> Net effect: Codex's failure-marker gap (FORNX-16) is resolved for
+> `tools.shell_command` sessions and remains a genuine, correctly-reported
+> `Unavailable` limitation for `tools.exec_command` (`unified_exec`, the
+> flagless-invocation shape on this install) sessions — this is a real
+> capability boundary of the installed CLI version/config, not something
+> this adapter can paper over without inventing evidence.
+
 ## opencode (FORNX-161)
 
 Source: `@opencode-ai/plugin` v1.18.25's shipped TypeScript definitions
@@ -168,9 +222,13 @@ code as `fornax_types::capabilities::{SignalClass, SignalAvailability}`
 in principle, not observed this session/version") are now distinct states —
 e.g. `fornax-adapter-codex` declares `ToolInvocation`/`SubagentLifecycle` as
 `Unsupported` (Codex hooks are opt-in/admin-suppressible per this doc) and
-`ProcessResult` as `Unavailable` (the confirmed `exec_command_end.exit_code`
-field above exists for Codex in principle; this adapter's primary
-rollout-tail path just hasn't wired an evidence path for it yet).
+`ProcessResult` as `Unavailable` — real per-session, not just unwired: as
+the corrected section above documents (FORNX-16), a real literal exit code
+*is* parseable when a session's exec tool is `tools.shell_command`, but the
+flagless-invocation `tools.exec_command` (`unified_exec`) shape structurally
+exposes none at all, even for a genuinely failing command — so the
+provider-wide declaration stays the conservative `Unavailable` rather than
+`Available`.
 `fornax-adapter-opencode` (FORNX-161) is the sharpest illustration of the
 three-state design paying off: it declares `ProcessResult` `Available` (a
 genuine literal exit code, no heuristic) while declaring
