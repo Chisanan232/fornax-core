@@ -406,7 +406,7 @@ async fn dashboard(State(state): State<AppState>) -> axum::response::Html<String
             body.push_str(&format!(
                 "<tr><td><a href=\"/dashboard/session/{id_enc}\">{id}</a></td><td>{provider}</td>\
                  <td>{events}</td><td>{claims}</td><td>{findings}</td><td>{when}</td></tr>",
-                id_enc = html_escape(&s.session_id),
+                id_enc = url_path_escape(&s.session_id),
                 id = html_escape(&s.session_id),
                 provider = provider_badge(&s.provider),
                 events = s.event_count,
@@ -498,7 +498,7 @@ async fn dashboard_session(
                          <td>{verifier}</td><td>{when}</td></tr>",
                         claim = html_escape(&c.text),
                         v = html_escape(&f.verdict),
-                        fid = html_escape(&f.id),
+                        fid = url_path_escape(&f.id),
                         verifier = html_escape(&f.verifier_name),
                         when = html_escape(&f.computed_at),
                     ));
@@ -557,7 +557,7 @@ async fn dashboard_finding(
          <p><strong>Verifier:</strong> {verifier}</p>\
          <p><strong>Rationale:</strong> {rationale}</p>\
          <p><strong>Computed at:</strong> {when}</p>",
-        sid_enc = html_escape(&finding.session_id),
+        sid_enc = url_path_escape(&finding.session_id),
         sid = html_escape(&finding.session_id),
         fid = html_escape(&finding.id),
         claim = html_escape(&finding.claim_text),
@@ -629,6 +629,32 @@ fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+/// Percent-encodes a string for safe use as one path segment inside an
+/// `href="..."` attribute value (FORNX-18 hardening). `session_id`/
+/// `finding_id` values originate from untrusted hook payloads (see the
+/// adversarial corpus's hostile-session-id cases) and, unlike the plain-text
+/// contexts `html_escape` was written for, these ids are interpolated
+/// directly into an HTML attribute — `html_escape` alone does not escape
+/// `"` or `'`, so a session id containing a quote could break out of the
+/// `href` attribute and inject a new one (e.g. `onmouseover=`). Restricting
+/// the output to the URL-safe unreserved character set closes that off
+/// entirely: every byte outside `[A-Za-z0-9._~-]` becomes `%XX`, so the
+/// result can never contain a quote, angle bracket, or `=` and is also a
+/// correctly encoded single path segment (a literal `/` in the id can no
+/// longer be mistaken for a path separator).
+fn url_path_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -896,6 +922,32 @@ mod tests {
             "session list must badge the session's provider: {html}"
         );
         assert!(html.contains(&format!("/dashboard/session/{session_id}")));
+    }
+
+    /// FORNX-18 hardening regression: `session_id` is untrusted (it arrives
+    /// verbatim from hook payloads — see the adversarial corpus's hostile
+    /// session-id cases) and is interpolated into an `href="..."` attribute,
+    /// not just page text. `html_escape` alone does not escape `"`, so a
+    /// naive implementation lets a quote in the id break out of the
+    /// attribute and inject a new one. Assert the raw payload never appears
+    /// unescaped in the `href` attribute value.
+    #[tokio::test]
+    async fn dashboard_session_link_is_safe_against_a_quote_breakout_session_id() {
+        let state = test_state().await;
+        let session_id = "fornx-18-xss\" onmouseover=\"alert(1)";
+        seed_verified_session(&state, session_id).await;
+
+        let html = dashboard(State(state)).await.0;
+        assert!(
+            !html.contains("onmouseover=\"alert(1)\">"),
+            "hostile session id must not break out of the href attribute: {html}"
+        );
+        assert!(
+            html.contains(&url_path_escape(session_id)),
+            "href must contain the percent-encoded session id: {html}"
+        );
+        // Percent-encoding never produces a literal `"`.
+        assert!(!url_path_escape(session_id).contains('"'));
     }
 
     #[tokio::test]
