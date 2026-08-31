@@ -1273,3 +1273,153 @@ mod command_success_verifier_tests {
         assert_eq!(f.evidence_ids, vec![ev[0].id]);
     }
 }
+
+#[cfg(test)]
+mod file_modified_verifier_tests {
+    use super::*;
+    use fornax_types::{CapabilitySignal, Provider, SignalAvailability};
+
+    fn caps() -> RuntimeCapabilities {
+        RuntimeCapabilities {
+            schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
+            provider: Provider::ClaudeCode,
+            signals: vec![
+                CapabilitySignal {
+                    class: SignalClass::ToolTrace,
+                    state: SignalAvailability::Available,
+                    detail: None,
+                },
+                CapabilitySignal {
+                    class: SignalClass::ToolResultPayload,
+                    state: SignalAvailability::Available,
+                    detail: None,
+                },
+            ],
+            notes: Default::default(),
+        }
+    }
+
+    fn no_caps() -> RuntimeCapabilities {
+        RuntimeCapabilities {
+            schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
+            provider: Provider::ClaudeCode,
+            signals: vec![
+                CapabilitySignal {
+                    class: SignalClass::ToolTrace,
+                    state: SignalAvailability::Unknown,
+                    detail: None,
+                },
+                CapabilitySignal {
+                    class: SignalClass::ToolResultPayload,
+                    state: SignalAvailability::Unknown,
+                    detail: None,
+                },
+            ],
+            notes: Default::default(),
+        }
+    }
+
+    fn file_diff_evidence(path: &str, diff: &str) -> Evidence {
+        Evidence {
+            id: Uuid::new_v4(),
+            session_id: "s1".into(),
+            source_event_id: Uuid::new_v4(),
+            kind: EvidenceKind::FileDiff,
+            observed_at: chrono::Utc::now().to_rfc3339(),
+            payload: serde_json::json!({"path": path, "diff": diff}),
+            provenance: "claude_code:1.2.3:PostToolUse:Edit#heuristic:tool_input".into(),
+            source: None,
+            extension: None,
+        }
+    }
+
+    #[test]
+    fn review_when_named_file_matches_evidence() {
+        let v = FileModifiedVerifier;
+        let c = crate::tests::claim_for("file_written", "I updated `src/lib.rs`.");
+        let ev = vec![file_diff_evidence(
+            "/Users/x/project/src/lib.rs",
+            "-old\n+new\n",
+        )];
+        let f = v.verify(&c, &ev, &caps());
+        assert_eq!(f.verdict, Verdict::Review);
+        assert_eq!(f.evidence_ids, vec![ev[0].id]);
+    }
+
+    #[test]
+    fn unverified_when_no_matching_file_evidence() {
+        let v = FileModifiedVerifier;
+        let c = crate::tests::claim_for("file_written", "I updated `src/lib.rs`.");
+        let ev = vec![file_diff_evidence(
+            "/Users/x/project/src/otherlib.rs",
+            "+new\n",
+        )];
+        let f = v.verify(&c, &ev, &caps());
+        assert_eq!(f.verdict, Verdict::Unverified);
+        assert!(f.evidence_ids.is_empty());
+    }
+
+    /// Path-segment-boundary regression: a naive substring match would wrongly
+    /// bind `src/lib.rs` to `src/otherlib.rs` since the latter ends with the
+    /// former's characters preceded by no `/`.
+    #[test]
+    fn does_not_substring_match_across_path_segment_boundary() {
+        let v = FileModifiedVerifier;
+        let c = crate::tests::claim_for("file_written", "I updated `lib.rs`.");
+        let ev = vec![file_diff_evidence(
+            "/Users/x/project/src/otherlib.rs",
+            "+new\n",
+        )];
+        let f = v.verify(&c, &ev, &caps());
+        assert_eq!(f.verdict, Verdict::Unverified);
+    }
+
+    #[test]
+    fn unverified_when_claim_names_no_path_literal() {
+        let v = FileModifiedVerifier;
+        let c = crate::tests::claim_for("file_written", "I updated the file.");
+        let ev = vec![file_diff_evidence("/Users/x/project/src/lib.rs", "+new\n")];
+        let f = v.verify(&c, &ev, &caps());
+        assert_eq!(f.verdict, Verdict::Unverified);
+        assert!(f.evidence_ids.is_empty());
+    }
+
+    /// A generic/unrelated claim naming a command, not a path, must not
+    /// spuriously bind to file evidence just because it is backtick-quoted
+    /// the same way a path literal is.
+    #[test]
+    fn unrelated_command_claim_does_not_bind_to_file_evidence() {
+        let v = FileModifiedVerifier;
+        let c = crate::tests::claim_for("file_written", "I ran `npm install`.");
+        let ev = vec![file_diff_evidence("/Users/x/project/src/lib.rs", "+new\n")];
+        let f = v.verify(&c, &ev, &caps());
+        assert_eq!(f.verdict, Verdict::Unverified);
+        assert!(f.evidence_ids.is_empty());
+    }
+
+    #[test]
+    fn unavailable_when_runtime_cannot_observe_tool_traces_or_results() {
+        let v = FileModifiedVerifier;
+        let c = crate::tests::claim_for("file_written", "I updated `src/lib.rs`.");
+        let f = v.verify(&c, &[], &no_caps());
+        assert_eq!(f.verdict, Verdict::Unavailable);
+    }
+
+    #[test]
+    fn recomputing_from_the_same_persisted_inputs_is_deterministic() {
+        let v = FileModifiedVerifier;
+        let c = crate::tests::claim_for("file_written", "I updated `src/lib.rs`.");
+        let ev = vec![file_diff_evidence(
+            "/Users/x/project/src/lib.rs",
+            "-old\n+new\n",
+        )];
+        let capabilities = caps();
+
+        let first = v.verify(&c, &ev, &capabilities);
+        let replayed = v.verify(&c, &ev, &capabilities);
+
+        assert_eq!(first.verdict, replayed.verdict);
+        assert_eq!(first.rationale, replayed.rationale);
+        assert_eq!(first.evidence_ids, replayed.evidence_ids);
+    }
+}
