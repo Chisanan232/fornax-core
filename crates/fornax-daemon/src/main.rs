@@ -9,7 +9,8 @@ use axum::{Json, Router};
 use fornax_types::redact::{redact_json, redact_text};
 use fornax_types::{IngestMessage, RuntimeCapabilities};
 use fornax_verify::{
-    CommandExecutedVerifier, CommandSuccessVerifier, TestResultVerifier, Verifier,
+    CommandExecutedVerifier, CommandSuccessVerifier, FileModifiedVerifier, TestResultVerifier,
+    Verifier,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -295,12 +296,13 @@ async fn handle_message(
 
             // FORNX-14: registry stays a flat Vec, per the ticket's own
             // maintainability requirement ("verifier registry/dispatch only
-            // as complex as the first real verifier set requires") — three
+            // as complex as the first real verifier set requires") — four
             // verifiers dispatched by `applies_to` doesn't yet justify more.
             let verifiers: Vec<Box<dyn Verifier + Send + Sync>> = vec![
                 Box::new(TestResultVerifier),
                 Box::new(CommandExecutedVerifier),
                 Box::new(CommandSuccessVerifier),
+                Box::new(FileModifiedVerifier),
             ];
             for verifier in verifiers.iter().filter(|v| v.applies_to(&claim)) {
                 let finding = verifier.verify(&claim, &evidence, &caps);
@@ -481,6 +483,72 @@ mod tests {
             stored_claims[0].text.contains("REDACTED"),
             "expected a redacted placeholder in stored claim text: {}",
             stored_claims[0].text
+        );
+    }
+
+    /// FORNX-14 regression: a secret-shaped string reconstructed into a
+    /// `FileDiff` evidence payload (e.g. by `ClaudeEditWriteDiffSensor` from
+    /// an Edit's `old_string`/`new_string`) must go through the same
+    /// redaction boundary as any other evidence payload before storage —
+    /// proven directly against `IngestMessage::Evidence`, mirroring
+    /// `tool_input_and_claim_text_are_redacted_before_storage` above.
+    #[tokio::test]
+    async fn file_diff_evidence_diff_is_redacted_before_storage() {
+        let state = test_state().await;
+        let mut hint = None;
+        let marker = format!("FORNAX-CANARY-{}-DO-NOT-LEAK", Uuid::new_v4().simple());
+        let session_id = "fornx-14-redaction-regression".to_string();
+
+        let event_id = Uuid::new_v4();
+        let event = AgentEvent {
+            id: event_id,
+            session_id: session_id.clone(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-08-31T00:00:00Z".to_string(),
+            tool_name: Some("Edit".to_string()),
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        handle_message(&state, IngestMessage::Event(event), &mut hint)
+            .await
+            .expect("handle event");
+
+        let evidence = fornax_types::Evidence {
+            id: Uuid::new_v4(),
+            session_id: session_id.clone(),
+            source_event_id: event_id,
+            kind: fornax_types::EvidenceKind::FileDiff,
+            observed_at: "2026-08-31T00:00:00Z".to_string(),
+            payload: serde_json::json!({
+                "path": "/repo/src/lib.rs",
+                "diff": format!("-old\n+let secret = {marker}\n"),
+            }),
+            provenance: "claude_code:1.2.3:PostToolUse:Edit#heuristic:tool_input".to_string(),
+            source: None,
+            extension: None,
+        };
+        handle_message(&state, IngestMessage::Evidence(evidence), &mut hint)
+            .await
+            .expect("handle evidence");
+
+        let stored = state
+            .store
+            .evidence_for_session(&session_id)
+            .await
+            .expect("read back evidence");
+        let stored_diff = stored.evidence[0].payload["diff"]
+            .as_str()
+            .expect("diff field present")
+            .to_string();
+        assert!(
+            !stored_diff.contains(&marker),
+            "raw canary marker leaked into stored FileDiff evidence: {stored_diff}"
+        );
+        assert!(
+            stored_diff.contains("REDACTED"),
+            "expected a redacted placeholder in stored FileDiff evidence: {stored_diff}"
         );
     }
 

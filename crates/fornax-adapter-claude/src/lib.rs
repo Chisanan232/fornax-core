@@ -286,6 +286,206 @@ impl EvidenceSensor for ClaudeBashExitCodeSensor {
     }
 }
 
+/// FORNX-14 "file changed" claim class: reconstructs a diff-shaped string
+/// for Edit/Write/MultiEdit `PostToolUse` events purely from `tool_input`.
+///
+/// A prior design pass identified a second, "authoritative" collection path:
+/// Claude Code's hook payload may also carry a `structuredPatch` field
+/// (observed in transcript JSONL entries). That field's exact shape in a
+/// real *hook* payload — as opposed to a transcript entry — is UNCONFIRMED
+/// in this repo: no captured `PostToolUse` hook payload has shown it, only
+/// transcript JSONL has. Per this repo's own established policy
+/// (`docs/research/adapter-capability-matrix.md`: re-verify field shapes
+/// against the installed CLI version before trusting them), this sensor
+/// deliberately never reads or guesses at `structuredPatch`'s shape — doing
+/// so risks silently misrepresenting evidence as authoritative when it is
+/// not. Only the confirmed-real `tool_input` (`old_string`/`new_string` for
+/// Edit, `edits[]` for MultiEdit, `content` for Write) is used, and all
+/// evidence this sensor produces is marked `#heuristic:tool_input` — never
+/// authoritative.
+///
+/// TODO(FORNX-14 follow-up): once a live Claude Code `PostToolUse` hook
+/// payload confirms `structuredPatch`'s real field names/shape (a live hook
+/// capture against a specific installed CLI version, not a guess), add an
+/// authoritative collection path here, and a corresponding
+/// `Verdict::Contradicted` branch to `fornax-verify`'s `FileModifiedVerifier`
+/// (which today has no way to detect a claimed file change that did *not*
+/// happen, since the heuristic path only ever observes edits that did
+/// occur). Both are deliberately out of scope for this ticket's narrowed
+/// implementation — see the PR description for FORNX-14's heuristic-only
+/// scope.
+struct ClaudeEditWriteDiffSensor {
+    adapter_version: &'static str,
+}
+
+impl ClaudeEditWriteDiffSensor {
+    /// Reconstructs a unified-diff-*shaped* string from an Edit's
+    /// `old_string`/`new_string` pair: every line of `old_string` prefixed
+    /// `-`, then every line of `new_string` prefixed `+`. Deliberately omits
+    /// an `@@` hunk header — `tool_input` carries no line-number/position
+    /// information, and fabricating one would misrepresent this evidence as
+    /// more precise than it is.
+    fn render_edit_diff(old_string: &str, new_string: &str) -> String {
+        let mut diff = String::new();
+        for line in old_string.lines() {
+            diff.push('-');
+            diff.push_str(line);
+            diff.push('\n');
+        }
+        for line in new_string.lines() {
+            diff.push('+');
+            diff.push_str(line);
+            diff.push('\n');
+        }
+        diff
+    }
+
+    /// Reconstructs a diff-shaped string for a Write: every line of
+    /// `content` prefixed `+`. There is no "old" side to render — a Write
+    /// is a full file write, not a diff against prior content.
+    fn render_write_diff(content: &str) -> String {
+        let mut diff = String::new();
+        for line in content.lines() {
+            diff.push('+');
+            diff.push_str(line);
+            diff.push('\n');
+        }
+        diff
+    }
+}
+
+impl EvidenceSensor for ClaudeEditWriteDiffSensor {
+    fn name(&self) -> &'static str {
+        "claude_edit_write_diff_sensor_v1"
+    }
+
+    fn required_capabilities(&self) -> &'static [SignalClass] {
+        &[SignalClass::ToolResultPayload]
+    }
+
+    fn trust_class(&self) -> TrustClass {
+        // Same reasoning as `ClaudeBashExitCodeSensor`: this is Claude
+        // Code's own account of what it wrote, reconstructed from its
+        // tool_input, not something Fornax measured independently.
+        TrustClass::AgentAdjacent
+    }
+
+    fn collection_method(&self) -> CollectionMethod {
+        CollectionMethod::HookCallback
+    }
+
+    fn collector_version(&self) -> Option<String> {
+        Some(self.adapter_version.to_string())
+    }
+
+    fn collect(&self, event: &AgentEvent, _caps: &RuntimeCapabilities) -> SensorOutcome {
+        let is_target_tool = matches!(
+            event.tool_name.as_deref(),
+            Some("Edit") | Some("Write") | Some("MultiEdit")
+        );
+        if event.kind != EventKind::PostToolUse || !is_target_tool {
+            return SensorOutcome::not_collected(
+                SignalAvailability::Unknown,
+                Some("not an Edit/Write/MultiEdit PostToolUse event".to_string()),
+            );
+        }
+
+        // Same precedent as `ClaudeBashExitCodeSensor`: presence of
+        // `tool_response` is the "did this actually execute" gate, checked
+        // before anything else.
+        let Some(resp) = &event.tool_response else {
+            return SensorOutcome::not_collected(
+                SignalAvailability::Unavailable,
+                Some("no tool_response present on this event".to_string()),
+            );
+        };
+
+        let input = event.tool_input.as_ref();
+
+        let diff = match event.tool_name.as_deref() {
+            Some("Edit") => input.and_then(|ti| {
+                let old_s = ti.get("old_string").and_then(|v| v.as_str())?;
+                let new_s = ti.get("new_string").and_then(|v| v.as_str())?;
+                Some(Self::render_edit_diff(old_s, new_s))
+            }),
+            Some("MultiEdit") => input
+                .and_then(|ti| ti.get("edits"))
+                .and_then(|v| v.as_array())
+                .filter(|edits| !edits.is_empty())
+                .map(|edits| {
+                    edits
+                        .iter()
+                        .map(|e| {
+                            let old_s = e.get("old_string").and_then(|v| v.as_str()).unwrap_or("");
+                            let new_s = e.get("new_string").and_then(|v| v.as_str()).unwrap_or("");
+                            Self::render_edit_diff(old_s, new_s)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("")
+                }),
+            Some("Write") => input
+                .and_then(|ti| ti.get("content"))
+                .and_then(|v| v.as_str())
+                .map(Self::render_write_diff),
+            _ => None,
+        };
+
+        let Some(diff) = diff else {
+            return SensorOutcome::not_collected(
+                SignalAvailability::Unavailable,
+                Some(
+                    "tool_input did not carry a recognizable old_string/new_string/content shape"
+                        .to_string(),
+                ),
+            );
+        };
+
+        // Case variance precedent, same as `ClaudeBashExitCodeSensor`'s
+        // `explicit_code` multi-key probe.
+        let path = resp
+            .get("filePath")
+            .and_then(|v| v.as_str())
+            .or_else(|| resp.get("file_path").and_then(|v| v.as_str()))
+            .or_else(|| {
+                input
+                    .and_then(|ti| ti.get("file_path"))
+                    .and_then(|v| v.as_str())
+            });
+
+        let Some(path) = path else {
+            return SensorOutcome::not_collected(
+                SignalAvailability::Unavailable,
+                Some("no file path found in tool_response or tool_input".to_string()),
+            );
+        };
+
+        SensorOutcome::collected(vec![Evidence {
+            id: Uuid::new_v4(),
+            session_id: event.session_id.clone(),
+            source_event_id: event.id,
+            kind: EvidenceKind::FileDiff,
+            observed_at: event.observed_at.clone(),
+            payload: serde_json::json!({
+                "path": path,
+                "diff": diff,
+            }),
+            provenance: format!(
+                "claude_code:{v}:PostToolUse:{tool}#heuristic:tool_input",
+                v = self.adapter_version,
+                tool = event.tool_name.as_deref().unwrap_or("")
+            ),
+            source: Some(EvidenceSource::now(
+                self.name(),
+                self.trust_class(),
+                Some(Provider::ClaudeCode),
+                self.collection_method(),
+                self.collector_version(),
+            )),
+            extension: None,
+        }])
+    }
+}
+
 fn translate(
     adapter: &ClaudeAdapter,
     session_hint: &str,
@@ -375,6 +575,22 @@ fn translate(
         out.extend(outcome.evidence.into_iter().map(IngestMessage::Evidence));
     }
 
+    // PostToolUse for an Edit/Write/MultiEdit call (FORNX-14): reconstruct a
+    // heuristic file-diff from `tool_input` — see `ClaudeEditWriteDiffSensor`
+    // for why only this path is implemented.
+    if kind == EventKind::PostToolUse
+        && matches!(
+            tool_name.as_deref(),
+            Some("Edit") | Some("Write") | Some("MultiEdit")
+        )
+    {
+        let sensor = ClaudeEditWriteDiffSensor {
+            adapter_version: adapter.adapter_version(),
+        };
+        let outcome = sensor.collect(&event, &caps);
+        out.extend(outcome.evidence.into_iter().map(IngestMessage::Evidence));
+    }
+
     // Stop: best-effort claim extraction from the transcript's last
     // assistant message, if Claude Code gave us a transcript_path.
     if kind == EventKind::SessionEnd {
@@ -441,7 +657,7 @@ fn last_assistant_text(raw: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fornax_types::{EventKind, IngestMessage, Provider};
+    use fornax_types::{EventKind, EvidenceKind, IngestMessage, Provider};
 
     fn normalize(raw: &serde_json::Value) -> NormalizationOutcome {
         ClaudeAdapter.normalize("unused-hint", raw)
@@ -709,6 +925,161 @@ mod tests {
                 );
             }
             other => panic!("expected Capabilities, got {other:?}"),
+        }
+    }
+
+    // --- FORNX-14: ClaudeEditWriteDiffSensor -------------------------------
+
+    #[test]
+    fn post_tool_use_edit_produces_file_diff_evidence() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "sess-1",
+            "tool_name": "Edit",
+            "tool_input": {
+                "file_path": "/repo/src/lib.rs",
+                "old_string": "fn old() {}",
+                "new_string": "fn new() {}"
+            },
+            "tool_response": {"filePath": "/repo/src/lib.rs"}
+        });
+        let msgs = normalize(&raw).into_messages();
+        assert_eq!(msgs.len(), 3);
+        match &msgs[2] {
+            IngestMessage::Evidence(ev) => {
+                assert_eq!(ev.kind, EvidenceKind::FileDiff);
+                assert_eq!(ev.payload["path"], "/repo/src/lib.rs");
+                let diff = ev.payload["diff"].as_str().unwrap();
+                assert!(diff.contains("-fn old() {}"));
+                assert!(diff.contains("+fn new() {}"));
+                assert!(ev.provenance.ends_with("#heuristic:tool_input"));
+            }
+            other => panic!("expected Evidence, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn post_tool_use_write_produces_only_plus_prefixed_diff() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "sess-1",
+            "tool_name": "Write",
+            "tool_input": {
+                "file_path": "/repo/src/new_file.rs",
+                "content": "line one\nline two"
+            },
+            "tool_response": {"filePath": "/repo/src/new_file.rs"}
+        });
+        let msgs = normalize(&raw).into_messages();
+        assert_eq!(msgs.len(), 3);
+        match &msgs[2] {
+            IngestMessage::Evidence(ev) => {
+                assert_eq!(ev.kind, EvidenceKind::FileDiff);
+                let diff = ev.payload["diff"].as_str().unwrap();
+                assert!(diff.contains("+line one"));
+                assert!(diff.contains("+line two"));
+                assert!(!diff.contains('-'));
+                assert!(ev.provenance.ends_with("#heuristic:tool_input"));
+            }
+            other => panic!("expected Evidence, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn post_tool_use_multiedit_concatenates_both_edits() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "sess-1",
+            "tool_name": "MultiEdit",
+            "tool_input": {
+                "file_path": "/repo/src/lib.rs",
+                "edits": [
+                    {"old_string": "a1", "new_string": "a2", "replace_all": false},
+                    {"old_string": "b1", "new_string": "b2", "replace_all": false}
+                ]
+            },
+            "tool_response": {"filePath": "/repo/src/lib.rs"}
+        });
+        let msgs = normalize(&raw).into_messages();
+        assert_eq!(msgs.len(), 3);
+        match &msgs[2] {
+            IngestMessage::Evidence(ev) => {
+                assert_eq!(ev.kind, EvidenceKind::FileDiff);
+                let diff = ev.payload["diff"].as_str().unwrap();
+                assert!(diff.contains("-a1"));
+                assert!(diff.contains("+a2"));
+                assert!(diff.contains("-b1"));
+                assert!(diff.contains("+b2"));
+            }
+            other => panic!("expected Evidence, got {other:?}"),
+        }
+        // Single evidence entry, not one per edit.
+        assert_eq!(msgs.len(), 3);
+    }
+
+    #[test]
+    fn post_tool_use_edit_without_tool_response_produces_only_event() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "sess-1",
+            "tool_name": "Edit",
+            "tool_input": {
+                "file_path": "/repo/src/lib.rs",
+                "old_string": "a",
+                "new_string": "b"
+            }
+        });
+        let msgs = normalize(&raw).into_messages();
+        assert_eq!(msgs.len(), 2);
+        assert!(matches!(&msgs[0], IngestMessage::Capabilities(_)));
+        assert!(matches!(&msgs[1], IngestMessage::Event(_)));
+    }
+
+    #[test]
+    fn claude_edit_write_diff_sensor_reports_unavailable_with_no_tool_response() {
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "sess-1".into(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: Some("Edit".into()),
+            tool_input: Some(serde_json::json!({"old_string": "a", "new_string": "b"})),
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        let sensor = ClaudeEditWriteDiffSensor {
+            adapter_version: ADAPTER_VERSION,
+        };
+        let outcome = sensor.collect(&event, &ClaudeAdapter.probe());
+        assert!(!outcome.has_evidence());
+        assert_eq!(outcome.state, SignalAvailability::Unavailable);
+    }
+
+    /// Bash PostToolUse events must not be picked up by the new
+    /// Edit/Write/MultiEdit branch — the existing Bash exit-code tests above
+    /// already prove the Bash sensor's own behavior is unchanged; this
+    /// proves the new sensor doesn't also fire (and thus doesn't double up
+    /// evidence) on a Bash event.
+    #[test]
+    fn bash_event_does_not_trigger_file_diff_sensor() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "sess-1",
+            "tool_name": "Bash",
+            "tool_input": {"command": "pytest"},
+            "tool_response": {"exit_code": 0}
+        });
+        let msgs = normalize(&raw).into_messages();
+        // Exactly one Evidence message (the Bash exit-code one), not two.
+        let evidence_count = msgs
+            .iter()
+            .filter(|m| matches!(m, IngestMessage::Evidence(_)))
+            .count();
+        assert_eq!(evidence_count, 1);
+        match &msgs[2] {
+            IngestMessage::Evidence(ev) => assert_eq!(ev.kind, EvidenceKind::ExitCode),
+            other => panic!("expected Evidence, got {other:?}"),
         }
     }
 }

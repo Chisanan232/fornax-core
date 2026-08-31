@@ -383,6 +383,170 @@ impl Verifier for CommandSuccessVerifier {
     }
 }
 
+/// Fourth claim class (FORNX-14): an agent claims a specific file was
+/// modified (e.g. "I updated `src/lib.rs`."). Deterministically checks for
+/// `EvidenceKind::FileDiff` evidence naming a matching path.
+///
+/// Narrowed scope (see the FORNX-14 PR description and
+/// `fornax-adapter-claude`'s `ClaudeEditWriteDiffSensor` doc comment): the
+/// only evidence this verifier can ever see today is heuristic, reconstructed
+/// from `tool_input` rather than an authoritative diff. There is therefore no
+/// way for this verifier to positively detect that a claimed file change did
+/// *not* happen — absence of matching evidence only means "not observed",
+/// never "did not happen" — so there is deliberately no `Verdict::Contradicted`
+/// branch. Matching evidence found produces `Verdict::Review`, never
+/// `Verdict::Verified`, for the same reason `TestResultVerifier`/
+/// `CommandSuccessVerifier` downgrade their own heuristic branch to `Review`
+/// via `is_stderr_heuristic_evidence`: this evidence's provenance always ends
+/// `#heuristic:tool_input`, so it is Claude Code's own unverified account of
+/// what it wrote, not something Fornax confirmed independently.
+///
+/// TODO(FORNX-14 follow-up): once an authoritative `structuredPatch`-derived
+/// evidence path exists (see the adapter-side TODO), this verifier can gain a
+/// `Verdict::Contradicted` branch and upgrade authoritative matches to
+/// `Verdict::Verified` — deliberately out of scope here.
+pub struct FileModifiedVerifier;
+
+impl FileModifiedVerifier {
+    /// Extract a path literal from claim text and require it to look
+    /// path-shaped (contains `/` or a `.`-extension) — a bare backtick-quoted
+    /// word like `` `npm install` `` or `` `build` `` must not spuriously
+    /// bind to file evidence just because it's delimited the same way a
+    /// command literal is.
+    fn extract_path_literal(text: &str) -> Option<String> {
+        let candidate = extract_delimited(text, '`').or_else(|| extract_delimited(text, '"'))?;
+        let looks_path_shaped = candidate.contains('/')
+            || (candidate.contains('.')
+                && candidate.rsplit('.').next().is_some_and(|ext| {
+                    !ext.is_empty()
+                        && ext.len() <= 8
+                        && ext.chars().all(|c| c.is_ascii_alphanumeric())
+                }));
+        if looks_path_shaped {
+            Some(candidate)
+        } else {
+            None
+        }
+    }
+
+    /// True when `evidence_path` names the same file as `claimed_path`: the
+    /// claimed path must match `evidence_path` on a path-segment boundary,
+    /// not merely as a substring (so a claim naming `src/lib.rs` matches
+    /// evidence for `/Users/x/project/src/lib.rs` but not
+    /// `src/otherlib.rs`).
+    fn path_matches(evidence_path: &str, claimed_path: &str) -> bool {
+        if evidence_path == claimed_path {
+            return true;
+        }
+        evidence_path
+            .strip_suffix(claimed_path)
+            .is_some_and(|prefix| prefix.is_empty() || prefix.ends_with('/'))
+    }
+}
+
+impl Verifier for FileModifiedVerifier {
+    fn name(&self) -> &'static str {
+        "file_modified_verifier_v1"
+    }
+
+    fn applies_to(&self, claim: &Claim) -> bool {
+        claim.subject == "file_written"
+    }
+
+    fn verify(&self, claim: &Claim, evidence: &[Evidence], caps: &RuntimeCapabilities) -> Finding {
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Deliberately gated on `ToolTrace`/`ToolResultPayload`, NOT
+        // `FinalResponse` — unlike `TestResultVerifier`/`CommandExecutedVerifier`/
+        // `CommandSuccessVerifier`, this verifier never derives anything from
+        // transcript text; its only evidence source is `EvidenceKind::FileDiff`,
+        // produced solely from `PostToolUse` tool_input/tool_response. Gating
+        // on `FinalResponse` here would open this verifier for sessions that
+        // can never actually produce the evidence it looks for.
+        if !caps.is_observable(&SignalClass::ToolTrace)
+            && !caps.is_observable(&SignalClass::ToolResultPayload)
+        {
+            return unavailable(
+                claim.id,
+                self.name(),
+                "runtime does not expose tool-trace/tool-result evidence needed to check file modifications",
+                now,
+            );
+        }
+
+        let Some(claimed_path) = Self::extract_path_literal(&claim.text) else {
+            return Finding {
+                id: Uuid::new_v4(),
+                claim_id: claim.id,
+                verdict: Verdict::Unverified,
+                evidence_ids: vec![],
+                verifier_name: self.name().to_string(),
+                rationale:
+                    "claim text does not name a literal, path-shaped file to check against evidence"
+                        .to_string(),
+                computed_at: now,
+            };
+        };
+
+        let matching = evidence.iter().rev().find(|e| {
+            e.kind == EvidenceKind::FileDiff
+                && e.payload
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|p| Self::path_matches(p, &claimed_path))
+        });
+
+        let Some(ev) = matching else {
+            return Finding {
+                id: Uuid::new_v4(),
+                claim_id: claim.id,
+                verdict: Verdict::Unverified,
+                evidence_ids: vec![],
+                verifier_name: self.name().to_string(),
+                rationale: format!(
+                    "no file-diff evidence observed for a file matching \"{claimed_path}\" in this session"
+                ),
+                computed_at: now,
+            };
+        };
+
+        let diff_nonempty = ev
+            .payload
+            .get("diff")
+            .and_then(|v| v.as_str())
+            .is_some_and(|d| !d.is_empty());
+
+        if !diff_nonempty {
+            return Finding {
+                id: Uuid::new_v4(),
+                claim_id: claim.id,
+                verdict: Verdict::Unverified,
+                evidence_ids: vec![],
+                verifier_name: self.name().to_string(),
+                rationale: format!(
+                    "file-diff evidence for \"{claimed_path}\" was found but its diff is empty"
+                ),
+                computed_at: now,
+            };
+        }
+
+        Finding {
+            id: Uuid::new_v4(),
+            claim_id: claim.id,
+            verdict: Verdict::Review,
+            evidence_ids: vec![ev.id],
+            verifier_name: self.name().to_string(),
+            rationale: format!(
+                "observed a file-diff matching \"{claimed_path}\", but this evidence is always \
+                 heuristic (reconstructed from tool_input, never authoritative) in this \
+                 implementation -- flagged for review, not confirmed verified ({})",
+                ev.provenance
+            ),
+            computed_at: now,
+        }
+    }
+}
+
 /// Extract the substring between the first pair of `delim` characters in
 /// `text`, trimmed. Returns `None` when `delim` doesn't appear twice or the
 /// enclosed text is empty.
@@ -1107,5 +1271,155 @@ mod command_success_verifier_tests {
         let f = v.verify(&c, &ev, &caps());
         assert_eq!(f.verdict, Verdict::Contradicted);
         assert_eq!(f.evidence_ids, vec![ev[0].id]);
+    }
+}
+
+#[cfg(test)]
+mod file_modified_verifier_tests {
+    use super::*;
+    use fornax_types::{CapabilitySignal, Provider, SignalAvailability};
+
+    fn caps() -> RuntimeCapabilities {
+        RuntimeCapabilities {
+            schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
+            provider: Provider::ClaudeCode,
+            signals: vec![
+                CapabilitySignal {
+                    class: SignalClass::ToolTrace,
+                    state: SignalAvailability::Available,
+                    detail: None,
+                },
+                CapabilitySignal {
+                    class: SignalClass::ToolResultPayload,
+                    state: SignalAvailability::Available,
+                    detail: None,
+                },
+            ],
+            notes: Default::default(),
+        }
+    }
+
+    fn no_caps() -> RuntimeCapabilities {
+        RuntimeCapabilities {
+            schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
+            provider: Provider::ClaudeCode,
+            signals: vec![
+                CapabilitySignal {
+                    class: SignalClass::ToolTrace,
+                    state: SignalAvailability::Unknown,
+                    detail: None,
+                },
+                CapabilitySignal {
+                    class: SignalClass::ToolResultPayload,
+                    state: SignalAvailability::Unknown,
+                    detail: None,
+                },
+            ],
+            notes: Default::default(),
+        }
+    }
+
+    fn file_diff_evidence(path: &str, diff: &str) -> Evidence {
+        Evidence {
+            id: Uuid::new_v4(),
+            session_id: "s1".into(),
+            source_event_id: Uuid::new_v4(),
+            kind: EvidenceKind::FileDiff,
+            observed_at: chrono::Utc::now().to_rfc3339(),
+            payload: serde_json::json!({"path": path, "diff": diff}),
+            provenance: "claude_code:1.2.3:PostToolUse:Edit#heuristic:tool_input".into(),
+            source: None,
+            extension: None,
+        }
+    }
+
+    #[test]
+    fn review_when_named_file_matches_evidence() {
+        let v = FileModifiedVerifier;
+        let c = crate::tests::claim_for("file_written", "I updated `src/lib.rs`.");
+        let ev = vec![file_diff_evidence(
+            "/Users/x/project/src/lib.rs",
+            "-old\n+new\n",
+        )];
+        let f = v.verify(&c, &ev, &caps());
+        assert_eq!(f.verdict, Verdict::Review);
+        assert_eq!(f.evidence_ids, vec![ev[0].id]);
+    }
+
+    #[test]
+    fn unverified_when_no_matching_file_evidence() {
+        let v = FileModifiedVerifier;
+        let c = crate::tests::claim_for("file_written", "I updated `src/lib.rs`.");
+        let ev = vec![file_diff_evidence(
+            "/Users/x/project/src/otherlib.rs",
+            "+new\n",
+        )];
+        let f = v.verify(&c, &ev, &caps());
+        assert_eq!(f.verdict, Verdict::Unverified);
+        assert!(f.evidence_ids.is_empty());
+    }
+
+    /// Path-segment-boundary regression: a naive substring match would wrongly
+    /// bind `src/lib.rs` to `src/otherlib.rs` since the latter ends with the
+    /// former's characters preceded by no `/`.
+    #[test]
+    fn does_not_substring_match_across_path_segment_boundary() {
+        let v = FileModifiedVerifier;
+        let c = crate::tests::claim_for("file_written", "I updated `lib.rs`.");
+        let ev = vec![file_diff_evidence(
+            "/Users/x/project/src/otherlib.rs",
+            "+new\n",
+        )];
+        let f = v.verify(&c, &ev, &caps());
+        assert_eq!(f.verdict, Verdict::Unverified);
+    }
+
+    #[test]
+    fn unverified_when_claim_names_no_path_literal() {
+        let v = FileModifiedVerifier;
+        let c = crate::tests::claim_for("file_written", "I updated the file.");
+        let ev = vec![file_diff_evidence("/Users/x/project/src/lib.rs", "+new\n")];
+        let f = v.verify(&c, &ev, &caps());
+        assert_eq!(f.verdict, Verdict::Unverified);
+        assert!(f.evidence_ids.is_empty());
+    }
+
+    /// A generic/unrelated claim naming a command, not a path, must not
+    /// spuriously bind to file evidence just because it is backtick-quoted
+    /// the same way a path literal is.
+    #[test]
+    fn unrelated_command_claim_does_not_bind_to_file_evidence() {
+        let v = FileModifiedVerifier;
+        let c = crate::tests::claim_for("file_written", "I ran `npm install`.");
+        let ev = vec![file_diff_evidence("/Users/x/project/src/lib.rs", "+new\n")];
+        let f = v.verify(&c, &ev, &caps());
+        assert_eq!(f.verdict, Verdict::Unverified);
+        assert!(f.evidence_ids.is_empty());
+    }
+
+    #[test]
+    fn unavailable_when_runtime_cannot_observe_tool_traces_or_results() {
+        let v = FileModifiedVerifier;
+        let c = crate::tests::claim_for("file_written", "I updated `src/lib.rs`.");
+        let f = v.verify(&c, &[], &no_caps());
+        assert_eq!(f.verdict, Verdict::Unavailable);
+    }
+
+    #[test]
+    fn recomputing_from_the_same_persisted_inputs_is_deterministic() {
+        let v = FileModifiedVerifier;
+        let c = crate::tests::claim_for("file_written", "I updated `src/lib.rs`.");
+        let ev = vec![file_diff_evidence(
+            "/Users/x/project/src/lib.rs",
+            "-old\n+new\n",
+        )];
+        let capabilities = caps();
+
+        let first = v.verify(&c, &ev, &capabilities);
+        let replayed = v.verify(&c, &ev, &capabilities);
+
+        assert_eq!(first.verdict, replayed.verdict);
+        assert_eq!(first.rationale, replayed.rationale);
+        assert_eq!(first.evidence_ids, replayed.evidence_ids);
     }
 }
