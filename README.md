@@ -62,6 +62,26 @@ echo '{"hook_event_name":"Stop","session_id":"'"$SESSION"'","transcript_path":"/
 ./target/debug/fornax detail   # full claim/evidence/rationale/verifier detail
 ```
 
+### Installing the Claude Code integration (FORNX-15)
+
+The Quick Start above feeds hook events by hand. For a real Claude Code
+session, wire the hooks into `~/.claude/settings.json` with:
+
+```bash
+./target/debug/fornax install-claude
+```
+
+This idempotently adds `SessionStart`, `UserPromptSubmit`, `PreToolUse`,
+`PostToolUse`, and `Stop` hook entries that invoke `fornax-hook-claude` —
+running it again is a no-op, and it never touches any other hook or setting
+already in that file. `fornax-hook-claude` must be on `PATH` for Claude Code
+to find it. To stop Fornax observing Claude Code sessions and return the
+file to a clean state:
+
+```bash
+./target/debug/fornax uninstall-claude
+```
+
 `fornax-hook-codex` (Codex CLI) and the dashboard at `/dashboard` on the
 daemon's HTTP port work the same way — see
 `docs/research/adapter-capability-matrix.md` for the Codex hook payload
