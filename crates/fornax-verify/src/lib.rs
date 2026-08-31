@@ -449,7 +449,7 @@ fn is_test_runner_evidence(e: &Evidence) -> bool {
 /// unreliable in the failure direction.
 fn is_stderr_heuristic_evidence(e: &Evidence) -> bool {
     e.payload.get("heuristic").and_then(|v| v.as_bool()) == Some(true)
-        && e.provenance.contains("heuristic:stderr_nonempty")
+        && e.provenance.ends_with("heuristic:stderr_nonempty")
 }
 
 fn unavailable(claim_id: Uuid, verifier: &str, reason: &str, now: String) -> Finding {
