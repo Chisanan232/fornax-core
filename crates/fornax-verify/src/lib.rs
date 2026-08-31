@@ -101,6 +101,21 @@ impl Verifier for TestResultVerifier {
                 rationale: format!("observed test-runner exit_code=0 ({})", ev.provenance),
                 computed_at: now,
             },
+            Some(code) if is_stderr_heuristic_evidence(ev) => Finding {
+                id: Uuid::new_v4(),
+                claim_id: claim.id,
+                verdict: Verdict::Review,
+                evidence_ids: vec![ev.id],
+                verifier_name: self.name().to_string(),
+                rationale: format!(
+                    "claim states tests passed; stderr was non-empty but Claude Code's \
+                     tool_response carries no real exit code, so this cannot be confirmed \
+                     as a failure -- flagged for review, not treated as contradicted \
+                     (heuristic exit_code={code}, {})",
+                    ev.provenance
+                ),
+                computed_at: now,
+            },
             Some(code) => Finding {
                 id: Uuid::new_v4(),
                 claim_id: claim.id,
@@ -331,6 +346,21 @@ impl Verifier for CommandSuccessVerifier {
                 rationale: format!("observed command exit_code=0 ({})", ev.provenance),
                 computed_at: now,
             },
+            Some(code) if is_stderr_heuristic_evidence(ev) => Finding {
+                id: Uuid::new_v4(),
+                claim_id: claim.id,
+                verdict: Verdict::Review,
+                evidence_ids: vec![ev.id],
+                verifier_name: self.name().to_string(),
+                rationale: format!(
+                    "claim states the command succeeded; stderr was non-empty but Claude \
+                     Code's tool_response carries no real exit code, so this cannot be \
+                     confirmed as a failure -- flagged for review, not treated as \
+                     contradicted (heuristic exit_code={code}, {})",
+                    ev.provenance
+                ),
+                computed_at: now,
+            },
             Some(code) => Finding {
                 id: Uuid::new_v4(),
                 claim_id: claim.id,
@@ -402,6 +432,24 @@ fn is_test_runner_evidence(e: &Evidence) -> bool {
             || cmd.contains("npm test")
             || cmd.contains("vitest")
             || cmd.contains("jest"))
+}
+
+/// True when `e`'s nonzero `exit_code` was synthesized by
+/// `fornax-adapter-claude`'s `ClaudeBashExitCodeSensor` from the
+/// `stderr_nonempty` heuristic (`"heuristic": true` and provenance ending in
+/// `#heuristic:stderr_nonempty`) rather than observed from a real exit code.
+///
+/// Claude Code's real PostToolUse `tool_response` never carries an actual
+/// exit code field; the adapter falls back to inferring failure from
+/// non-empty stderr, which is wrong whenever a command writes to stderr
+/// (a warning, a progress message, ...) but still exits 0. Deliberately
+/// narrow: `heuristic:interrupted` (an explicit signal that the user killed
+/// the command) and `heuristic:stderr_empty` (which only ever produces
+/// exit_code 0) are excluded — only this specific heuristic reason is
+/// unreliable in the failure direction.
+fn is_stderr_heuristic_evidence(e: &Evidence) -> bool {
+    e.payload.get("heuristic").and_then(|v| v.as_bool()) == Some(true)
+        && e.provenance.contains("heuristic:stderr_nonempty")
 }
 
 fn unavailable(claim_id: Uuid, verifier: &str, reason: &str, now: String) -> Finding {
