@@ -927,4 +927,159 @@ mod tests {
             other => panic!("expected Capabilities, got {other:?}"),
         }
     }
+
+    // --- FORNX-14: ClaudeEditWriteDiffSensor -------------------------------
+
+    #[test]
+    fn post_tool_use_edit_produces_file_diff_evidence() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "sess-1",
+            "tool_name": "Edit",
+            "tool_input": {
+                "file_path": "/repo/src/lib.rs",
+                "old_string": "fn old() {}",
+                "new_string": "fn new() {}"
+            },
+            "tool_response": {"filePath": "/repo/src/lib.rs"}
+        });
+        let msgs = normalize(&raw).into_messages();
+        assert_eq!(msgs.len(), 3);
+        match &msgs[2] {
+            IngestMessage::Evidence(ev) => {
+                assert_eq!(ev.kind, EvidenceKind::FileDiff);
+                assert_eq!(ev.payload["path"], "/repo/src/lib.rs");
+                let diff = ev.payload["diff"].as_str().unwrap();
+                assert!(diff.contains("-fn old() {}"));
+                assert!(diff.contains("+fn new() {}"));
+                assert!(ev.provenance.ends_with("#heuristic:tool_input"));
+            }
+            other => panic!("expected Evidence, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn post_tool_use_write_produces_only_plus_prefixed_diff() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "sess-1",
+            "tool_name": "Write",
+            "tool_input": {
+                "file_path": "/repo/src/new_file.rs",
+                "content": "line one\nline two"
+            },
+            "tool_response": {"filePath": "/repo/src/new_file.rs"}
+        });
+        let msgs = normalize(&raw).into_messages();
+        assert_eq!(msgs.len(), 3);
+        match &msgs[2] {
+            IngestMessage::Evidence(ev) => {
+                assert_eq!(ev.kind, EvidenceKind::FileDiff);
+                let diff = ev.payload["diff"].as_str().unwrap();
+                assert!(diff.contains("+line one"));
+                assert!(diff.contains("+line two"));
+                assert!(!diff.contains('-'));
+                assert!(ev.provenance.ends_with("#heuristic:tool_input"));
+            }
+            other => panic!("expected Evidence, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn post_tool_use_multiedit_concatenates_both_edits() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "sess-1",
+            "tool_name": "MultiEdit",
+            "tool_input": {
+                "file_path": "/repo/src/lib.rs",
+                "edits": [
+                    {"old_string": "a1", "new_string": "a2", "replace_all": false},
+                    {"old_string": "b1", "new_string": "b2", "replace_all": false}
+                ]
+            },
+            "tool_response": {"filePath": "/repo/src/lib.rs"}
+        });
+        let msgs = normalize(&raw).into_messages();
+        assert_eq!(msgs.len(), 3);
+        match &msgs[2] {
+            IngestMessage::Evidence(ev) => {
+                assert_eq!(ev.kind, EvidenceKind::FileDiff);
+                let diff = ev.payload["diff"].as_str().unwrap();
+                assert!(diff.contains("-a1"));
+                assert!(diff.contains("+a2"));
+                assert!(diff.contains("-b1"));
+                assert!(diff.contains("+b2"));
+            }
+            other => panic!("expected Evidence, got {other:?}"),
+        }
+        // Single evidence entry, not one per edit.
+        assert_eq!(msgs.len(), 3);
+    }
+
+    #[test]
+    fn post_tool_use_edit_without_tool_response_produces_only_event() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "sess-1",
+            "tool_name": "Edit",
+            "tool_input": {
+                "file_path": "/repo/src/lib.rs",
+                "old_string": "a",
+                "new_string": "b"
+            }
+        });
+        let msgs = normalize(&raw).into_messages();
+        assert_eq!(msgs.len(), 2);
+        assert!(matches!(&msgs[0], IngestMessage::Capabilities(_)));
+        assert!(matches!(&msgs[1], IngestMessage::Event(_)));
+    }
+
+    #[test]
+    fn claude_edit_write_diff_sensor_reports_unavailable_with_no_tool_response() {
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "sess-1".into(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: Some("Edit".into()),
+            tool_input: Some(serde_json::json!({"old_string": "a", "new_string": "b"})),
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        let sensor = ClaudeEditWriteDiffSensor {
+            adapter_version: ADAPTER_VERSION,
+        };
+        let outcome = sensor.collect(&event, &ClaudeAdapter.probe());
+        assert!(!outcome.has_evidence());
+        assert_eq!(outcome.state, SignalAvailability::Unavailable);
+    }
+
+    /// Bash PostToolUse events must not be picked up by the new
+    /// Edit/Write/MultiEdit branch — the existing Bash exit-code tests above
+    /// already prove the Bash sensor's own behavior is unchanged; this
+    /// proves the new sensor doesn't also fire (and thus doesn't double up
+    /// evidence) on a Bash event.
+    #[test]
+    fn bash_event_does_not_trigger_file_diff_sensor() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "sess-1",
+            "tool_name": "Bash",
+            "tool_input": {"command": "pytest"},
+            "tool_response": {"exit_code": 0}
+        });
+        let msgs = normalize(&raw).into_messages();
+        // Exactly one Evidence message (the Bash exit-code one), not two.
+        let evidence_count = msgs
+            .iter()
+            .filter(|m| matches!(m, IngestMessage::Evidence(_)))
+            .count();
+        assert_eq!(evidence_count, 1);
+        match &msgs[2] {
+            IngestMessage::Evidence(ev) => assert_eq!(ev.kind, EvidenceKind::ExitCode),
+            other => panic!("expected Evidence, got {other:?}"),
+        }
+    }
 }
