@@ -111,9 +111,13 @@ impl CapabilityProbe for CodexAdapter {
                     class: SignalClass::ProcessResult,
                     state: SignalAvailability::Unavailable,
                     detail: Some(
-                        "exec_command_end (literal exit_code) not emitted by codex-cli 0.147.0; \
-                         only the heuristic script-completed marker via \
-                         custom_tool_call_output is observed today"
+                        "exec_command_end (literal exit_code) not emitted by codex-cli 0.147.0. \
+                         custom_tool_call_output does carry a real, parseable exit code \
+                         (FORNX-16, live-confirmed) when the session's exec tool is \
+                         tools.shell_command (unified_exec disabled) — but the default \
+                         tools.exec_command (unified_exec) shape still exposes no exit \
+                         status at all, even for a genuinely failing command, so this \
+                         stays Unavailable rather than Available at the provider-wide level"
                             .to_string(),
                     ),
                 },
@@ -259,9 +263,27 @@ impl EvidenceSensor for CodexExecCommandEndSensor {
 
 /// FORNX-157: formalizes the `custom_tool_call_output` "Script completed"
 /// heuristic (no literal exit code exposed in this shape at all — see the
-/// doc comment at its original call site) as an `EvidenceSensor`. Unchanged
-/// heuristic; see the `tests` module's existing tests for the before/after
-/// regression proof.
+/// doc comment at its original call site) as an `EvidenceSensor`.
+///
+/// FORNX-16 (live capture 2026-08-31 against codex-cli 0.147.0, the exact
+/// version referenced by the FORNX-55 comments below): the "no literal exit
+/// code at all" claim was true only for the *default* `exec` custom tool
+/// (`tools.exec_command`, the persistent/`unified_exec` shell) — a real
+/// failing command (`false`, `exit 1`) through that tool still yields
+/// `"Script completed"` with no distinguishing text at all, confirming that
+/// gap is real and not fixable from this shape alone.
+///
+/// But codex-cli 0.147.0 also exposes a second, stateless exec tool,
+/// `tools.shell_command` (reached when the `unified_exec` feature is
+/// disabled, e.g. `codex exec --disable unified_exec`), whose
+/// `custom_tool_call_output` for the *same* `response_item` shape carries a
+/// genuine, parseable `"Exit code: <n>"` annotation in the output text for
+/// both outcomes — `"Script failed"` / `"Script error:\nExit code: <n>"` on
+/// failure, `"Script completed"` / `"Exit code: 0"` on success. `collect`
+/// below prefers this literal value whenever it's present (real evidence,
+/// `heuristic: false`) and only falls back to the old zero-guess heuristic
+/// when no `"Exit code: "` text is present at all — the genuine
+/// `unified_exec` gap remains `Unavailable`, not a synthetic verdict.
 struct CodexCustomToolCallOutputSensor;
 
 impl EvidenceSensor for CodexCustomToolCallOutputSensor {
@@ -302,29 +324,20 @@ impl EvidenceSensor for CodexCustomToolCallOutputSensor {
                 Some("no tool_response present on this event".to_string()),
             );
         };
-        let output_text: String = resp
+        let blocks: Vec<&str> = resp
             .get("output")
             .and_then(|v| v.as_array())
             .map(|blocks| {
                 blocks
                     .iter()
                     .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-                    .collect::<Vec<_>>()
-                    .join("")
+                    .collect()
             })
             .unwrap_or_default();
-
-        // "Script completed" is the only confirmed real success marker
-        // observed so far; a real failing-command capture to confirm the
-        // failure-path marker is still outstanding (residual FORNX-55
-        // follow-up) — so an unrecognized shape produces no Evidence rather
-        // than a guessed verdict in either direction.
-        if !output_text.contains("Script completed") {
-            return SensorOutcome::not_collected(
-                SignalAvailability::Unavailable,
-                Some("output text has no recognized completion marker".to_string()),
-            );
-        }
+        // Only used for the "Script completed" fallback marker below, never
+        // for exit-code extraction — see `parse_exit_code_from_blocks`'s doc
+        // comment for why joined text is unsafe for that.
+        let output_text: String = blocks.concat();
 
         let command = event
             .tool_input
@@ -332,6 +345,51 @@ impl EvidenceSensor for CodexCustomToolCallOutputSensor {
             .and_then(|ti| ti.get("command"))
             .cloned()
             .unwrap_or_default();
+
+        // FORNX-16: the `tools.shell_command` wire shape embeds a literal
+        // "Exit code: <n>" in the output text for both outcomes — prefer it
+        // whenever present, real value, not a guess. See the struct doc
+        // comment above for how this was confirmed and how it differs from
+        // the still-real `unified_exec` gap below.
+        if let Some(code) = parse_exit_code_from_blocks(&blocks) {
+            return SensorOutcome::collected(vec![Evidence {
+                id: Uuid::new_v4(),
+                session_id: event.session_id.clone(),
+                source_event_id: event.id,
+                kind: EvidenceKind::ExitCode,
+                observed_at: event.observed_at.clone(),
+                payload: serde_json::json!({
+                    "command": command,
+                    "exit_code": code,
+                    "heuristic": false,
+                }),
+                provenance: format!(
+                    "codex:{v}:rollout:custom_tool_call_output#exit_code_text",
+                    v = ADAPTER_VERSION
+                ),
+                source: Some(EvidenceSource::now(
+                    self.name(),
+                    self.trust_class(),
+                    Some(Provider::Codex),
+                    self.collection_method(),
+                    self.collector_version(),
+                )),
+                extension: None,
+            }]);
+        }
+
+        // "Script completed" is the only confirmed marker on the
+        // `unified_exec` (`tools.exec_command`) shape, which carries no
+        // parseable exit code at all — even a genuinely failing command
+        // still reports "Script completed" there (confirmed live,
+        // FORNX-16). So an unrecognized shape, or this heuristic-only
+        // shape, never claims more than a zero-guess.
+        if !output_text.contains("Script completed") {
+            return SensorOutcome::not_collected(
+                SignalAvailability::Unavailable,
+                Some("output text has no recognized completion marker".to_string()),
+            );
+        }
 
         SensorOutcome::collected(vec![Evidence {
             id: Uuid::new_v4(),
@@ -358,6 +416,50 @@ impl EvidenceSensor for CodexCustomToolCallOutputSensor {
             extension: None,
         }])
     }
+}
+
+/// Looks for a literal `"Exit code: <digits>"` annotation the way
+/// `tools.shell_command`'s real `custom_tool_call_output` actually places
+/// it: as the leading content of one whole output *block*, never merely
+/// present somewhere inside a block's text.
+///
+/// This is deliberately **not** a substring search over the blocks joined
+/// together — joining first and searching second would let a command's own
+/// *stdout* (the second block in the real shape, which the block carrying
+/// the real marker also happens to hold, right after it) forge a fake exit
+/// code. A build tool that echoes `"Exit code: 1"` as part of its own
+/// output, with no failure at all, must never be able to flip a truthful
+/// claim to `heuristic: false` + a fabricated CONTRADICTED verdict — that
+/// would be worse than not parsing it at all. Anchoring to "is this block's
+/// own leading text" instead of "does the marker appear anywhere" is what
+/// keeps `heuristic: false` an honest claim about a provider-emitted field.
+///
+/// Matches the two real shapes captured live (FORNX-16): a block starting
+/// with `"Exit code: <n>"` directly (success), or one starting with
+/// `"Script error:"` followed by `"Exit code: <n>"` on the next line
+/// (failure). No regex dependency, consistent with this module's existing
+/// manual parsing (see `extract_cmd`).
+fn parse_exit_code_from_blocks(blocks: &[&str]) -> Option<i64> {
+    const MARKER: &str = "Exit code: ";
+    for block in blocks {
+        let b = block.trim_start();
+        let after_marker = if let Some(rest) = b.strip_prefix(MARKER) {
+            Some(rest)
+        } else {
+            b.strip_prefix("Script error:")
+                .map(|rest| rest.trim_start_matches(['\n', '\r']))
+                .and_then(|rest| rest.strip_prefix(MARKER))
+        };
+        if let Some(rest) = after_marker {
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if !digits.is_empty() {
+                if let Ok(code) = digits.parse::<i64>() {
+                    return Some(code);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn translate_line(
@@ -434,10 +536,9 @@ fn translate_line(
                 let mut out = vec![IngestMessage::Event(event.clone())];
 
                 // FORNX-157: formalized as `CodexCustomToolCallOutputSensor`
-                // — see that type for the unchanged "Script completed"
-                // heuristic (a real failing-command capture to confirm the
-                // failure-path marker is still outstanding, residual
-                // FORNX-55 follow-up).
+                // — see that type for the "Script completed" heuristic and
+                // the FORNX-16 real exit-code-text parsing added alongside
+                // it.
                 let sensor = CodexCustomToolCallOutputSensor;
                 let outcome = sensor.collect(&event, &CodexAdapter::new().probe());
                 out.extend(outcome.evidence.into_iter().map(IngestMessage::Evidence));
@@ -792,6 +893,159 @@ mod tests {
             IngestMessage::Evidence(ev) => {
                 assert_eq!(ev.payload["exit_code"], 0);
                 assert_eq!(ev.payload["command"], "echo hi");
+                assert_eq!(ev.payload["heuristic"], true);
+                assert!(ev.provenance.contains("script_completed"));
+            }
+            other => panic!("expected Evidence, got {other:?}"),
+        }
+    }
+
+    /// FORNX-16: real captured failure shape (codex-cli 0.147.0, live
+    /// capture 2026-08-31, `codex exec --disable unified_exec`, command
+    /// `exit 1` through `tools.shell_command`) — a real nonzero exit code
+    /// must be extracted from the `"Exit code: 1"` text, non-heuristic.
+    #[test]
+    fn custom_tool_call_output_with_real_failure_marker_produces_nonzero_exit_code_evidence() {
+        let mut adapter = CodexAdapter::new();
+        let call = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "call_id": "call_fail",
+                "name": "exec",
+                "input": "const r = await tools.shell_command({command:\"exit 1\",workdir:\"/tmp\"}); text(r)\n"
+            }
+        });
+        let _ = normalize(&mut adapter, &call);
+
+        let output = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "call_fail",
+                "output": [
+                    {"type": "input_text", "text": "Script failed\nWall time 0.1 seconds\nOutput:\n"},
+                    {"type": "input_text", "text": "Script error:\nExit code: 1\nWall time: 0.1 seconds\nOutput:\n"}
+                ]
+            }
+        });
+        let msgs = normalize(&mut adapter, &output).into_messages();
+        assert_eq!(msgs.len(), 2);
+        match &msgs[1] {
+            IngestMessage::Evidence(ev) => {
+                assert_eq!(ev.kind, EvidenceKind::ExitCode);
+                assert_eq!(ev.payload["exit_code"], 1);
+                assert_eq!(ev.payload["heuristic"], false);
+                assert!(ev.provenance.contains("exit_code_text"));
+            }
+            other => panic!("expected Evidence, got {other:?}"),
+        }
+    }
+
+    /// Same real shape, success case with an explicit `"Exit code: 0"` —
+    /// must also produce a non-heuristic Evidence (not the old zero-guess
+    /// heuristic), since a real value is present.
+    #[test]
+    fn custom_tool_call_output_with_real_success_exit_code_text_is_non_heuristic() {
+        let mut adapter = CodexAdapter::new();
+        let call = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "call_id": "call_ok",
+                "name": "exec",
+                "input": "const r = await tools.shell_command({command:\"echo hi\",workdir:\"/tmp\"}); text(r)\n"
+            }
+        });
+        let _ = normalize(&mut adapter, &call);
+
+        let output = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "call_ok",
+                "output": [
+                    {"type": "input_text", "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"},
+                    {"type": "input_text", "text": "Exit code: 0\nWall time: 0.1 seconds\nOutput:\nhello\n"}
+                ]
+            }
+        });
+        let msgs = normalize(&mut adapter, &output).into_messages();
+        match &msgs[1] {
+            IngestMessage::Evidence(ev) => {
+                assert_eq!(ev.payload["exit_code"], 0);
+                assert_eq!(ev.payload["heuristic"], false);
+                assert!(ev.provenance.contains("exit_code_text"));
+            }
+            other => panic!("expected Evidence, got {other:?}"),
+        }
+    }
+
+    /// The genuine `unified_exec` gap (no exit-code text at all, even on a
+    /// real failing command — confirmed live 2026-08-31) must remain the
+    /// unchanged zero-guess heuristic, not silently upgraded.
+    #[test]
+    fn custom_tool_call_output_without_exit_code_text_keeps_old_heuristic() {
+        let mut adapter = CodexAdapter::new();
+        let call = serde_json::json!({
+            "type": "response_item",
+            "payload": {"type": "custom_tool_call", "name": "exec", "call_id": "c_uexec", "input": "false"}
+        });
+        let _ = normalize(&mut adapter, &call);
+
+        let output = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "c_uexec",
+                "output": [{"type": "input_text", "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"}]
+            }
+        });
+        let msgs = normalize(&mut adapter, &output).into_messages();
+        match &msgs[1] {
+            IngestMessage::Evidence(ev) => {
+                assert_eq!(ev.payload["exit_code"], 0);
+                assert_eq!(ev.payload["heuristic"], true);
+                assert!(ev.provenance.contains("script_completed"));
+            }
+            other => panic!("expected Evidence, got {other:?}"),
+        }
+    }
+
+    /// Regression: a genuinely successful `unified_exec` command whose own
+    /// stdout happens to contain the literal text `"Exit code: 1"` (e.g. a
+    /// nested build tool echoing that as part of its normal output) must
+    /// never forge a fabricated nonzero, `heuristic: false` exit code. Only
+    /// a block whose *own* leading text is the marker counts — see
+    /// `parse_exit_code_from_blocks`'s doc comment for why joining blocks
+    /// before searching would be unsafe here.
+    #[test]
+    fn stdout_containing_the_exit_code_words_does_not_forge_a_fake_marker() {
+        let mut adapter = CodexAdapter::new();
+        let call = serde_json::json!({
+            "type": "response_item",
+            "payload": {"type": "custom_tool_call", "name": "exec", "call_id": "c_stdout_spoof", "input": "make"}
+        });
+        let _ = normalize(&mut adapter, &call);
+
+        let output = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "c_stdout_spoof",
+                "output": [
+                    {"type": "input_text", "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"},
+                    {"type": "input_text", "text": "make: Exit code: 1 (from a nested build log)\n"}
+                ]
+            }
+        });
+        let msgs = normalize(&mut adapter, &output).into_messages();
+        match &msgs[1] {
+            IngestMessage::Evidence(ev) => {
+                assert_eq!(
+                    ev.payload["exit_code"], 0,
+                    "must not adopt a number from the command's own stdout"
+                );
                 assert_eq!(ev.payload["heuristic"], true);
                 assert!(ev.provenance.contains("script_completed"));
             }

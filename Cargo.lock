@@ -558,12 +558,15 @@ dependencies = [
 name = "fornax-adapter-conformance"
 version = "0.0.1"
 dependencies = [
+ "chrono",
  "fornax-adapter-claude",
  "fornax-adapter-codex",
  "fornax-adapter-opencode",
  "fornax-types",
+ "fornax-verify",
  "serde",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]
