@@ -82,11 +82,39 @@ file to a clean state:
 ./target/debug/fornax uninstall-claude
 ```
 
-`fornax-hook-codex` (Codex CLI) and the dashboard at `/dashboard` on the
-daemon's HTTP port work the same way — see
-`docs/research/adapter-capability-matrix.md` for the Codex hook payload
-shape and `crates/fornax-adapter-codex` for that adapter's translation
-logic.
+### Installing the Codex integration (FORNX-16)
+
+Codex's evidence capture needs no installation at all: `fornax-hook-codex`
+reads Codex's own always-on rollout JSONL transcripts directly — just run
+it (see `docs/research/adapter-capability-matrix.md` for the payload shape
+and `crates/fornax-adapter-codex` for the translation logic).
+
+`install-codex`/`uninstall-codex` wire only the separate, optional
+ambient-status surface (FORNX-17) — a `notify` entry in
+`~/.codex/config.toml` pointing at `scripts/fornax-codex-notify.sh`, so
+Codex writes its own turn-status to `$FORNAX_HOME/last-status` (Codex
+discards `notify`'s stdout, so the script must write to a file — see
+`docs/dogfooding-codex-notify.md`):
+
+```bash
+./target/debug/fornax install-codex
+```
+
+Codex's `notify` holds exactly one command, unlike Claude's per-event hook
+arrays — so if `notify` is already wired to something else (e.g. a
+different tool your session already uses), `install-codex` refuses to
+overwrite it and leaves the file byte-for-byte unchanged, rather than
+silently replacing or corrupting an unrelated integration. Wire Fornax in
+manually in that case. Running it again when Fornax is already installed
+is a no-op. To remove exactly the entry `install-codex` added (never a
+foreign `notify` value), leaving every other key/table/comment untouched:
+
+```bash
+./target/debug/fornax uninstall-codex
+```
+
+The dashboard at `/dashboard` on the daemon's HTTP port works the same way
+across every adapter.
 
 opencode monitoring uses a third, distinct mechanism: an in-process
 `@opencode-ai/plugin` (`crates/fornax-adapter-opencode/plugin/fornax-capture.js`)
