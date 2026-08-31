@@ -389,3 +389,183 @@ mod evidence_schema_tests {
         assert_eq!(ev.extension, back.extension);
     }
 }
+
+/// Direct unit coverage for the core domain types (FORNX-11): construction
+/// and serde round-trip for `AgentEvent`/`Claim`/`Evidence`/`Finding`/
+/// `IngestMessage`, plus the five-state `Verdict` vocabulary. Schema
+/// versioning/evolution itself is FORNX-158's `extension` module (see
+/// `docs/adr/0005-schema-evolution.md`) — this module only closes the gap
+/// that `fornax-types`' other domain types had no direct tests of their own.
+#[cfg(test)]
+mod domain_type_tests {
+    use super::*;
+
+    fn sample_event() -> AgentEvent {
+        AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "s1".into(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: Some("Bash".into()),
+            tool_input: Some(serde_json::json!({"command": "pytest"})),
+            tool_response: Some(serde_json::json!({"exit_code": 0})),
+            raw: serde_json::json!({"hook_event_name": "PostToolUse"}),
+        }
+    }
+
+    fn sample_claim() -> Claim {
+        Claim {
+            id: Uuid::new_v4(),
+            session_id: "s1".into(),
+            source_event_id: Uuid::new_v4(),
+            text: "All tests passed".into(),
+            subject: "test_result".into(),
+            claimed_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    fn sample_finding(verdict: Verdict) -> Finding {
+        Finding {
+            id: Uuid::new_v4(),
+            claim_id: Uuid::new_v4(),
+            verdict,
+            evidence_ids: vec![Uuid::new_v4()],
+            verifier_name: "exit_code_verifier".into(),
+            rationale: "exit code was 0".into(),
+            computed_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    // --- AgentEvent ---------------------------------------------------
+
+    #[test]
+    fn agent_event_round_trips_through_json() {
+        let event = sample_event();
+        let json = serde_json::to_string(&event).unwrap();
+        let back: AgentEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event.id, back.id);
+        assert_eq!(event.session_id, back.session_id);
+        assert_eq!(event.provider, back.provider);
+        assert_eq!(event.kind, back.kind);
+        assert_eq!(event.tool_name, back.tool_name);
+        assert_eq!(event.tool_input, back.tool_input);
+        assert_eq!(event.tool_response, back.tool_response);
+        assert_eq!(event.raw, back.raw);
+    }
+
+    #[test]
+    fn agent_event_allows_absent_tool_fields() {
+        let mut event = sample_event();
+        event.tool_name = None;
+        event.tool_input = None;
+        event.tool_response = None;
+        let json = serde_json::to_string(&event).unwrap();
+        let back: AgentEvent = serde_json::from_str(&json).unwrap();
+        assert!(back.tool_name.is_none());
+        assert!(back.tool_input.is_none());
+        assert!(back.tool_response.is_none());
+    }
+
+    // --- Claim ----------------------------------------------------------
+
+    #[test]
+    fn claim_round_trips_through_json() {
+        let claim = sample_claim();
+        let json = serde_json::to_string(&claim).unwrap();
+        let back: Claim = serde_json::from_str(&json).unwrap();
+        assert_eq!(claim.id, back.id);
+        assert_eq!(claim.session_id, back.session_id);
+        assert_eq!(claim.source_event_id, back.source_event_id);
+        assert_eq!(claim.text, back.text);
+        assert_eq!(claim.subject, back.subject);
+        assert_eq!(claim.claimed_at, back.claimed_at);
+    }
+
+    // --- Finding ----------------------------------------------------------
+
+    #[test]
+    fn finding_round_trips_through_json() {
+        let finding = sample_finding(Verdict::Verified);
+        let json = serde_json::to_string(&finding).unwrap();
+        let back: Finding = serde_json::from_str(&json).unwrap();
+        assert_eq!(finding.id, back.id);
+        assert_eq!(finding.claim_id, back.claim_id);
+        assert_eq!(finding.verdict, back.verdict);
+        assert_eq!(finding.evidence_ids, back.evidence_ids);
+        assert_eq!(finding.verifier_name, back.verifier_name);
+        assert_eq!(finding.rationale, back.rationale);
+        assert_eq!(finding.computed_at, back.computed_at);
+    }
+
+    // --- Verdict: the five-state vocabulary must never collapse ----------
+
+    /// Exhaustive match with no wildcard arm: if a `Verdict` variant is ever
+    /// added, removed, or renamed, this fails to compile rather than
+    /// silently passing (HVDL-15 / FORNX-20: "never collapsed to a boolean
+    /// or a score").
+    #[test]
+    fn verdict_has_exactly_five_states_with_stable_wire_names() {
+        let cases = [
+            (Verdict::Verified, "verified"),
+            (Verdict::Unverified, "unverified"),
+            (Verdict::Contradicted, "contradicted"),
+            (Verdict::Review, "review"),
+            (Verdict::Unavailable, "unavailable"),
+        ];
+        for (verdict, expected_wire_name) in cases {
+            // Exhaustiveness check: every variant must be named here.
+            match verdict {
+                Verdict::Verified
+                | Verdict::Unverified
+                | Verdict::Contradicted
+                | Verdict::Review
+                | Verdict::Unavailable => {}
+            }
+            let json = serde_json::to_value(verdict).unwrap();
+            assert_eq!(json, serde_json::json!(expected_wire_name));
+            let back: Verdict = serde_json::from_value(json).unwrap();
+            assert_eq!(verdict, back);
+        }
+    }
+
+    // --- IngestMessage ----------------------------------------------------
+
+    #[test]
+    fn ingest_message_event_variant_round_trips_and_tags_type() {
+        let msg = IngestMessage::Event(sample_event());
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json.get("type").and_then(|v| v.as_str()), Some("event"));
+        let back: IngestMessage = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, IngestMessage::Event(_)));
+    }
+
+    #[test]
+    fn ingest_message_claim_variant_round_trips_and_tags_type() {
+        let msg = IngestMessage::Claim(sample_claim());
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json.get("type").and_then(|v| v.as_str()), Some("claim"));
+        let back: IngestMessage = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, IngestMessage::Claim(_)));
+    }
+
+    #[test]
+    fn ingest_message_evidence_variant_round_trips_and_tags_type() {
+        let evidence = Evidence {
+            id: Uuid::new_v4(),
+            session_id: "s1".into(),
+            source_event_id: Uuid::new_v4(),
+            kind: EvidenceKind::ExitCode,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            payload: serde_json::json!({"command": [], "exit_code": 0}),
+            provenance: "test".into(),
+            source: None,
+            extension: None,
+        };
+        let msg = IngestMessage::Evidence(evidence);
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json.get("type").and_then(|v| v.as_str()), Some("evidence"));
+        let back: IngestMessage = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, IngestMessage::Evidence(_)));
+    }
+}
