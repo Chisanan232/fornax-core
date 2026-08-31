@@ -86,9 +86,18 @@ A user embeds that file's content wherever their terminal setup allows,
 e.g. in a shell prompt:
 
 ```bash
-# ~/.bashrc or ~/.zshrc
+# ~/.bashrc
 fornax_ambient() { cat "${FORNAX_HOME:-$HOME/.fornax}/last-status" 2>/dev/null; }
 PS1='$(fornax_ambient) '"$PS1"
+```
+
+```zsh
+# ~/.zshrc — zsh does not expand command substitution in a prompt without
+# this option; without it the prompt shows the literal text
+# "$(fornax_ambient)" instead of running it.
+setopt PROMPT_SUBST
+fornax_ambient() { cat "${FORNAX_HOME:-$HOME/.fornax}/last-status" 2>/dev/null; }
+PROMPT='$(fornax_ambient) '"$PROMPT"
 ```
 
 or a tmux status-bar command polling the same file. This is coarser than
