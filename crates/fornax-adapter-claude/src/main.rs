@@ -4,13 +4,17 @@
 //! result to the daemon over the Unix Domain Socket. This binary is
 //! transport plumbing only — no translation logic lives here (D5, ADR 0001).
 //!
-//! Wire into `~/.claude/settings.json` (not done automatically — this is the
-//! user's global config):
+//! Wire into `~/.claude/settings.json` by running `fornax install-claude`
+//! (FORNX-15) — it idempotently adds the hook entries below without
+//! touching any other hook or setting already in that file. Run
+//! `fornax uninstall-claude` to remove them again and return Claude Code to
+//! a clean state. The resulting shape:
 //! ```json
-//! "PreToolUse":  [{ "hooks": [{ "type": "command", "command": "fornax-hook-claude" }] }],
-//! "PostToolUse": [{ "hooks": [{ "type": "command", "command": "fornax-hook-claude" }] }],
-//! "Stop":        [{ "hooks": [{ "type": "command", "command": "fornax-hook-claude" }] }],
-//! "SessionStart":[{ "hooks": [{ "type": "command", "command": "fornax-hook-claude" }] }]
+//! "PreToolUse":       [{ "hooks": [{ "type": "command", "command": "fornax-hook-claude" }] }],
+//! "PostToolUse":      [{ "hooks": [{ "type": "command", "command": "fornax-hook-claude" }] }],
+//! "Stop":             [{ "hooks": [{ "type": "command", "command": "fornax-hook-claude" }] }],
+//! "SessionStart":     [{ "hooks": [{ "type": "command", "command": "fornax-hook-claude" }] }],
+//! "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "fornax-hook-claude" }] }]
 //! ```
 
 use fornax_adapter_claude::ClaudeAdapter;
