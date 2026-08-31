@@ -388,11 +388,13 @@ fn command_text(payload: &serde_json::Value) -> String {
 }
 
 fn is_test_runner_evidence(e: &Evidence) -> bool {
-    let cmd = e
-        .payload
-        .get("command")
-        .map(|v| v.to_string().to_lowercase())
-        .unwrap_or_default();
+    // FORNX-295: must use the space-joined `command_text` normalization, not
+    // a raw `Value::to_string()` — Codex's real rollout shape is a JSON argv
+    // array (e.g. `["cargo","test"]`), whose `to_string()` renders as
+    // `["cargo","test"]` (quotes and brackets intact) and never contains the
+    // literal substring "cargo test". Using the shared helper here matches
+    // how `command_text` is already used elsewhere in this file.
+    let cmd = command_text(&e.payload);
     e.payload.get("exit_code").is_some()
         && (cmd.contains("pytest")
             || cmd.contains("cargo test")
@@ -545,6 +547,25 @@ mod tests {
         let c = claim("All tests passed.");
         let f = v.verify(&c, &[], &caps());
         assert_eq!(f.verdict, Verdict::Unverified);
+    }
+
+    /// FORNX-295 regression: Codex's real rollout evidence carries `command`
+    /// as a JSON argv array (`["cargo","test"]`), not a single string. A
+    /// naive `Value::to_string()` renders that as `["cargo","test"]` — which
+    /// never contains the literal substring "cargo test" — so this multi-
+    /// token command was silently invisible to `is_test_runner_evidence`.
+    #[test]
+    fn recognizes_multi_token_argv_test_runner_commands() {
+        let v = TestResultVerifier;
+        let c = claim("All tests passed.");
+        let ev = vec![evidence_for_command(&["cargo", "test"], 1)];
+        let f = v.verify(&c, &ev, &caps());
+        assert_eq!(f.verdict, Verdict::Contradicted);
+        assert_eq!(f.evidence_ids, vec![ev[0].id]);
+
+        let ev2 = vec![evidence_for_command(&["cargo", "nextest", "run"], 0)];
+        let f2 = v.verify(&c, &ev2, &caps());
+        assert_eq!(f2.verdict, Verdict::Verified);
     }
 
     #[test]
