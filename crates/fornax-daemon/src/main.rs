@@ -40,9 +40,13 @@ async fn ensure_single_instance(sock_path: &PathBuf) -> anyhow::Result<()> {
     if sock_path.exists() {
         match UnixStream::connect(sock_path).await {
             Ok(_) => {
+                let home_dir = sock_path
+                    .parent()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
                 anyhow::bail!(
                     "fornaxd is already running: another daemon is live on {} — \
-                     stop it first (e.g. `fornax daemon stop`) before starting a new one",
+                     stop it first (e.g. `kill $(cat {home_dir}/fornaxd.pid)`) before starting a new one",
                     sock_path.display()
                 );
             }
@@ -124,9 +128,14 @@ async fn main() -> anyhow::Result<()> {
     let sock_path = home.join("fornax.sock");
     let pid_path = home.join("fornaxd.pid");
     ensure_single_instance(&sock_path).await?;
-    // Written for `fornax daemon stop` to find this process (FORNX-12). Best
-    // effort: a daemon that can't write its own pid file still runs, it just
-    // can't be stopped via the CLI convenience command.
+    // Written so an operator (or the single-instance guard's own error
+    // message) can find this process's PID to stop it, e.g.
+    // `kill $(cat "$FORNAX_HOME/fornaxd.pid")` (FORNX-12). There is no CLI
+    // wrapper for this — a `fornax daemon stop` subcommand would need to
+    // shell out to `kill`, which the zero-subprocess-spawn invariant
+    // (asserted by `subprocess_surface_is_still_zero_in_production_code`)
+    // forbids in production code. Best effort: a daemon that can't write
+    // its own pid file still runs, it just can't be stopped this way.
     if let Err(e) = std::fs::write(&pid_path, std::process::id().to_string()) {
         tracing::warn!(error = %e, "failed to write pid file");
     }
