@@ -9,7 +9,8 @@ use axum::{Json, Router};
 use fornax_types::redact::{redact_json, redact_text};
 use fornax_types::{IngestMessage, RuntimeCapabilities};
 use fornax_verify::{
-    CommandExecutedVerifier, CommandSuccessVerifier, TestResultVerifier, Verifier,
+    CommandExecutedVerifier, CommandSuccessVerifier, FileModifiedVerifier, TestResultVerifier,
+    Verifier,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -295,12 +296,13 @@ async fn handle_message(
 
             // FORNX-14: registry stays a flat Vec, per the ticket's own
             // maintainability requirement ("verifier registry/dispatch only
-            // as complex as the first real verifier set requires") — three
+            // as complex as the first real verifier set requires") — four
             // verifiers dispatched by `applies_to` doesn't yet justify more.
             let verifiers: Vec<Box<dyn Verifier + Send + Sync>> = vec![
                 Box::new(TestResultVerifier),
                 Box::new(CommandExecutedVerifier),
                 Box::new(CommandSuccessVerifier),
+                Box::new(FileModifiedVerifier),
             ];
             for verifier in verifiers.iter().filter(|v| v.applies_to(&claim)) {
                 let finding = verifier.verify(&claim, &evidence, &caps);
