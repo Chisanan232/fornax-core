@@ -701,6 +701,69 @@ mod tests {
         assert_eq!(first.evidence_ids, replayed.evidence_ids);
     }
 
+    /// FORNX-15 regression: `fornax-adapter-claude`'s `ClaudeBashExitCodeSensor`
+    /// synthesizes `exit_code: 1` whenever a Bash tool call's stderr is
+    /// non-empty, because Claude Code's real PostToolUse `tool_response`
+    /// carries no actual exit code field (documented capability gap, not a
+    /// real signal). A command that writes to stderr but genuinely exits 0
+    /// must not be reported as `Contradicted` against a "tests passed"
+    /// claim -- it must be flagged `Review`, since the heuristic cannot
+    /// actually confirm failure. Mirrors the exact payload shape produced by
+    /// `post_tool_use_real_shape_stderr_nonempty_infers_heuristic_failure`
+    /// in `fornax-adapter-claude`.
+    #[test]
+    fn heuristic_stderr_nonempty_failure_is_review_not_contradicted() {
+        let v = TestResultVerifier;
+        let c = claim("All tests passed.");
+        let ev = vec![Evidence {
+            id: Uuid::new_v4(),
+            session_id: "s1".into(),
+            source_event_id: Uuid::new_v4(),
+            kind: EvidenceKind::ExitCode,
+            observed_at: chrono::Utc::now().to_rfc3339(),
+            payload: serde_json::json!({
+                "command": "pytest",
+                "exit_code": 1,
+                "heuristic": true,
+            }),
+            provenance: "claude_code:1.2.3:PostToolUse:Bash#heuristic:stderr_nonempty".into(),
+            source: None,
+            extension: None,
+        }];
+        let f = v.verify(&c, &ev, &caps());
+        assert_eq!(f.verdict, Verdict::Review);
+        assert_eq!(f.evidence_ids, vec![ev[0].id]);
+    }
+
+    /// Companion to the above: `heuristic:interrupted` is an explicit real
+    /// signal from Claude Code (the user genuinely killed/interrupted the
+    /// command), not an unreliable inference, so a nonzero exit_code from
+    /// that reason must still produce `Contradicted` -- proving the
+    /// downgrade above didn't get accidentally widened to the wrong case.
+    #[test]
+    fn heuristic_interrupted_failure_still_contradicts() {
+        let v = TestResultVerifier;
+        let c = claim("All tests passed.");
+        let ev = vec![Evidence {
+            id: Uuid::new_v4(),
+            session_id: "s1".into(),
+            source_event_id: Uuid::new_v4(),
+            kind: EvidenceKind::ExitCode,
+            observed_at: chrono::Utc::now().to_rfc3339(),
+            payload: serde_json::json!({
+                "command": "pytest",
+                "exit_code": 130,
+                "heuristic": true,
+            }),
+            provenance: "claude_code:1.2.3:PostToolUse:Bash#heuristic:interrupted".into(),
+            source: None,
+            extension: None,
+        }];
+        let f = v.verify(&c, &ev, &caps());
+        assert_eq!(f.verdict, Verdict::Contradicted);
+        assert_eq!(f.evidence_ids, vec![ev[0].id]);
+    }
+
     /// FORNX-159 AC: "Provenance fields remain stable under replay." Extends
     /// `recomputing_from_the_same_persisted_inputs_is_deterministic` above
     /// (FORNX-27's replay contract) with evidence that actually carries the
@@ -990,5 +1053,59 @@ mod command_success_verifier_tests {
         assert_eq!(first.verdict, replayed.verdict);
         assert_eq!(first.rationale, replayed.rationale);
         assert_eq!(first.evidence_ids, replayed.evidence_ids);
+    }
+
+    /// FORNX-15 regression: same false-`Contradicted` bug as
+    /// `TestResultVerifier`, exercised through `CommandSuccessVerifier`'s
+    /// own named-command matching path.
+    #[test]
+    fn heuristic_stderr_nonempty_failure_is_review_not_contradicted() {
+        let v = CommandSuccessVerifier;
+        let c = crate::tests::claim_for("command_succeeded", "The `npm install` succeeded.");
+        let ev = vec![Evidence {
+            id: Uuid::new_v4(),
+            session_id: "s1".into(),
+            source_event_id: Uuid::new_v4(),
+            kind: EvidenceKind::ExitCode,
+            observed_at: chrono::Utc::now().to_rfc3339(),
+            payload: serde_json::json!({
+                "command": "npm install",
+                "exit_code": 1,
+                "heuristic": true,
+            }),
+            provenance: "claude_code:1.2.3:PostToolUse:Bash#heuristic:stderr_nonempty".into(),
+            source: None,
+            extension: None,
+        }];
+        let f = v.verify(&c, &ev, &caps());
+        assert_eq!(f.verdict, Verdict::Review);
+        assert_eq!(f.evidence_ids, vec![ev[0].id]);
+    }
+
+    /// Companion: `heuristic:interrupted` remains a real signal and still
+    /// contradicts, proving the downgrade wasn't widened past its intended
+    /// scope.
+    #[test]
+    fn heuristic_interrupted_failure_still_contradicts() {
+        let v = CommandSuccessVerifier;
+        let c = crate::tests::claim_for("command_succeeded", "The `npm install` succeeded.");
+        let ev = vec![Evidence {
+            id: Uuid::new_v4(),
+            session_id: "s1".into(),
+            source_event_id: Uuid::new_v4(),
+            kind: EvidenceKind::ExitCode,
+            observed_at: chrono::Utc::now().to_rfc3339(),
+            payload: serde_json::json!({
+                "command": "npm install",
+                "exit_code": 130,
+                "heuristic": true,
+            }),
+            provenance: "claude_code:1.2.3:PostToolUse:Bash#heuristic:interrupted".into(),
+            source: None,
+            extension: None,
+        }];
+        let f = v.verify(&c, &ev, &caps());
+        assert_eq!(f.verdict, Verdict::Contradicted);
+        assert_eq!(f.evidence_ids, vec![ev[0].id]);
     }
 }
