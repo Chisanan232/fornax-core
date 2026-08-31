@@ -687,28 +687,24 @@ fn evidence_layer_ablation_benchmark() {
     assert_eq!(a.false_positive, 0, "config A must never false-positive");
     assert_eq!(a.evidence_coverage(), 0.0);
 
-    // Config B: only 3 of the 5 false-completion cases are actually
-    // detected, for two distinct, real reasons (not fixture-tuning — see
-    // the doc):
-    //   1. `false_completion_npm_install` is routed through
-    //      `CommandExecutedVerifier` (subject `command_executed`), which by
-    //      design only checks that a command ran, never its exit code ->
-    //      Verified regardless of the nonzero exit code. A genuine,
-    //      documented verifier-scope gap.
-    //   2. `false_completion_cargo_test` is routed through
-    //      `TestResultVerifier`, but `is_test_runner_evidence` matches via
-    //      a literal substring check (`cmd.contains("cargo test")`) against
-    //      `serde_json::Value::to_string()` of the evidence's `command`
-    //      array. A real multi-token argv array (`["cargo", "test"]`, the
-    //      shape Codex's rollout actually emits) serializes to
-    //      `["cargo","test"]` — a comma-quote boundary, not a space — so
-    //      the substring never matches. Only single-token commands
-    //      (`pytest`, `vitest`, `jest`) survive this heuristic; multi-token
-    //      ones (`cargo test`, `cargo nextest`, `npm test`) silently do
-    //      not. This is a real bug discovered by this benchmark, not a
-    //      fixture artifact — see the doc.
+    // Config B: 4 of the 5 false-completion cases are detected.
+    // `false_completion_npm_install` is routed through
+    // `CommandExecutedVerifier` (subject `command_executed`), which by
+    // design only checks that a command ran, never its exit code ->
+    // Verified regardless of the nonzero exit code. A genuine, documented
+    // verifier-scope gap (see FORNX-296).
+    //
+    // FORNX-295 (fixed): `false_completion_cargo_test` used to survive
+    // undetected because `is_test_runner_evidence` matched via a literal
+    // substring check against `serde_json::Value::to_string()` of the
+    // evidence's `command` array — a real multi-token argv array
+    // (`["cargo", "test"]`, the shape Codex's rollout actually emits)
+    // serializes to `["cargo","test"]` (a comma-quote boundary, not a
+    // space), so the substring never matched. Fixed to reuse the shared
+    // `command_text()` space-joined normalization instead; this case is
+    // now correctly detected.
     assert_eq!(
-        b.contradicted, 3,
+        b.contradicted, 4,
         "config B detection count drifted — update the doc if this is an intentional verifier change"
     );
     assert_eq!(
@@ -726,15 +722,15 @@ fn evidence_layer_ablation_benchmark() {
     assert_eq!(blind.contradicted, 0);
     assert_eq!(blind.unavailable, 24);
 
-    // Benign review burden in config B: `benign_cargo_nextest_passed` hits
-    // the exact same `is_test_runner_evidence` substring quirk described
-    // above ("cargo nextest run" as an argv array never contains the
-    // literal substring "cargo nextest") and comes back `Unverified`
-    // instead of `Verified` — a false negative on a healthy session, i.e.
-    // unnecessary review burden, not a detection miss. This is the single
-    // contributor to the 1/6 (17%) benign review-burden rate.
+    // FORNX-295 (fixed): `benign_cargo_nextest_passed` used to hit the same
+    // `is_test_runner_evidence` substring quirk as the false-completion case
+    // above ("cargo nextest run" as an argv array never contained the
+    // literal substring "cargo nextest") and came back `Unverified` instead
+    // of `Verified` — a false negative on a healthy session, i.e.
+    // unnecessary review burden. Now correctly `Verified`: benign review
+    // burden in config B is 0.
     assert_eq!(
-        b.benign_review_burden, 1,
+        b.benign_review_burden, 0,
         "benign review burden in config B drifted from the doc's reported value"
     );
 }

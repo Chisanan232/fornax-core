@@ -23,8 +23,9 @@ a gap papered over with a synthetic C/D.
 What *was* built and *is* real: a replay harness that runs a frozen,
 non-cherry-picked fixture set through the actual verifiers deterministically,
 and measures what the one real evidence layer (claim-only vs.
-claim+ExitCode) actually buys today. Those numbers are below, unmodified
-from the test run that produced them.
+claim+ExitCode) actually buys today. Those numbers are below, taken directly
+from the current test run — updated once, after FORNX-295 (a real bug this
+benchmark surfaced) was fixed the same day; see "Follow-ups."
 
 ## What this benchmark is, precisely
 
@@ -112,8 +113,8 @@ verdicts: verified=0 unverified=24 contradicted=0 unavailable=0 review=0
 precision=undefined (0/0) recall=0% evidence_coverage=0% benign_review_burden=100% (n=24, benign_n=6)
 
 === Configuration: B=C=D (ExitCode evidence, full verifier pipeline) ===
-verdicts: verified=6 unverified=14 contradicted=3 unavailable=1 review=0
-precision=100% recall=17% evidence_coverage=79% benign_review_burden=17% (n=24, benign_n=6)
+verdicts: verified=7 unverified=12 contradicted=4 unavailable=1 review=0
+precision=100% recall=22% evidence_coverage=79% benign_review_burden=0% (n=24, benign_n=6)
 
 === Configuration: capability-blind (evidence present, runtime opaque) ===
 verdicts: verified=0 unverified=0 contradicted=0 unavailable=24 review=0
@@ -124,11 +125,11 @@ Per-category breakdown, config B (the only configuration where anything
 interesting happens):
 
 ```
-false_completion         n=5   verified=1 unverified=1 contradicted=3 unavailable=0 review=0
+false_completion         n=5   verified=1 unverified=0 contradicted=4 unavailable=0 review=0
 unsupported_claim        n=5   verified=0 unverified=5 contradicted=0 unavailable=0 review=0
 hallucinated_execution   n=5   verified=0 unverified=5 contradicted=0 unavailable=0 review=0
 omitted_evidence         n=4   verified=1 unverified=2 contradicted=0 unavailable=1 review=0
-benign_healthy           n=5   verified=4 unverified=1 contradicted=0 unavailable=0 review=0
+benign_healthy           n=5   verified=5 unverified=0 contradicted=0 unavailable=0 review=0
 ```
 
 Full per-configuration, per-category tables and the raw marginal-value
@@ -144,11 +145,11 @@ behavior that no longer exists.
 
 | Metric | A (no evidence) | B=C=D (ExitCode evidence) | Delta |
 |---|---|---|---|
-| Contradicted (detections) | 0 | 3 | **+3** |
-| Recall | 0% (see note) | 17% | **+17pp** |
+| Contradicted (detections) | 0 | 4 | **+4** |
+| Recall | 0% (see note) | 22% | **+22pp** |
 | Precision | undefined (0/0) | 100% | now defined |
 | Evidence coverage | 0% | 79% (19/24) | +79pp |
-| Benign review burden | 100% (every case is `Unverified`, so every benign case burdens review) | 17% (1/6) | **−83pp** |
+| Benign review burden | 100% (every case is `Unverified`, so every benign case burdens review) | 0% (0/6) | **−100pp** |
 
 Note on config A's recall: with zero detections and 18 ground-truth-positive
 cases (5 false-completion + 5 unsupported + 5 hallucinated + 3 of 4
@@ -157,20 +158,21 @@ omitted), recall = 0/18 = 0%, not undefined — recall's denominator
 (`TP + FP`) is 0/0 and is reported as undefined, per the mapping above.
 
 **Going from claim-only to claim+ExitCode evidence is the entire
-measurable effect in this codebase today.** It moves 3 genuine detections
-from impossible to real, and it cuts benign review burden by 83 percentage
+measurable effect in this codebase today.** It moves 4 genuine detections
+from impossible to real, and it cuts benign review burden by 100 percentage
 points (from "every healthy session looks the same as every unhealthy one,
-because nothing is ever verified" to "only 1 in 6 healthy sessions still
-requires a human look"). That is a real, substantial, honestly-measured
+because nothing is ever verified" to "no healthy session requires a human
+look"). That is a real, substantial, honestly-measured
 effect — attributable entirely to the first evidence layer.
 
 ### Two real detectability gaps this benchmark surfaced (not fixture bugs)
 
 The false-completion category was constructed as "obviously should be
-caught" (a claim of success contradicted by a nonzero exit code) and yet
-only 3 of 5 cases (60%) are actually caught. The two misses are genuine,
-reproducible findings about the current verifiers, not artifacts of
-fixture phrasing:
+caught" (a claim of success contradicted by a nonzero exit code). At the
+time this benchmark first ran, only 3 of 5 cases (60%) were actually
+caught; one of the two misses (below) has since been fixed as FORNX-295,
+bringing this to 4 of 5 (80%). Both were genuine, reproducible findings
+about the current verifiers, not artifacts of fixture phrasing:
 
 1. **`CommandExecutedVerifier` never checks exit code, by design.** A
    claim like "I ran `npm install` and it worked" is routed by `subject`
@@ -200,12 +202,13 @@ fixture phrasing:
    sitting right there in the evidence. This same bug produces the
    benchmark's one benign-healthy false negative below.
 
-   This is a real, fixable bug: `is_test_runner_evidence` should match
+   **Fixed as FORNX-295**, same day: `is_test_runner_evidence` now matches
    against `command_text()` (the function that already joins argv tokens
    with spaces, used by the other two verifiers) instead of
-   `Value::to_string()`. It was left unfixed here — this ticket is scoped
-   to measurement, not to patching verifiers discovered along the way; see
-   "Follow-ups" below.
+   `Value::to_string()`. Left unfixed in the original benchmark PR — this
+   ticket was scoped to measurement, not to patching verifiers discovered
+   along the way — but filed and fixed immediately after as a real,
+   independent bug; see "Follow-ups" below.
 
 ### The other three required categories are structurally undetectable today
 
@@ -239,12 +242,15 @@ fixture phrasing:
   design intends: `Unavailable` is reserved for "we found the right
   evidence but it's missing the field we need," distinct from
   `Unverified`'s "we found no relevant evidence at all."
-- **Benign healthy**: 4 of 5 correctly `Verified`; 1
-  (`benign_cargo_nextest_passed`) is a false negative on a healthy session,
-  hitting the exact same `is_test_runner_evidence` substring bug described
-  above (`"cargo nextest run"` as an argv array never contains the literal
-  substring `"cargo nextest"`). This is the entire source of the 17% benign
-  review-burden figure in config B.
+- **Benign healthy**: all 5 correctly `Verified`. `benign_cargo_nextest_passed`
+  originally surfaced as a false negative on a healthy session, hitting the
+  same `is_test_runner_evidence` substring bug described above (`"cargo
+  nextest run"` as an argv array never contained the literal substring
+  `"cargo nextest"`) — the entire source of the original 17% benign
+  review-burden figure in config B. **Fixed same-day as FORNX-295**
+  (`is_test_runner_evidence` now reuses the shared `command_text()`
+  space-joined normalization instead of a raw `Value::to_string()`); benign
+  review burden in config B is now 0%.
 
 ## Capability-blind axis
 
@@ -264,8 +270,8 @@ owner's decision per the ticket's "final business interpretation remains
 owner decision," not as a declared conclusion.
 
 - Not **PIVOT**: the one evidence layer that exists produces a real,
-  substantial, honestly-measured effect (0 → 3 detections, 100% → 17% drop
-  in review burden). The underlying thesis — that evidence improves
+  substantial, honestly-measured effect (0 → 4 detections, 100% → 0% drop
+  in benign review burden). The underlying thesis — that evidence improves
   verification over claim-only — is not falsified by anything measured
   here. It has one real, positive data point behind it.
 - Not **CONTINUE** as currently scoped: the ticket's actual ask — measure
@@ -283,12 +289,14 @@ owner decision," not as a declared conclusion.
     either shipped adapter today. Any one of these becoming real, with a
     verifier that consumes it, is what would make a genuine C-layer
     measurement possible.
-  - Two concrete, low-risk bugs were found by this benchmark
-    (`is_test_runner_evidence`'s substring-vs-array mismatch;
-    `CommandExecutedVerifier`'s by-design exit-code blindness) that are
-    each worth their own ticket before the next ablation round, since they
-    currently suppress real detections independent of any new evidence
-    layer.
+  - Two concrete, low-risk bugs/design questions were found by this
+    benchmark and filed as their own tickets: `is_test_runner_evidence`'s
+    substring-vs-array mismatch (FORNX-295, fixed same day) and
+    `CommandExecutedVerifier`'s by-design exit-code blindness (FORNX-296,
+    a design question deferred to whoever builds claim extraction) — the
+    kind of thing worth catching before the next ablation round, since they
+    would otherwise suppress real detections independent of any new
+    evidence layer.
   - The hallucinated-execution-state category exposes a design ceiling
     (absence of the named command's evidence is indistinguishable from
     absence of any evidence) that a future evidence or verifier design
@@ -296,12 +304,14 @@ owner decision," not as a declared conclusion.
 
 ## Follow-ups (not fixed as part of this ticket — scope is measurement)
 
-- Fix `is_test_runner_evidence` to match against `command_text()` instead
-  of `Value::to_string()`, so multi-token test-runner invocations
-  (`cargo test`, `cargo nextest run`, `npm test`) are recognized the same
-  way `CommandExecutedVerifier`/`CommandSuccessVerifier` already recognize
-  multi-token commands.
-- Decide, as a design question (not silently in a verifier tweak), whether
+- ~~Fix `is_test_runner_evidence` to match against `command_text()` instead
+  of `Value::to_string()`~~ — **done, FORNX-295**, same day: multi-token
+  test-runner invocations (`cargo test`, `cargo nextest run`, `npm test`)
+  are now recognized the same way `CommandExecutedVerifier`/
+  `CommandSuccessVerifier` already recognize multi-token commands. The
+  results above already reflect this fix.
+- Decide, as a design question (not silently in a verifier tweak — tracked
+  as FORNX-296), whether
   `CommandExecutedVerifier` should ever consult exit code, or whether claim
   extraction should route "ran and it worked"-style claims to
   `CommandSuccessVerifier` instead.
