@@ -28,6 +28,65 @@ fn dirs_home() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
 }
 
+/// Single-instance guard (FORNX-12): a stale socket file left behind by an
+/// unclean shutdown must not be confused with a second `fornaxd` already
+/// live. Probe the existing path with a real connection attempt — a live
+/// listener accepts it, a stale file refuses it — instead of unconditionally
+/// deleting the path and silently stealing the socket out from under a
+/// running daemon.
+async fn ensure_single_instance(sock_path: &PathBuf) -> anyhow::Result<()> {
+    if sock_path.exists() {
+        match UnixStream::connect(sock_path).await {
+            Ok(_) => {
+                anyhow::bail!(
+                    "fornaxd is already running: another daemon is live on {} — \
+                     stop it first (e.g. `fornax daemon stop`) before starting a new one",
+                    sock_path.display()
+                );
+            }
+            Err(_) => {
+                // Nothing is listening: a stale file from a previous unclean
+                // shutdown (crash, kill -9, power loss). Safe to reclaim.
+                tracing::warn!(
+                    path = %sock_path.display(),
+                    "removing stale socket file from a previous unclean shutdown"
+                );
+                std::fs::remove_file(sock_path)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolves to `()` once SIGTERM or SIGINT/Ctrl-C is received, for use with
+/// `axum::serve(..).with_graceful_shutdown(..)` (FORNX-12: no signal handling
+/// existed before this — the process could only be killed uncleanly).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to install SIGTERM handler");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("received Ctrl-C, shutting down"),
+        _ = terminate => tracing::info!("received SIGTERM, shutting down"),
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     store: fornax_store::Store,
@@ -61,8 +120,13 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&home)?;
     let db_path = home.join("fornax.db");
     let sock_path = home.join("fornax.sock");
-    if sock_path.exists() {
-        std::fs::remove_file(&sock_path)?;
+    let pid_path = home.join("fornaxd.pid");
+    ensure_single_instance(&sock_path).await?;
+    // Written for `fornax daemon stop` to find this process (FORNX-12). Best
+    // effort: a daemon that can't write its own pid file still runs, it just
+    // can't be stopped via the CLI convenience command.
+    if let Err(e) = std::fs::write(&pid_path, std::process::id().to_string()) {
+        tracing::warn!(error = %e, "failed to write pid file");
     }
 
     let store = fornax_store::Store::open(&db_path).await?;
@@ -72,9 +136,10 @@ async fn main() -> anyhow::Result<()> {
         processing: Arc::new(Mutex::new(())),
     };
 
+    let uds_sock_path = sock_path.clone();
     let uds_state = state.clone();
     let uds_task = tokio::spawn(async move {
-        if let Err(e) = run_uds_server(&sock_path, uds_state).await {
+        if let Err(e) = run_uds_server(&uds_sock_path, uds_state).await {
             tracing::error!(error = %e, "UDS server exited");
         }
     });
@@ -91,9 +156,18 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(4317);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     tracing::info!(port, "fornax localhost dashboard listening");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
 
+    // FORNX-12: on a clean shutdown (SIGTERM/Ctrl-C), stop accepting new UDS
+    // connections and reclaim both filesystem artifacts so the next start
+    // doesn't have to distinguish "stale from a clean stop" from "stale from
+    // a crash" — there's nothing left to distinguish.
     uds_task.abort();
+    let _ = std::fs::remove_file(&sock_path);
+    let _ = std::fs::remove_file(&pid_path);
+    tracing::info!("fornaxd stopped");
     Ok(())
 }
 
@@ -390,6 +464,63 @@ mod tests {
             "expected a redacted placeholder in stored claim text: {}",
             stored_claims[0].text
         );
+    }
+
+    /// FORNX-12 regression: no socket file at all is the ordinary first-boot
+    /// case — must not error.
+    #[tokio::test]
+    async fn ensure_single_instance_allows_first_boot_with_no_socket() {
+        let sock_path = std::env::temp_dir().join(format!("fornax-test-{}.sock", Uuid::new_v4()));
+        assert!(!sock_path.exists());
+        ensure_single_instance(&sock_path)
+            .await
+            .expect("no existing socket must never block startup");
+    }
+
+    /// FORNX-12 regression: a leftover socket *file* with nothing listening
+    /// on it (the daemon's previous process crashed/was killed -9) must be
+    /// reclaimed, not mistaken for a live instance.
+    #[tokio::test]
+    async fn ensure_single_instance_reclaims_a_stale_socket_file() {
+        let sock_path = std::env::temp_dir().join(format!("fornax-test-{}.sock", Uuid::new_v4()));
+        // A plain file at the socket path (not an actual bound socket) is
+        // exactly what a crash leaves behind: the inode exists, nothing
+        // accepts connections on it.
+        std::fs::write(&sock_path, b"stale").expect("write stale socket file");
+
+        ensure_single_instance(&sock_path)
+            .await
+            .expect("a stale socket file must be reclaimed, not treated as a live instance");
+        assert!(
+            !sock_path.exists(),
+            "stale socket file should have been removed"
+        );
+    }
+
+    /// FORNX-12 regression: a second daemon must refuse to start — loudly —
+    /// rather than deleting the first daemon's live socket out from under it.
+    #[tokio::test]
+    async fn ensure_single_instance_refuses_when_another_daemon_is_live() {
+        let sock_path = std::env::temp_dir().join(format!("fornax-test-{}.sock", Uuid::new_v4()));
+        let listener = UnixListener::bind(&sock_path).expect("bind first instance's socket");
+        // Keep the listener alive for the duration of the check by accepting
+        // in the background; the guard only needs *something* live on the
+        // other end of `connect`.
+        let _accept_task = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+
+        let result = ensure_single_instance(&sock_path).await;
+        assert!(
+            result.is_err(),
+            "starting a second instance while one is live must be refused"
+        );
+        assert!(
+            sock_path.exists(),
+            "the first instance's live socket must not be deleted"
+        );
+
+        let _ = std::fs::remove_file(&sock_path);
     }
 
     /// FORNX-288 regression: a session that submits a Claim before any
