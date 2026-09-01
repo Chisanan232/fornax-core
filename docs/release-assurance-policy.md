@@ -22,7 +22,7 @@ only what no other ticket, done or planned, already owns:
 | QA sign-off artifact format, worker evidence schema, finding lifecycle | FORNX-232 | To Do |
 | Security gate skill, versioned threat model, trust-boundary delta record | FORNX-233 | To Do |
 | Post-release smoke/canary/rollback automation | FORNX-236 | To Do |
-| Release-docs/changelog/website-impact workflow | FORNX-216 | To Do |
+| Release-docs/changelog/website-impact workflow | FORNX-216 | Done |
 | **Risk classification, assurance-depth policy, verdict semantics, blocker taxonomy, waiver policy, the canonical relay, degraded-CI evidence policy** | **FORNX-229 (this doc)** | This ticket |
 
 Notably, FORNX-233 already names the four risk/change classes used below
@@ -44,9 +44,11 @@ journey tiers) that catalog must satisfy.
   risk; risk instead governs *what must be true inside* a gate's sign-off
   before it may be recorded as Done (see "Assurance depth by risk class"
   below) — this keeps the shipped checker's "all four gates always
-  required" behavior correct as-is. No `risk_class` manifest field exists
-  today; adding one is out of scope for this docs-only ticket and is
-  tracked as follow-up for FORNX-231 (which owns the manifest schema).
+  required" behavior correct as-is. An optional `risk_class` manifest field
+  is now defined in
+  [`docs/release-candidate-evidence.md`](release-candidate-evidence.md)
+  (FORNX-231, which owns the manifest schema); `release-readiness.sh` itself
+  still does not read or enforce it.
 - **`scripts/release-execute.sh`** (FORNX-235, `docs/release-execute.md`)
   performs the canonical relay's `Release` and post-`Release` mechanics:
   tag creation (immutable, never moved), canonical GitHub Release,
