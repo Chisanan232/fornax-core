@@ -18,9 +18,9 @@
     },
     {
       "id": "SEC-v0.0.1-0002",
-      "severity": "high",
-      "title": "npm audit (fornax-docs): 24 findings (18 high), transitive through Docusaurus 3.10.2's dev-server dependency chain",
-      "evidence": "npm audit fornax-docs: 24 findings, 18 high; affects local dev server only, not the published static site; no clean fix without a Docusaurus major bump",
+      "severity": "low",
+      "title": "npm audit (fornax-docs): 24 findings (18 rated high by npm), transitive through Docusaurus 3.10.2's dev-server dependency chain",
+      "evidence": "npm audit fornax-docs: 24 findings, 18 rated high by npm's own advisory severity; every one of the 18 is reachable only through the local Docusaurus dev server, never through the published static site fornax-docs actually ships (static HTML/JS with no dev-server process running in production); no clean fix without a Docusaurus major bump. Severity here is rated at its effective severity to this candidate (unreachable in the shipped artifact), not npm's upstream advisory rating; the reachability argument that justifies the downgrade is stated here rather than left implicit.",
       "disposition": "accepted_risk",
       "waiver_ref": null
     },

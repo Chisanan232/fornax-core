@@ -96,6 +96,15 @@ already accepted-risk in `release/v0.0.1-security-signoff.json`
 corresponding sign-off finding is a process violation, not a CI
 convenience.
 
+### Known limitation
+
+The new `security` CI job is not (yet) a required status check on `main`
+branch protection — only the `rust` job is (`.github/workflows/ci.yml`'s
+own comment explains why that job's name can't change). A PR can merge
+with a red `security` job until an owner adds it to the required-checks
+list, the same "not wired into a CI pipeline trigger" caveat
+`docs/release-readiness.md` already states for its own script.
+
 ## Versioned threat model
 
 The durable, versioned threat model lives at
@@ -187,6 +196,14 @@ that script.
   manifest `version` must appear in the ticket text) — this schema makes
   that binding structured and machine-checkable at the artifact level too,
   rather than relying solely on substring matching over prose.
+- **`severity` is effective severity to this candidate, not an upstream
+  advisory's own rating.** A scanner (e.g. `npm audit`) may rate a finding
+  `high` while it is genuinely unreachable in what actually ships (a
+  dev-server-only dependency chain never present in the published
+  artifact, for example). `severity` records the reachability-adjusted
+  rating, and `evidence` must state the reachability argument explicitly
+  whenever `severity` is rated below the scanner's own rating — silently
+  downgrading severity with no stated reason is not permitted.
 - **Machine-checkable verdict rule**: `verdict` must be the worst of
   `findings[].severity`/`disposition` — any `critical` or `high` finding
   with `disposition` other than `fixed` or a fully policy-compliant
@@ -199,6 +216,20 @@ that script.
   artifact cannot represent "trust boundary changed, no delta reviewed" as
   a valid `PASS`, mirroring FORNX-231's "NOT_COVERED carries a
   remediation_jira_key" fail-closed convention.
+- **Known gap this convention closes, not the shipped checker**:
+  `release-readiness.sh`'s `not_blocked` check greps the sign-off ticket's
+  text for the literal token `BLOCK` only — a Done ticket carrying a
+  security sign-off whose `verdict` is `INCONCLUSIVE` or `UNTESTED` (both
+  of which block per FORNX-229's verdict semantics, "no fake PASS") passes
+  every check that script runs today, since neither word is `BLOCK`. This
+  document's rule closes that gap procedurally rather than mechanically:
+  a security sign-off whose `verdict` is not `PASS` must either keep the
+  gate ticket out of `Done`, or include the literal token `BLOCK`
+  somewhere in the ticket text, so `not_blocked` actually fires. This is a
+  process convention this document establishes, not a claim that
+  `release-readiness.sh` itself reads `verdict`, `INCONCLUSIVE`, or
+  `UNTESTED` — see the AC-bullet map below for where this distinction
+  matters.
 
 ## Negative/falsification controls
 
@@ -284,12 +315,21 @@ ajv validate -s release/trust-boundary-delta.schema.json -d release/v0.0.1-trust
 
 Both instances validate against their schemas.
 
-**Schema negative control** (proves the schema actually rejects an invalid
-sign-off rather than accepting anything): a `findings[]` entry with
-`disposition: "waived"` and `waiver_ref: null` was appended to a copy of
-`release/v0.0.1-security-signoff.json` and re-validated — `ajv` correctly
-reported it invalid (`waiver_ref must be string`), confirming the
-waiver-binding rule is enforced, not decorative.
+**Schema negative controls** (prove the schema actually rejects invalid
+sign-offs rather than accepting anything):
+
+- A `findings[]` entry with `disposition: "waived"` and `waiver_ref: null`
+  was appended to a copy of `release/v0.0.1-security-signoff.json` and
+  re-validated — `ajv` correctly reported it invalid (`waiver_ref must be
+  string`), confirming the waiver-binding rule is enforced, not decorative.
+- A candidate with `risk_class: "TRUST_BOUNDARY"` and
+  `trust_boundary_delta_ref: null` was validated two ways: with
+  `threat_model_version` also missing (rejected: `must have required
+  property 'threat_model_version'`) and with `threat_model_version`
+  present but `trust_boundary_delta_ref` still `null` (rejected:
+  `trust_boundary_delta_ref must be string`) — confirming the
+  risk-class-conditional binding is enforced in both directions, not only
+  documented prose.
 
 **`cargo audit` job negative control** (proves the CI check is non-vacuous,
 per this ticket's AC): run locally with `.cargo/audit.toml` temporarily
@@ -319,7 +359,7 @@ traceably ignored — not because the check is a no-op.
 | Skill/runbook exists with explicit risk tiers and BLOCK semantics | This document as a whole; "Security-specific assurance depth by risk class" |
 | Versioned threat model and trust-boundary delta are durable and linked to release evidence | "Versioned threat model"; "Trust-boundary delta record" |
 | Security sign-off is exact-candidate-bound and machine-checkable | "Security sign-off artifact" |
-| Missing or non-PASS security sign-off prevents release readiness | Already mechanically enforced by `scripts/release-readiness.sh`'s existing `evidence.security.*` checks (FORNX-234); this document's artifact is written to satisfy those checks without requiring any change to that script |
+| Missing or non-PASS security sign-off prevents release readiness | A missing sign-off, a non-Done sign-off, or a sign-off explicitly carrying the literal token `BLOCK` is already mechanically caught by `scripts/release-readiness.sh`'s existing `evidence.security.*` checks (FORNX-234). A sign-off whose `verdict` is `INCONCLUSIVE` or `UNTESTED` is **not** mechanically caught by that script today (it only greps for `BLOCK`) — "Security sign-off artifact" above establishes the procedural convention (non-`PASS` keeps the ticket out of `Done`, or the ticket text must literally say `BLOCK`) that closes this gap without changing the shipped checker |
 | High/Critical unresolved findings block release unless an explicit policy-compliant owner disposition is recorded | "Security sign-off artifact" (machine-checkable verdict rule), deferring to FORNX-229's waiver policy for what "policy-compliant" means |
 | Synthetic/adversarial security fixtures never contain real secrets | "Synthetic/adversarial fixtures never contain real secrets" |
 | Negative controls prove at least key egress/auth/redaction/security checks are non-vacuous | "Negative/falsification controls" |
