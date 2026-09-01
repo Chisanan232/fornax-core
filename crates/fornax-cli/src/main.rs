@@ -589,13 +589,15 @@ async fn export_spool_from_store(
         // filename, matching that same convention.
         //
         // FORNX-155: the domain `RuntimeCapabilities` now carries
-        // `schema_version`/`signals`, which fornax-cloud's
-        // `fornax-uploader::types::RuntimeCapabilities` (a separate,
-        // out-of-scope repo) does not know about. Project to the frozen
-        // flat-bool wire shape at the export boundary so the spool envelope
-        // stays byte-for-byte wire-compatible — see
+        // `schema_version`/`signals`. FORNX-301 additively includes both of
+        // those, plus `session_id`, on the exported wire shape so
+        // fornax-cloud can receive the rich per-signal taxonomy instead of
+        // only the down-projected bools — the nine legacy flat-bool keys
+        // remain unchanged, since `fornax-cloud`'s `device_capabilities`
+        // worker-gate consumer still reads exactly those. See
         // `fornax_types::capabilities::LegacyCapabilitiesWire`'s doc comment.
-        let legacy = fornax_types::LegacyCapabilitiesWire::from(caps);
+        let mut legacy = fornax_types::LegacyCapabilitiesWire::from(caps);
+        legacy.session_id = Some(session.to_string());
         write_envelope(&pending_dir, "capabilities", uuid::Uuid::new_v4(), &legacy)?;
     }
 
@@ -1396,12 +1398,11 @@ trust_level = \"trusted\"\n";
             assert!(types.contains(&"claim".to_string()));
             assert!(types.contains(&"evidence".to_string()));
 
-            // The emitted capabilities file must be wire-compatible with
-            // fornax-cloud's fornax-uploader::types::RuntimeCapabilities:
-            // the flat field set below, plus "type" — no extra fields such
-            // as a store-internal session_id/id (the cloud backend keys
-            // capabilities on (device_id, provider), never on an envelope
-            // id — see that crate's IngestMessage::canonical_id doc).
+            // The emitted capabilities file must remain wire-compatible
+            // with fornax-cloud's original fornax-uploader::types::
+            // RuntimeCapabilities nine-key shape (FORNX-301 adds
+            // session_id/schema_version/signals additively on top — see
+            // `LegacyCapabilitiesWire`'s doc comment).
             let caps_file = std::fs::read_dir(&pending_dir)
                 .unwrap()
                 .map(|e| e.unwrap().path())
@@ -1413,22 +1414,131 @@ trust_level = \"trusted\"\n";
                 .expect("capabilities file exists");
             let v: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(&caps_file).unwrap()).unwrap();
-            let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
-            keys.sort_unstable();
+            let keys: std::collections::HashSet<&str> =
+                v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+            let frozen = [
+                "notes",
+                "provider",
+                "supports_post_tool_use",
+                "supports_pre_tool_use",
+                "supports_session_stop_event",
+                "supports_subagent_lifecycle",
+                "supports_tool_response_capture",
+                "supports_transcript_tail",
+                "type",
+            ];
+            for key in frozen {
+                assert!(keys.contains(key), "frozen legacy key {key} missing");
+            }
+            // FORNX-301: session_id is set by export_spool_from_store from
+            // its `session` parameter, schema_version/signals come through
+            // `From<&RuntimeCapabilities>`.
+            assert_eq!(v["session_id"], "s-aha");
+            assert_eq!(v["schema_version"], fornax_types::CAPABILITY_SCHEMA_VERSION);
+            assert_eq!(v["signals"].as_array().unwrap().len(), 6);
+
+            std::fs::remove_file(&db_path).ok();
+            std::fs::remove_dir_all(&out_dir).ok();
+        }
+
+        /// FORNX-301: proves the byte-identical backward-compat guarantee
+        /// end-to-end through the real export path — a capabilities
+        /// announcement using only the legacy six bools (no rich `signals`)
+        /// still exports to exactly the original nine legacy keys, with no
+        /// `session_id`/`schema_version`/`signals` keys appearing, once
+        /// `notes` doesn't carry a session id of its own either. This is the
+        /// export-path counterpart to `fornax_types::capabilities`'s
+        /// `empty_signals_and_absent_session_id_serialize_to_exactly_the_original_nine_keys`
+        /// unit test — but `export_spool_from_store` always stamps
+        /// `session_id` from its `session` parameter, so this test instead
+        /// confirms the new keys are present and additive, not exact-set.
+        #[tokio::test]
+        async fn full_signal_capabilities_export_round_trips_every_field() {
+            let db_path = tmp_db_path("full-signals");
+            let store = seeded_store(&db_path).await;
+            let caps = RuntimeCapabilities {
+                schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
+                provider: Provider::Codex,
+                signals: vec![
+                    CapabilitySignal {
+                        class: SignalClass::ToolInvocation,
+                        state: SignalAvailability::Unsupported,
+                        detail: Some("rollout tail cannot intercept pre-execution".to_string()),
+                    },
+                    CapabilitySignal {
+                        class: SignalClass::ToolTrace,
+                        state: SignalAvailability::Available,
+                        detail: None,
+                    },
+                    CapabilitySignal {
+                        class: SignalClass::ProcessResult,
+                        state: SignalAvailability::CollectionFailed,
+                        detail: Some("no literal exit code in tool_response".to_string()),
+                    },
+                    CapabilitySignal {
+                        class: SignalClass::ReasoningSummary,
+                        state: SignalAvailability::Redacted,
+                        detail: None,
+                    },
+                    CapabilitySignal {
+                        class: SignalClass::InternalModelSignals,
+                        state: SignalAvailability::Unknown,
+                        detail: None,
+                    },
+                    CapabilitySignal {
+                        class: SignalClass::Unrecognized("neural_trace".to_string()),
+                        state: SignalAvailability::Unrecognized("quantum_entangled".to_string()),
+                        detail: None,
+                    },
+                ],
+                notes: [("session_id".to_string(), "s-1".to_string())].into(),
+            };
+            store
+                .upsert_capabilities("s-1", &caps)
+                .await
+                .expect("upsert capabilities");
+
+            let out_dir = std::env::temp_dir().join(format!("fornax-spool-{}", Uuid::new_v4()));
+            export_spool_from_store(&store, "s-1", &out_dir)
+                .await
+                .expect("export spool");
+
+            let pending_dir = out_dir.join("pending");
+            let caps_file = std::fs::read_dir(&pending_dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .find(|p| {
+                    let v: serde_json::Value =
+                        serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
+                    v["type"] == "capabilities"
+                })
+                .expect("capabilities file exists");
+            let v: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&caps_file).unwrap()).unwrap();
+
+            assert_eq!(v["type"], "capabilities");
+            assert_eq!(v["provider"], "codex");
+            assert_eq!(v["supports_pre_tool_use"], false);
+            assert_eq!(v["supports_post_tool_use"], true);
+            assert_eq!(v["supports_tool_response_capture"], false);
+            assert_eq!(v["supports_session_stop_event"], false);
+            assert_eq!(v["supports_transcript_tail"], false);
+            assert_eq!(v["supports_subagent_lifecycle"], false);
+            assert_eq!(v["session_id"], "s-1");
+            assert_eq!(v["schema_version"], fornax_types::CAPABILITY_SCHEMA_VERSION);
+
+            let signals = v["signals"].as_array().unwrap();
+            assert_eq!(signals.len(), 6);
+            assert_eq!(signals[0]["class"], "tool_invocation");
+            assert_eq!(signals[0]["state"], "unsupported");
             assert_eq!(
-                keys,
-                vec![
-                    "notes",
-                    "provider",
-                    "supports_post_tool_use",
-                    "supports_pre_tool_use",
-                    "supports_session_stop_event",
-                    "supports_subagent_lifecycle",
-                    "supports_tool_response_capture",
-                    "supports_transcript_tail",
-                    "type",
-                ]
+                signals[0]["detail"],
+                "rollout tail cannot intercept pre-execution"
             );
+            assert_eq!(signals[2]["class"], "process_result");
+            assert_eq!(signals[2]["state"], "collection_failed");
+            assert_eq!(signals[5]["class"], "neural_trace");
+            assert_eq!(signals[5]["state"], "quantum_entangled");
 
             std::fs::remove_file(&db_path).ok();
             std::fs::remove_dir_all(&out_dir).ok();
