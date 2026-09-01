@@ -74,6 +74,14 @@ whose scope was absorbed into this release; `v0.0.1` is the only prior tag.
 
 ### Known limitations
 
+- **`Evidence::source`/`Evidence::extension` bypass the redaction boundary.**
+  `fornax-daemon`'s `handle_message` redacts `Evidence::payload` before
+  persistence but never calls `redact_json` on `source` or `extension` — a
+  structural gap found while documenting this release, not introduced by it
+  (the boundary was already incomplete; `ExtensionEnvelope` just gives it a
+  real, populated field for the first time). Do not place unredacted
+  sensitive content in an extension payload until this is closed. See
+  `docs/privacy-redaction-policy.md`'s "Known gap" note.
 - **opencode's LLM tool-calling turn is stubbed, not fully autonomous, on
   local Ollama.** Every locally available Ollama tool-calling model reliably
   degrades real `tool_calls` into plain-text JSON once wrapped in opencode's

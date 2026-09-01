@@ -16,6 +16,12 @@ Also see, before you start:
   canonical `EvidenceKind`, this is the `ExtensionEnvelope` contract (schema
   versioning, unknown-field tolerance, and the promotion-to-canonical
   criteria) rather than inventing an ad hoc untyped field.
+- `docs/privacy-redaction-policy.md` — **read this before populating
+  `ExtensionEnvelope::fields`**: the redaction boundary in
+  `fornax-daemon`'s `handle_message` currently redacts `Evidence::payload`
+  only, not `Evidence::source`/`Evidence::extension` (a known, disclosed
+  gap, not fixed as of this writing). Do not put raw provider secrets or
+  unredacted sensitive text into an extension payload today.
 
 Together, this file plus the three docs above are the full extension
 contract FORNX-87 originally scoped as a single integration guide. They stay
