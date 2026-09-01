@@ -19,7 +19,7 @@ this skill's assets is a bug in this skill, not a valid override:
 |---|---|
 | Risk classes (`PATCH_LOW_RISK`/`FEATURE`/`TRUST_BOUNDARY`/`MAJOR_OR_GA`), assurance-depth-by-risk table, verdict semantics (`PASS`/`BLOCK`/`INCONCLUSIVE`/`UNTESTED`), blocker taxonomy, waiver policy, `CI_DEGRADED_EXTERNAL` | `docs/release-assurance-policy.md` (FORNX-229) |
 | Candidate manifest schema, `risk_class` field, feature-delta schema, golden-journey catalog, QA coverage reconciliation schema, shared surface vocabulary | `docs/release-candidate-evidence.md` (FORNX-231) |
-| Durable QA sign-off artifact format, finding lifecycle | FORNX-232 (not yet built — see "Worker evidence contract" below) |
+| Durable QA sign-off artifact format, worker evidence schema, finding lifecycle, verifier roles/handoff contract | `docs/release-qa-signoff.md` (FORNX-232) |
 | Security gate skill, threat model, trust-boundary delta record | FORNX-233 (not yet built) |
 | Mechanical gate enforcement (`scripts/release-readiness.sh`) | FORNX-234 |
 | Tag/build/publish/promotion mechanics | FORNX-235 |
@@ -40,7 +40,8 @@ count**, dispatch of those workers, and an honest aggregate verdict.
 - The candidate is not yet frozen (no manifest) — run Feature Delta/coverage
   reconciliation first.
 - You need the *durable* QA sign-off record — that artifact format is
-  FORNX-232's; this skill's output feeds it, but is not itself that record.
+  `docs/release-qa-signoff.md`'s (FORNX-232); this skill's output feeds it,
+  but is not itself that record.
 - You need to run the security gate — that is a separate skill (FORNX-233).
 - A single narrow bug needs reproduction — use the normal dev-impl-loop, not
   this coordinator.
@@ -84,8 +85,11 @@ below).
 
 ## Step 3 — Worker sizing (bounded by actual independent work)
 
-One worker per **selected** lane, never more workers than selected lanes,
-never fewer than the lanes actually need to stay non-overlapping:
+The unit of independent work is a lane, or — when a selected lane's depth
+(Step 2) pulls in multiple non-overlapping golden-journey groups or repos —
+a non-overlapping slice within that lane. Each worker owns exactly one
+lane or slice; two workers never cover the same surface. Total worker
+count across all lanes/slices is bounded by this band:
 
 | Selected lane count | Worker band |
 |---|---|
@@ -93,10 +97,15 @@ never fewer than the lanes actually need to stay non-overlapping:
 | 3–4 lanes (several independent surfaces) | 4–6 workers |
 | 5+ lanes, or any lane at `TRUST_BOUNDARY`+ depth (broad/high-risk) | 6–8 workers |
 
+A single selected lane at `PATCH_LOW_RISK`/`FEATURE` depth with nothing
+further to split stays at the low end of its band (as few as 1–2 workers);
+the band's upper numbers exist for when a lane's required depth genuinely
+splits into that many non-overlapping slices, not as a floor.
+
 **Anti-pattern: the ceiling as a target.** The upper bound of a band is not
-a goal to reach — a genuinely 2-lane `FEATURE` change gets 2–4 workers, full
-stop, even though the table's top band goes to 8. Do not pad worker count to
-look thorough.
+a goal to reach — do not split a lane into slices, or dispatch idle
+workers, merely to reach the top of its band. Worker count follows real
+independent work; it never leads it.
 
 No nested sub-agent explosion: a worker verifies its own lane directly. A
 worker that needs to fan out further is a sign the lane was drawn too
@@ -105,24 +114,37 @@ broadly — split the lane at Step 2, not by spawning sub-workers under it.
 ## Step 4 — Reuse existing CI evidence before re-running anything
 
 Before a worker re-runs a suite, check whether hosted CI already ran that
-exact suite against the exact candidate SHA and is currently green
-(`scripts/release-readiness.sh`'s `sha_on_main`/evidence checks, or the
-repo's own CI status API for that SHA). If so, the worker **cites** that
-run (SHA, workflow run URL/ID, result) instead of re-executing it.
-Independent reproduction is still required, per FORNX-229's depth table,
-for any suspected High/Critical finding at `TRUST_BOUNDARY`+ risk, and for
-any lane whose existing CI evidence is itself `CI_DEGRADED_EXTERNAL` — in
-that case follow FORNX-229's local-CI-equivalent-manifest policy rather than
-treating the outage itself as a pass or a block.
+exact suite against the exact candidate SHA and is currently green — the
+repo's own Actions/workflow-run status for that SHA (e.g. `gh run list
+--commit <sha>`, `gh pr checks`), or a `CI_DEGRADED_EXTERNAL` local
+CI-equivalent verification manifest per FORNX-229 when hosted CI could not
+execute. `scripts/release-readiness.sh` is a **different** signal and does
+not itself answer this question — it verifies gate-evidence *presence*
+(each of qa/security/docs/stage points at a Done, non-BLOCK,
+candidate-referenced Jira ticket) and that a repo's SHA is real and on
+`main` (`sha_on_main`); it has no awareness of whether any CI suite ran or
+what its result was. Use it only to confirm the SHA a worker is citing CI
+evidence for is genuinely the candidate's SHA, never as the CI-greenness
+source itself.
+
+If hosted CI is green for the exact SHA, the worker **cites** that run
+(SHA, workflow run URL/ID, result) instead of re-executing it. Independent
+reproduction is still required, per FORNX-229's depth table, for any
+suspected High/Critical finding at `TRUST_BOUNDARY`+ risk, and for any lane
+whose existing CI evidence is itself `CI_DEGRADED_EXTERNAL` — in that case
+follow FORNX-229's local-CI-equivalent-manifest policy rather than treating
+the outage itself as a pass or a block.
 
 ## Step 5 — Dispatch workers with a compact evidence contract
 
-See [`worker-evidence-contract.md`](worker-evidence-contract.md) for the
-exact shape. Workers return **compact evidence**: verdict, evidence
-pointers (paths/SHAs/run IDs/log excerpts), and blocked/untested surfaces —
-never chain-of-thought, and never a raw log dump. A worker that cannot
-produce a confident `PASS`/`BLOCK` reports `INCONCLUSIVE`, not a rounded-up
-guess.
+Workers return `docs/release-qa-signoff.md` §2's evidence schema
+(`STATUS`/`BASELINE`/`VERIFIED`/`SUSPECTED_FINDINGS`/`UNTESTED_OR_BLOCKED`/
+`CONFIDENCE`) — compact evidence with pointers (paths/SHAs/run IDs), never
+chain-of-thought or a raw log dump. See
+[`worker-evidence-contract.md`](worker-evidence-contract.md) for the one
+thing this skill adds on top (lane tagging) and how a lane result rolls up
+into Step 6's aggregate verdict. A worker that cannot produce a confident
+result reports `STATUS: PARTIAL` or `BLOCKED`, not a rounded-up `COMPLETE`.
 
 ## Step 6 — Aggregate verdict
 

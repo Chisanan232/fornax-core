@@ -1,7 +1,7 @@
 # Lane ↔ surface mapping
 
 Jira: FORNX-230. This is the mechanism behind [`SKILL.md`](SKILL.md)'s
-Step 2 — it turns FORNX-231's 13-value shared surface vocabulary
+Step 2 — it turns FORNX-231's shared surface vocabulary
 (`docs/release-candidate-evidence.md`) into the 8 verification lanes named
 in FORNX-230's own scope, so lane selection is a mechanical join rather than
 a judgment call made fresh per release.
@@ -17,16 +17,17 @@ policy change, never inferred ad hoc by a worker.
 | Local/runtime | `daemon_socket`, `cli` | Local daemon/socket behavior, CLI commands, fresh-checkout local flows. |
 | Adapters/providers | `adapter_provider_input` | `fornax-hook-claude`/`fornax-hook-codex` input handling and event-shape correctness against the installed CLI. |
 | Evidence/verifier semantics | `evidence_provenance`, `judge_replay_execution` | Five-state finding vocabulary correctness, evidence/provenance integrity, judge/replay execution. |
-| Cloud/API/data | `cloud_identity_tenant`, `public_api_schema_migration` | Cloud ingest/backend API behavior, tenant/identity authorization, schema/migration correctness. |
-| Browser/SaaS | `browser_rendering_injection` | SaaS Evidence dashboard rendering, injection-surface checks (XSS-class). |
+| Cloud/API/data | `cloud_identity_tenant`, `public_api_schema_migration`, `egress_redaction` | Cloud ingest/backend API behavior, tenant/identity authorization, schema/migration correctness, redaction-before-egress at the cloud boundary. |
+| Browser/SaaS | `browser_rendering_injection`, `egress_redaction` | SaaS Evidence dashboard rendering, injection-surface checks (XSS-class), redaction-before-egress at the browser/dashboard boundary. |
 | Docs/public claims | `ui_docs` | Release notes/docs/website claims match actual candidate behavior. |
 | Reliability/migration | `event_transport`, `public_api_schema_migration` | Event transport correctness, restart/recovery, migration reversibility. |
 | Release artifact/install | `enterprise_policy_deployment`, `sdk_plugin_trust`, `infra_config` | Build/tag/publish artifact identity, install/deployment posture, SDK/plugin trust boundary. |
 
-`egress_redaction` selects **both** "Cloud/API/data" and "Browser/SaaS" —
-redaction-before-egress must be verified at the boundary the data actually
-crosses, and a candidate touching this surface may need it checked in more
-than one lane rather than picking just one.
+`egress_redaction` is listed under both "Cloud/API/data" and "Browser/SaaS"
+above (not a third, separate lane) because redaction-before-egress must be
+verified at the boundary the data actually crosses, and a candidate
+touching this surface may need it checked in more than one lane rather than
+picking just one.
 
 An item whose only surface is FORNX-231's unclassified fallback
 (`infra_config` used as the "surface could not be determined" catch-all)
