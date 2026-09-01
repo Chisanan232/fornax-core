@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Lets a human/release process force the full required candidate suite
+  # on demand, regardless of the affected-surface path filter below.
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -13,10 +16,66 @@ permissions:
   contents: read
 
 jobs:
+  # Conservative affected-surface detection (FORNX-237). Doc-only PRs (e.g.
+  # a README/docs/**-only change) currently trigger a full
+  # `cargo build --workspace` + `cargo test --workspace` for no reason —
+  # zero risk in skipping. Anything that could plausibly affect Rust
+  # correctness always runs the full suite: any `.rs` file, `Cargo.toml`/
+  # `Cargo.lock`, the workflow files themselves (`.github/**` — a workflow
+  # change must validate itself), and the contract/schema surfaces
+  # (`crates/fornax-types/**`, `crates/fornax-adapter-conformance/**`,
+  # FORNX-14/230/231) that cross-repo consumers depend on.
+  #
+  # `push` (the release/main lane) and manual `workflow_dispatch` always
+  # resolve to `code=true` here — path filtering only ever narrows the PR
+  # fast lane, never the release lane, satisfying the "release assurance
+  # can still force the complete required candidate suite regardless of
+  # path filters" AC.
+  #
+  # Implemented as a job-level `if` (not a top-level `on.paths-ignore`)
+  # deliberately: `rust` is the required status check on `main` branch
+  # protection, and a workflow that never triggers at all for a given path
+  # pattern leaves that required check stuck "Expected" forever, blocking
+  # merge. A job that runs but skips its steps completes as a normal
+  # (green) required check instead.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          fetch-depth: 0
+      - name: determine affected surface
+        id: filter
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "non-PR event (${{ github.event_name }}): always running full suite"
+            exit 0
+          fi
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          changed="$(git diff --name-only "$base...$head" || true)"
+          echo "changed files in this PR:"
+          echo "$changed"
+          if [ -z "$changed" ]; then
+            # Couldn't resolve a diff — fail safe and run the full suite.
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if echo "$changed" | grep -Eq '\.rs$|(^|/)Cargo\.(toml|lock)$|^\.github/|^crates/fornax-types/|^crates/fornax-adapter-conformance/'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+
   # Fast feedback lane: fmt/clippy are cheap and deterministic. Running them
   # in their own job lets them report red/green in parallel with the slower
   # build+test job instead of waiting behind a full `cargo build --workspace`.
   lint:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: t0
@@ -84,6 +143,8 @@ jobs:
   # target/<profile>/<bin> path, so `cargo build --workspace` must run in the
   # same job, on the same runner filesystem, immediately before `cargo test`.
   rust:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: t0
