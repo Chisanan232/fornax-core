@@ -104,24 +104,6 @@ jobs:
       - name: t3 (post-cache-restore)
         id: t3
         run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
-      # --- BEGIN sccache benchmark experiment (FORNX-237, temporary) ---
-      # Installed via pinned `cargo install --locked` release rather than a
-      # third-party GitHub Action, matching this repo's existing convention
-      # for cargo-audit (no new action SHA to pin, docs/adr/0002).
-      - name: install sccache
-        id: sccache_install
-        run: cargo install sccache --version 0.17.0 --locked
-      - name: cache sccache dir
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: ~/.cache/sccache
-          key: v0-sccache-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            v0-sccache-${{ runner.os }}-
-      - name: t3b (post-sccache-setup)
-        id: t3b
-        run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
-      # --- END sccache benchmark experiment ---
       - name: check workspace has crates
         id: has_crates
         run: |
@@ -133,18 +115,12 @@ jobs:
       - name: build workspace binaries
         id: build
         if: steps.has_crates.outputs.present == 'true'
-        env:
-          RUSTC_WRAPPER: sccache
-          SCCACHE_DIR: /home/runner/.cache/sccache
         # Some integration tests (e.g. fornax-daemon's) invoke sibling
         # workspace binaries by their conventional target/<profile>/<bin>
         # path rather than CARGO_BIN_EXE_<name> (which Cargo only sets for
         # bins in the *same* crate as the test) — those binaries must exist
         # on disk before `cargo test` runs, same as local dev convention.
         run: cargo build --workspace
-      - name: sccache stats
-        if: always()
-        run: sccache --show-stats || true
       - name: t4 (post-build)
         id: t4
         run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
