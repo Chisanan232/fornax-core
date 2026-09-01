@@ -29,22 +29,24 @@ additional regression test (`tool_input_and_claim_text_are_redacted_before_stora
 proving a canary secret placed in `tool_input`/claim text never reaches
 storage unredacted (FORNX-280).
 
-**Known gap, disclosed (FORNX-219, not fixed here): `Evidence::source` and
-`Evidence::extension` are not passed through `handle_message`'s redaction
-calls at all** — only `Evidence::payload` is (see the table above;
-`crates/fornax-daemon/src/main.rs`'s `IngestMessage::Evidence` arm calls
-`redact_json` on `payload` only). `ExtensionEnvelope::fields`/`unknown`
-(`docs/adr/0005-schema-evolution.md`) are deliberately untyped,
-provider-specific JSON an adapter author chooses to attach — real content
-observed today includes tool-call title/timing telemetry (the opencode
-adapter's first use of the envelope) — and none of it is scanned by
-`redact_json` before persistence or before `fornax export-spool` sends it
-onward. This is a structural gap (an entire field never reaches the
-classifier), not a detector weakness like the ones listed below. An adapter
-author populating `ExtensionEnvelope::fields` today is responsible for not
-putting anything sensitive there themselves until this gap is closed; a
-future ticket should extend `handle_message`'s redaction calls to cover
-`source`/`extension` the same way `payload` is covered.
+**Gap found and fixed before release (FORNX-219/FORNX-244, SEC-v0.0.3-0001):
+`Evidence::extension` was not passed through `handle_message`'s redaction
+calls at all** — only `Evidence::payload` was (see the table above).
+`ExtensionEnvelope::fields`/`unknown` (`docs/adr/0005-schema-evolution.md`)
+are deliberately untyped, provider-specific JSON an adapter author chooses
+to attach — real content observed today includes tool-call title/timing
+telemetry (the opencode adapter's first use of the envelope). This was a
+structural gap (an entire field never reached the classifier), not a
+detector weakness like the ones listed below. `handle_message`'s
+`IngestMessage::Evidence` arm now calls `redact_json` on `extension.fields`
+and `extension.unknown` the same way it already did on `payload`; see
+`docs/release/v0.0.3-security-signoff.md` for the finding and its
+regression test.
+
+`Evidence::source` (`EvidenceSource`) is deliberately not passed through
+`redact_json` — every one of its fields (sensor name, trust class,
+timestamps, provider, collection method) is a short structured
+identifier/enum, with no free-text content a secret could hide in.
 
 ## Detectors that run today
 

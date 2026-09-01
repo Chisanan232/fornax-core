@@ -12,12 +12,14 @@ Nothing yet.
 ## [v0.0.3] — Extensible Evidence Platform
 
 Engineering complete: epic FORNX-138 and all children (FORNX-155–162,
-FORNX-289–293) are Done. **Not yet a frozen/tagged release** — QA/Security
-sign-off (FORNX-244) is still in flight at the time this entry is written,
-so unlike `[v0.0.1]` below there is no candidate manifest or commit-hash
-table here yet; those land once FORNX-244 completes. No `v0.0.2` was ever
-tagged in this repo — branch names under `v0.0.2/...` reflect in-flight work
-whose scope was absorbed into this release; `v0.0.1` is the only prior tag.
+FORNX-289–293) are Done. QA/Security sign-off (FORNX-244) is PASS —
+see `docs/release/v0.0.3-qa-signoff.md` and
+`docs/release/v0.0.3-security-signoff.md`. **Not yet a frozen/tagged
+release** — the release itself (FORNX-245) has not run, so unlike
+`[v0.0.1]` below there is no candidate manifest or commit-hash table here
+yet; those land once FORNX-245 completes. No `v0.0.2` was ever tagged in
+this repo — branch names under `v0.0.2/...` reflect in-flight work whose
+scope was absorbed into this release; `v0.0.1` is the only prior tag.
 
 ### Added
 
@@ -72,16 +74,29 @@ whose scope was absorbed into this release; `v0.0.1` is the only prior tag.
   is now a permanent CI regression for this path. See
   `docs/research/0003-opencode-live-transport-verification.md`.
 
-### Known limitations
+### Fixed
 
-- **`Evidence::source`/`Evidence::extension` bypass the redaction boundary.**
-  `fornax-daemon`'s `handle_message` redacts `Evidence::payload` before
-  persistence but never calls `redact_json` on `source` or `extension` — a
-  structural gap found while documenting this release, not introduced by it
-  (the boundary was already incomplete; `ExtensionEnvelope` just gives it a
-  real, populated field for the first time). Do not place unredacted
-  sensitive content in an extension payload until this is closed. See
-  `docs/privacy-redaction-policy.md`'s "Known gap" note.
+- **`Evidence::extension.fields`/`.unknown` now go through the same
+  redaction boundary as `Evidence::payload`** (SEC-v0.0.3-0001).
+  `fornax-daemon`'s `handle_message` redacted `payload` before persistence
+  but never called `redact_json` on the extension envelope's own
+  content — a structural gap found while documenting this release (the
+  boundary was already incomplete; the opencode adapter's `ExtensionEnvelope`
+  usage just gives it a real, populated field for the first time), found
+  and fixed before release, not shipped as a known limitation. See
+  `docs/security/threat-model.md`'s `egress_redaction` section and
+  `docs/release/v0.0.3-security-signoff.md`.
+- **Cross-provider capability-cache spoofing/downgrade** (SEC-v0.0.3-0002).
+  `fornax-daemon`'s in-memory capabilities cache was keyed only on
+  provider-controlled `session_id` with no provider discriminator, so a
+  same-session `Capabilities` announcement from a different provider could
+  silently overwrite another provider's cached snapshot — a real capability
+  downgrade that could suppress verification and hide evidence. Fixed by
+  refusing a cross-provider overwrite of an already-cached session. See
+  `docs/security/threat-model.md`'s `evidence_provenance` section and
+  `docs/release/v0.0.3-security-signoff.md`.
+
+### Known limitations
 - **opencode's LLM tool-calling turn is stubbed, not fully autonomous, on
   local Ollama.** Every locally available Ollama tool-calling model reliably
   degrades real `tool_calls` into plain-text JSON once wrapped in opencode's
