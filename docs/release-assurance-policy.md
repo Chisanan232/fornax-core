@@ -21,7 +21,7 @@ only what no other ticket, done or planned, already owns:
 | Candidate manifest content, feature-delta discovery, golden-journey **catalog** (stable IDs, P0/P1/P2 assignment per journey, evidence contract), coverage reconciliation | FORNX-231 | Done — `docs/release-candidate-evidence.md` |
 | QA sign-off artifact format, worker evidence schema, finding lifecycle | FORNX-232 | To Do |
 | Security gate skill, versioned threat model, trust-boundary delta record | FORNX-233 | To Do |
-| Post-release smoke/canary/rollback automation | FORNX-236 | To Do |
+| Post-release smoke/canary/rollback automation | FORNX-236 | Done |
 | Release-docs/changelog/website-impact workflow | FORNX-216 | Done |
 | **Risk classification, assurance-depth policy, verdict semantics, blocker taxonomy, waiver policy, the canonical relay, degraded-CI evidence policy** | **FORNX-229 (this doc)** | This ticket |
 
@@ -53,6 +53,14 @@ journey tiers) that catalog must satisfy.
   performs the canonical relay's `Release` and post-`Release` mechanics:
   tag creation (immutable, never moved), canonical GitHub Release,
   partial-failure evidence, and `--yank` for post-publication deprecation.
+- **`scripts/release-post-verify.sh`** (FORNX-236,
+  `docs/release-post-verify.md`) performs the canonical relay's
+  `Post-Release Verification` step: clones the actually published tag into
+  an isolated context, verifies artifact/version identity and checksum
+  coverage against the release-execution evidence, runs a small P0 smoke
+  matrix, and derives the `PUBLISHED_PENDING_VERIFICATION -> HEALTHY`
+  transition — never by re-running readiness, per the "no fake PASS" rule
+  in Verdict semantics below.
 - **CI_UNAVAILABLE_EXTERNAL classification** (this session's own working
   practice, and Jira comments on FORNX-229/234) already establishes that
   hosted-CI unavailability is not itself a correctness failure, and that a
