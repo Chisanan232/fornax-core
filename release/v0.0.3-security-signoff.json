@@ -1,7 +1,7 @@
 {
   "version": "v0.0.3",
   "candidate_repos": [
-    { "name": "fornax-core", "owner": "horonomy", "sha": "cc7ed3f3ebd1e7af0af3ae4ebe05b1ec105f7bf8" }
+    { "name": "fornax-core", "owner": "horonomy", "sha": "d9ca81ea4fb6fb1d267afe2e5004d013ac5e9ec0" }
   ],
   "risk_class": "TRUST_BOUNDARY",
   "trust_boundary_delta_ref": "release/v0.0.3-trust-boundary-delta.json",
