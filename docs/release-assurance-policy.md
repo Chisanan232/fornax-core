@@ -133,7 +133,7 @@ values must satisfy.
 Depth is **additive**, not a replacement — each tier does everything the
 tier below it does, plus more:
 
-| Class | QA depth | Security depth (already defined by FORNX-233, restated here as the QA-side analogue) |
+| Class | QA depth | Security depth (canonically owned by [`docs/release-security-gate.md`](release-security-gate.md), FORNX-233; restated here as the QA-side analogue) |
 |---|---|---|
 | `PATCH_LOW_RISK` | P0 golden journeys touched by the change only; reuse already-green exact-candidate CI evidence rather than re-running unaffected suites. | Dependency/advisory/supply-chain scan, release-diff review, affected security regressions. |
 | `FEATURE` | Above, plus all P0 journeys plus P1 journeys for the touched surface. | Above, plus changed-attack-surface and privacy/egress review. |
