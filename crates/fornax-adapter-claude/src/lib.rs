@@ -5,8 +5,9 @@
 
 use fornax_types::{
     AgentAdapter, AgentEvent, CapabilityProbe, Claim, CollectionMethod, EventKind, Evidence,
-    EvidenceKind, EvidenceSensor, EvidenceSource, IngestMessage, NormalizationOutcome, Provider,
-    RuntimeCapabilities, SensorOutcome, SignalAvailability, SignalClass, TrustClass,
+    EvidenceKind, EvidenceSensor, EvidenceSource, IngestMessage, NormalizationOutcome,
+    ProcessObservationDetail, Provider, RuntimeCapabilities, SensorOutcome, SignalAvailability,
+    SignalClass, TrustClass, VcsOperation, VcsOutcome,
 };
 use uuid::Uuid;
 
@@ -486,6 +487,291 @@ impl EvidenceSensor for ClaudeEditWriteDiffSensor {
     }
 }
 
+/// FORNX-14 "git commit/push claim" class: parses `git commit`/`git push`
+/// output from a Bash `tool_response` into structured `VcsOperation`
+/// evidence.
+///
+/// Unlike [`ClaudeEditWriteDiffSensor`] (which reconstructs a diff-shaped
+/// string heuristically from `tool_input`, never authoritatively), this
+/// sensor parses git's own real printed stdout/stderr — evidentially
+/// authoritative, not a `tool_input` reconstruction — hence its provenance
+/// ends `#tool_response:...`, not `#heuristic:...`.
+///
+/// **Security note**: a `git push` remote URL can embed a credential
+/// (`https://x-access-token:ghp_xxx@github.com/o/r.git`). `redact_text` does
+/// not catch this shape (`:`/`@` fall outside its detector's allowed
+/// character set — a verified real gap). This sensor therefore sanitizes
+/// `remote` itself, before it ever reaches `Evidence::payload` — see
+/// [`Self::sanitize_remote`] — rather than relying on the shared redactor.
+struct ClaudeGitOutcomeSensor {
+    adapter_version: &'static str,
+}
+
+impl ClaudeGitOutcomeSensor {
+    /// True when `command` (the Bash `tool_input.command` string) looks like
+    /// a `git commit` or `git push` invocation. Deliberately a plain
+    /// lowercased substring check — no existing command-text normalization
+    /// idiom exists in this crate to reuse (unlike `fornax-verify`'s
+    /// `command_text`, which normalizes a *stored evidence payload's*
+    /// `command` field, not a raw `tool_input` string being gated here).
+    fn command_kind(command: &str) -> Option<VcsOperation> {
+        let lower = command.to_lowercase();
+        // A compound command naming both (`git commit -m x && git push`) is
+        // treated as a commit only — see the module docs for why splitting
+        // this into two evidence rows from one event is out of scope here.
+        if lower.contains("git commit") {
+            Some(VcsOperation::Commit)
+        } else if lower.contains("git push") {
+            Some(VcsOperation::Push)
+        } else {
+            None
+        }
+    }
+
+    /// True when `s` looks like a git commit SHA: 7-40 hex characters (git's
+    /// abbreviated SHA is 7+ chars by default; a full SHA-1 is 40).
+    fn looks_sha_shaped(s: &str) -> bool {
+        (7..=40).contains(&s.len()) && s.chars().all(|c| c.is_ascii_hexdigit())
+    }
+
+    /// Parses `git commit`'s real stdout for its bracketed summary line
+    /// (`[main 0e2fbd4] message`, `[main (root-commit) 0e2fbd4] message`,
+    /// `[detached HEAD abc1234] message`) or its "nothing to commit" text.
+    /// Returns `(outcome, commit_sha, branch)`. `None` means unparseable —
+    /// callers must fall back to `SensorOutcome::not_collected`, never
+    /// fabricate an outcome.
+    fn parse_commit(text: &str) -> Option<(VcsOutcome, Option<String>, Option<String>)> {
+        let lower = text.to_lowercase();
+        if lower.contains("nothing to commit") || lower.contains("no changes added to commit") {
+            return Some((VcsOutcome::NothingToCommit, None, None));
+        }
+        for line in text.lines() {
+            let trimmed = line.trim();
+            let Some(rest) = trimmed.strip_prefix('[') else {
+                continue;
+            };
+            let Some(close_idx) = rest.find(']') else {
+                continue;
+            };
+            let inner = &rest[..close_idx];
+            let tokens: Vec<&str> = inner.split_whitespace().collect();
+            let Some(&last) = tokens.last() else {
+                continue;
+            };
+            if !Self::looks_sha_shaped(last) {
+                continue;
+            }
+            let branch = tokens[..tokens.len() - 1].join(" ");
+            let branch = if branch.is_empty() {
+                None
+            } else {
+                Some(branch)
+            };
+            return Some((VcsOutcome::Created, Some(last.to_string()), branch));
+        }
+        None
+    }
+
+    /// Parses `git push`'s real stdout/stderr. Returns
+    /// `(outcome, branch, remote)`. `None` means unparseable — callers must
+    /// fall back to `SensorOutcome::not_collected`.
+    fn parse_push(text: &str) -> Option<(VcsOutcome, Option<String>, Option<String>)> {
+        let remote = Self::extract_remote_line(text);
+
+        // Rejection markers are checked before the ref-update scan below: a
+        // rejected push's "! [rejected]  main -> main (fetch first)" line
+        // also contains " -> " and would otherwise be misread as a
+        // successful ref update.
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("! [")
+                || trimmed.contains("[rejected]")
+                || trimmed.contains("error:")
+            {
+                return Some((VcsOutcome::Rejected, None, remote));
+            }
+        }
+
+        if text.contains("Everything up-to-date") {
+            return Some((VcsOutcome::UpToDate, None, remote));
+        }
+
+        for line in text.lines() {
+            let trimmed = line.trim();
+            let Some(arrow_idx) = trimmed.find(" -> ") else {
+                continue;
+            };
+            let before = &trimmed[..arrow_idx];
+            let mut parts = before.split_whitespace();
+            let Some(range) = parts.next() else { continue };
+            let Some(local_ref) = parts.next() else {
+                continue;
+            };
+            if range.contains("..") {
+                return Some((VcsOutcome::RefUpdated, Some(local_ref.to_string()), remote));
+            }
+        }
+        None
+    }
+
+    fn extract_remote_line(text: &str) -> Option<String> {
+        for line in text.lines() {
+            if let Some(rest) = line.trim().strip_prefix("To ") {
+                return Self::sanitize_remote(rest.trim());
+            }
+        }
+        None
+    }
+
+    /// Strips userinfo (`user:pass@`/`user@`) and any query string from a
+    /// git remote URL, keeping only `scheme://host/path`. Returns `None`
+    /// (never a raw fallback) when `remote` doesn't parse as
+    /// `scheme://...` — see this sensor's security note.
+    fn sanitize_remote(remote: &str) -> Option<String> {
+        let (scheme, rest) = remote.split_once("://")?;
+        let after_userinfo = match rest.rfind('@') {
+            Some(idx) => &rest[idx + 1..],
+            None => rest,
+        };
+        let path_part = after_userinfo.split('?').next().unwrap_or(after_userinfo);
+        if path_part.is_empty() {
+            return None;
+        }
+        Some(format!("{scheme}://{path_part}"))
+    }
+}
+
+impl EvidenceSensor for ClaudeGitOutcomeSensor {
+    fn name(&self) -> &'static str {
+        "claude_git_outcome_sensor_v1"
+    }
+
+    fn required_capabilities(&self) -> &'static [SignalClass] {
+        &[SignalClass::ToolResultPayload]
+    }
+
+    fn trust_class(&self) -> TrustClass {
+        TrustClass::AgentAdjacent
+    }
+
+    fn collection_method(&self) -> CollectionMethod {
+        CollectionMethod::HookCallback
+    }
+
+    fn collector_version(&self) -> Option<String> {
+        Some(self.adapter_version.to_string())
+    }
+
+    fn collect(&self, event: &AgentEvent, _caps: &RuntimeCapabilities) -> SensorOutcome {
+        if event.kind != EventKind::PostToolUse || event.tool_name.as_deref() != Some("Bash") {
+            return SensorOutcome::not_collected(
+                SignalAvailability::Unknown,
+                Some("not a Bash PostToolUse event".to_string()),
+            );
+        }
+
+        let Some(command) = event
+            .tool_input
+            .as_ref()
+            .and_then(|ti| ti.get("command"))
+            .and_then(|v| v.as_str())
+        else {
+            return SensorOutcome::not_collected(
+                SignalAvailability::Unknown,
+                Some("no command string in tool_input".to_string()),
+            );
+        };
+
+        let Some(operation) = Self::command_kind(command) else {
+            return SensorOutcome::not_collected(
+                SignalAvailability::Unknown,
+                Some("not a git commit/push command".to_string()),
+            );
+        };
+
+        let Some(resp) = &event.tool_response else {
+            return SensorOutcome::not_collected(
+                SignalAvailability::Unavailable,
+                Some("no tool_response present on this event".to_string()),
+            );
+        };
+
+        let stdout = resp.get("stdout").and_then(|v| v.as_str()).unwrap_or("");
+        let stderr = resp.get("stderr").and_then(|v| v.as_str()).unwrap_or("");
+        // git commonly prints progress/summary to stderr (especially for
+        // `push`), so both streams are scanned together.
+        let combined = format!("{stdout}\n{stderr}");
+
+        // `parse_commit` returns `(outcome, commit_sha, branch)`; `parse_push`
+        // returns `(outcome, branch, remote)` — different tuple shapes per
+        // operation, so each arm below binds its own fields explicitly
+        // rather than sharing one destructuring pattern (that mismatch was a
+        // real bug caught in review before this landed).
+        let (outcome, commit_sha, branch, remote) = match operation {
+            VcsOperation::Commit => {
+                let Some((outcome, commit_sha, branch)) = Self::parse_commit(&combined) else {
+                    return SensorOutcome::not_collected(
+                        SignalAvailability::Unavailable,
+                        Some(
+                            "git output did not match a recognizable commit outcome shape"
+                                .to_string(),
+                        ),
+                    );
+                };
+                (outcome, commit_sha, branch, None)
+            }
+            VcsOperation::Push => {
+                let Some((outcome, branch, remote)) = Self::parse_push(&combined) else {
+                    return SensorOutcome::not_collected(
+                        SignalAvailability::Unavailable,
+                        Some(
+                            "git output did not match a recognizable push outcome shape"
+                                .to_string(),
+                        ),
+                    );
+                };
+                (outcome, None, branch, remote)
+            }
+        };
+
+        let (op_label, outcome_label, provenance_tag) = match operation {
+            VcsOperation::Commit => ("commit", format!("{outcome:?}"), "git_commit"),
+            VcsOperation::Push => ("push", format!("{outcome:?}"), "git_push"),
+        };
+
+        SensorOutcome::collected(vec![Evidence {
+            id: Uuid::new_v4(),
+            session_id: event.session_id.clone(),
+            source_event_id: event.id,
+            kind: EvidenceKind::ProcessObservation,
+            observed_at: event.observed_at.clone(),
+            payload: serde_json::to_value(fornax_types::ProcessObservationPayload {
+                description: format!("git {op_label} {outcome_label}"),
+                observation: Some(ProcessObservationDetail::VcsOperation {
+                    operation,
+                    outcome,
+                    commit_sha,
+                    branch,
+                    remote,
+                }),
+            })
+            .expect("ProcessObservationPayload always serializes"),
+            provenance: format!(
+                "claude_code:{v}:PostToolUse:Bash#tool_response:{provenance_tag}",
+                v = self.adapter_version
+            ),
+            source: Some(EvidenceSource::now(
+                self.name(),
+                self.trust_class(),
+                Some(Provider::ClaudeCode),
+                self.collection_method(),
+                self.collector_version(),
+            )),
+            extension: None,
+        }])
+    }
+}
+
 fn translate(
     adapter: &ClaudeAdapter,
     session_hint: &str,
@@ -585,6 +871,19 @@ fn translate(
         )
     {
         let sensor = ClaudeEditWriteDiffSensor {
+            adapter_version: adapter.adapter_version(),
+        };
+        let outcome = sensor.collect(&event, &caps);
+        out.extend(outcome.evidence.into_iter().map(IngestMessage::Evidence));
+    }
+
+    // PostToolUse for a Bash call whose command looks like `git commit`/
+    // `git push` (FORNX-14): parse git's own real stdout/stderr into
+    // structured `VcsOperation` evidence. Gated the same way as
+    // `ClaudeBashExitCodeSensor` (Bash PostToolUse); the sensor itself does
+    // the finer-grained command-text gate.
+    if kind == EventKind::PostToolUse && tool_name.as_deref() == Some("Bash") {
+        let sensor = ClaudeGitOutcomeSensor {
             adapter_version: adapter.adapter_version(),
         };
         let outcome = sensor.collect(&event, &caps);
@@ -1081,5 +1380,237 @@ mod tests {
             IngestMessage::Evidence(ev) => assert_eq!(ev.kind, EvidenceKind::ExitCode),
             other => panic!("expected Evidence, got {other:?}"),
         }
+    }
+
+    // --- FORNX-14: ClaudeGitOutcomeSensor ----------------------------------
+
+    fn git_evidence(msgs: &[IngestMessage]) -> &Evidence {
+        msgs.iter()
+            .find_map(|m| match m {
+                IngestMessage::Evidence(ev) if ev.kind == EvidenceKind::ProcessObservation => {
+                    Some(ev)
+                }
+                _ => None,
+            })
+            .expect("expected a ProcessObservation Evidence message")
+    }
+
+    #[test]
+    fn successful_commit_produces_created_outcome_with_sha_and_branch() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "sess-1",
+            "tool_name": "Bash",
+            "tool_input": {"command": "git commit -m 'fix bug'"},
+            "tool_response": {
+                "stdout": "[main 0e2fbd4] fix bug\n 1 file changed, 2 insertions(+)\n",
+                "stderr": "",
+                "interrupted": false
+            }
+        });
+        let msgs = normalize(&raw).into_messages();
+        let ev = git_evidence(&msgs);
+        assert_eq!(
+            ev.payload["observation"]["observation_kind"],
+            "vcs_operation"
+        );
+        assert_eq!(ev.payload["observation"]["operation"], "commit");
+        assert_eq!(ev.payload["observation"]["outcome"], "created");
+        assert_eq!(ev.payload["observation"]["commit_sha"], "0e2fbd4");
+        assert_eq!(ev.payload["observation"]["branch"], "main");
+        assert!(ev.provenance.ends_with("#tool_response:git_commit"));
+        let source = ev.source.as_ref().expect("evidence must carry source");
+        assert_eq!(source.sensor_name, "claude_git_outcome_sensor_v1");
+        assert_eq!(source.trust_class, fornax_types::TrustClass::AgentAdjacent);
+    }
+
+    #[test]
+    fn root_commit_and_detached_head_shapes_still_extract_sha() {
+        let raw_root = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "sess-1",
+            "tool_name": "Bash",
+            "tool_input": {"command": "git commit -m 'init'"},
+            "tool_response": {"stdout": "[main (root-commit) 0e2fbd4] init\n", "stderr": ""}
+        });
+        let msgs = normalize(&raw_root).into_messages();
+        let ev = git_evidence(&msgs);
+        assert_eq!(ev.payload["observation"]["commit_sha"], "0e2fbd4");
+
+        let raw_detached = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "sess-1",
+            "tool_name": "Bash",
+            "tool_input": {"command": "git commit -m 'wip'"},
+            "tool_response": {"stdout": "[detached HEAD abc1234] wip\n", "stderr": ""}
+        });
+        let msgs2 = normalize(&raw_detached).into_messages();
+        let ev2 = git_evidence(&msgs2);
+        assert_eq!(ev2.payload["observation"]["commit_sha"], "abc1234");
+        assert_eq!(ev2.payload["observation"]["branch"], "detached HEAD");
+    }
+
+    #[test]
+    fn nothing_to_commit_produces_nothing_to_commit_outcome_with_no_sha() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "sess-1",
+            "tool_name": "Bash",
+            "tool_input": {"command": "git commit -m 'noop'"},
+            "tool_response": {
+                "stdout": "On branch main\nnothing to commit, working tree clean\n",
+                "stderr": ""
+            }
+        });
+        let msgs = normalize(&raw).into_messages();
+        let ev = git_evidence(&msgs);
+        assert_eq!(ev.payload["observation"]["outcome"], "nothing_to_commit");
+        assert!(ev.payload["observation"]["commit_sha"].is_null());
+    }
+
+    #[test]
+    fn successful_push_produces_ref_updated_with_branch_and_sanitized_remote() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "sess-1",
+            "tool_name": "Bash",
+            "tool_input": {"command": "git push"},
+            "tool_response": {
+                "stdout": "",
+                "stderr": "To https://github.com/o/r.git\n   a1b2c3d..e4f5a6b  main -> main\n"
+            }
+        });
+        let msgs = normalize(&raw).into_messages();
+        let ev = git_evidence(&msgs);
+        assert_eq!(ev.payload["observation"]["operation"], "push");
+        assert_eq!(ev.payload["observation"]["outcome"], "ref_updated");
+        assert_eq!(ev.payload["observation"]["branch"], "main");
+        assert_eq!(
+            ev.payload["observation"]["remote"],
+            "https://github.com/o/r.git"
+        );
+        assert!(ev.provenance.ends_with("#tool_response:git_push"));
+    }
+
+    #[test]
+    fn everything_up_to_date_produces_up_to_date_outcome() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "sess-1",
+            "tool_name": "Bash",
+            "tool_input": {"command": "git push"},
+            "tool_response": {"stdout": "", "stderr": "Everything up-to-date\n"}
+        });
+        let msgs = normalize(&raw).into_messages();
+        let ev = git_evidence(&msgs);
+        assert_eq!(ev.payload["observation"]["outcome"], "up_to_date");
+    }
+
+    #[test]
+    fn rejected_push_produces_rejected_outcome() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "sess-1",
+            "tool_name": "Bash",
+            "tool_input": {"command": "git push"},
+            "tool_response": {
+                "stdout": "",
+                "stderr": "To https://github.com/o/r.git\n ! [rejected]        main -> main (fetch first)\nerror: failed to push some refs to 'https://github.com/o/r.git'\n"
+            }
+        });
+        let msgs = normalize(&raw).into_messages();
+        let ev = git_evidence(&msgs);
+        assert_eq!(ev.payload["observation"]["outcome"], "rejected");
+    }
+
+    /// Falsification: unparseable git output must never fabricate an
+    /// outcome — no evidence at all, only the Event.
+    #[test]
+    fn unparseable_git_output_produces_no_evidence() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "sess-1",
+            "tool_name": "Bash",
+            "tool_input": {"command": "git commit -m 'x'"},
+            "tool_response": {"stdout": "some totally unexpected output\n", "stderr": ""}
+        });
+        let msgs = normalize(&raw).into_messages();
+        let evidence_count = msgs
+            .iter()
+            .filter(|m| matches!(m, IngestMessage::Evidence(_)))
+            .count();
+        assert_eq!(evidence_count, 0);
+    }
+
+    /// Falsification: a non-git Bash command must not trigger this sensor at
+    /// all — the existing Bash exit-code sensor's evidence must be the only
+    /// evidence produced, unaffected by this sensor's addition.
+    #[test]
+    fn non_git_bash_command_does_not_trigger_git_outcome_sensor() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "sess-1",
+            "tool_name": "Bash",
+            "tool_input": {"command": "pytest"},
+            "tool_response": {"stdout": "5 passed\n", "stderr": "", "interrupted": false}
+        });
+        let msgs = normalize(&raw).into_messages();
+        let evidence: Vec<_> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                IngestMessage::Evidence(ev) => Some(ev),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].kind, EvidenceKind::ExitCode);
+    }
+
+    /// Required secret regression test: a push whose stderr embeds a
+    /// credential in the remote URL must never let that credential reach
+    /// storage in ANY field of the evidence, checked via full payload
+    /// serialization (not just the `remote` field).
+    #[test]
+    fn credential_embedded_in_push_remote_url_is_never_stored() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "sess-1",
+            "tool_name": "Bash",
+            "tool_input": {"command": "git push"},
+            "tool_response": {
+                "stdout": "",
+                "stderr": "To https://x-access-token:ghp_FAKELOOKINGTOKEN1234567890@github.com/o/r.git\n   a1b2c3d..e4f5a6b  main -> main\n"
+            }
+        });
+        let msgs = normalize(&raw).into_messages();
+        let ev = git_evidence(&msgs);
+        assert_eq!(
+            ev.payload["observation"]["remote"],
+            "https://github.com/o/r.git"
+        );
+        let full = serde_json::to_string(ev).unwrap();
+        assert!(!full.contains("ghp_FAKELOOKINGTOKEN1234567890"));
+        assert!(!full.contains("x-access-token"));
+    }
+
+    #[test]
+    fn claude_git_outcome_sensor_reports_unavailable_with_no_tool_response() {
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "sess-1".into(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: Some("Bash".into()),
+            tool_input: Some(serde_json::json!({"command": "git commit -m 'x'"})),
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        let sensor = ClaudeGitOutcomeSensor {
+            adapter_version: ADAPTER_VERSION,
+        };
+        let outcome = sensor.collect(&event, &ClaudeAdapter.probe());
+        assert!(!outcome.has_evidence());
+        assert_eq!(outcome.state, SignalAvailability::Unavailable);
     }
 }
