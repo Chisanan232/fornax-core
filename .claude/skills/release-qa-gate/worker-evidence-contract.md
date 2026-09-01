@@ -1,60 +1,40 @@
-# Worker evidence contract (provisional)
+# Worker evidence contract
 
-Jira: FORNX-230. This is the **transient** shape a lane worker hands back to
-the coordinator during one `/release-qa-gate` run — just enough for the
-coordinator to compute the aggregate verdict in
-[`SKILL.md`](SKILL.md) Step 6. It is deliberately minimal.
+Jira: FORNX-230. FORNX-232 now owns and ships the durable worker evidence
+schema this file previously stubbed as provisional — see
+[`docs/release-qa-signoff.md`](../../../docs/release-qa-signoff.md) §2
+("Worker evidence schema") for the actual `STATUS`/`BASELINE`/`VERIFIED`/
+`SUSPECTED_FINDINGS`/`UNTESTED_OR_BLOCKED`/`CONFIDENCE` shape every QA
+worker returns, and §4 ("QA verifier roles and coordinator handoff
+contract") for the `qa-coordinator`/`qa-worker`/`qa-finding-verifier` role
+split. This file does not restate or fork that schema — a second,
+diverging worker-evidence shape living here would be exactly the
+copy-paste drift FORNX-231/232 both explicitly guard against.
 
-**This is not the durable QA sign-off artifact.** FORNX-232 ("Add durable
-QA sign-off, independent finding verification, runtime recipes and reusable
-verifier agents") owns that format and the finding lifecycle, and is not
-yet built. When FORNX-232 lands, this contract is superseded by whatever
-schema that ticket defines for the durable record; this file's shape stays
-in use only as the in-run coordinator/worker handoff, and should be updated
-to conform to FORNX-232's schema at that point rather than kept as a second,
-diverging shape.
+## What this file adds on top of FORNX-232's schema
 
-## Shape
+FORNX-232 §4 states plainly: "Worker-count sizing and lane assignment
+strategy belong to FORNX-230's orchestration, not this document." The one
+thing this skill's dispatch needs that FORNX-232's schema does not itself
+carry is **which lane** ([`lane-surface-mapping.md`](lane-surface-mapping.md))
+a given worker result belongs to, so the coordinator (Step 6) can compute
+the worst-of verdict per lane before rolling it up to the gate overall.
 
-```jsonc
-{
-  "lane": "adapters_providers",          // one of the 8 lane ids from lane-surface-mapping.md
-  "verdict": "BLOCK",                    // PASS | BLOCK | INCONCLUSIVE | UNTESTED — FORNX-229 vocabulary, no other spelling
-  "risk_class_depth_applied": "TRUST_BOUNDARY",
-  "checks": [
-    {
-      "name": "fornax-hook-codex event-shape correctness",
-      "verdict": "PASS",
-      "evidence": {
-        "kind": "ci_reused",             // ci_reused | ci_rerun | local_repro | golden_journey | static_review
-        "ref": "github.com/horonomy/fornax-core/actions/runs/123456", // run URL, commit SHA, file path, or journey ID — never a raw log dump
-        "note": "exact-candidate SHA 9e75d95, green, cited not re-run"
-      }
-    }
-  ],
-  "blocked_or_untested_surfaces": [],    // FORNX-231 surface ids left unverified in this lane; [] only if genuinely none
-  "findings": [                          // present only when verdict is BLOCK; kept to a pointer, not a full report
-    {
-      "severity": "High",
-      "summary": "one-line description",
-      "jira_key": "FORNX-9999",          // filed/linked per SKILL.md Step 7; null until filed
-      "independently_reproduced": true    // required true for High/Critical at TRUST_BOUNDARY+ per FORNX-229
-    }
-  ]
-}
-```
+When dispatching a worker, the coordinator tags the assignment with its
+lane id from `lane-surface-mapping.md` (e.g. `adapters_providers`). The
+worker's returned evidence stays exactly FORNX-232 §2's shape — this skill
+adds no new field to it. The coordinator associates the lane id with the
+result on its own side (it already knows which lane it dispatched to; the
+worker does not need to echo it back).
 
-## Rules
+## Aggregation into the gate verdict (SKILL.md Step 6)
 
-- `verdict` uses FORNX-229's four-state vocabulary only. No `WARN`, no
-  `PARTIAL`, no bare boolean.
-- `evidence.ref` is always a pointer (URL, SHA, path, journey ID) — a worker
-  returning inline raw log text or chain-of-thought instead of a pointer is
-  a contract violation, not a stylistic choice (this is the AC's "workers
-  return compact evidence, not chain-of-thought or giant raw logs").
-- `blocked_or_untested_surfaces` is never omitted to make a lane look
-  cleaner — an empty array is an explicit claim ("nothing left unverified
-  in this lane"), not the absence of the field.
-- A `BLOCK` verdict always carries at least one `findings[]` entry; a
-  `findings[]` entry always carries a `jira_key` once Step 7 has run (may be
-  `null` only in the first coordinator report, before filing).
+- A lane's verdict is `BLOCK` if any of its workers' results carry a
+  `SUSPECTED_FINDINGS` entry that reaches `CONFIRMED` (FORNX-232 §3's
+  finding lifecycle), `PASS` if `STATUS: COMPLETE` with no confirmed
+  finding and nothing in `UNTESTED_OR_BLOCKED`, `INCONCLUSIVE` if
+  `STATUS: PARTIAL` with no confirmed finding but genuine ambiguity
+  remains, and `UNTESTED` if `STATUS: BLOCKED` or the lane was never
+  dispatched (e.g. Step 1's fail-closed discovery outcome).
+- The gate's overall verdict is the worst of all lane verdicts, per
+  FORNX-229's verdict semantics — restated in `SKILL.md` Step 6, not here.

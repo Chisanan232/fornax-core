@@ -19,7 +19,7 @@ this skill's assets is a bug in this skill, not a valid override:
 |---|---|
 | Risk classes (`PATCH_LOW_RISK`/`FEATURE`/`TRUST_BOUNDARY`/`MAJOR_OR_GA`), assurance-depth-by-risk table, verdict semantics (`PASS`/`BLOCK`/`INCONCLUSIVE`/`UNTESTED`), blocker taxonomy, waiver policy, `CI_DEGRADED_EXTERNAL` | `docs/release-assurance-policy.md` (FORNX-229) |
 | Candidate manifest schema, `risk_class` field, feature-delta schema, golden-journey catalog, QA coverage reconciliation schema, shared surface vocabulary | `docs/release-candidate-evidence.md` (FORNX-231) |
-| Durable QA sign-off artifact format, finding lifecycle | FORNX-232 (not yet built — see "Worker evidence contract" below) |
+| Durable QA sign-off artifact format, worker evidence schema, finding lifecycle, verifier roles/handoff contract | `docs/release-qa-signoff.md` (FORNX-232) |
 | Security gate skill, threat model, trust-boundary delta record | FORNX-233 (not yet built) |
 | Mechanical gate enforcement (`scripts/release-readiness.sh`) | FORNX-234 |
 | Tag/build/publish/promotion mechanics | FORNX-235 |
@@ -40,7 +40,8 @@ count**, dispatch of those workers, and an honest aggregate verdict.
 - The candidate is not yet frozen (no manifest) — run Feature Delta/coverage
   reconciliation first.
 - You need the *durable* QA sign-off record — that artifact format is
-  FORNX-232's; this skill's output feeds it, but is not itself that record.
+  `docs/release-qa-signoff.md`'s (FORNX-232); this skill's output feeds it,
+  but is not itself that record.
 - You need to run the security gate — that is a separate skill (FORNX-233).
 - A single narrow bug needs reproduction — use the normal dev-impl-loop, not
   this coordinator.
@@ -136,12 +137,14 @@ the outage itself as a pass or a block.
 
 ## Step 5 — Dispatch workers with a compact evidence contract
 
-See [`worker-evidence-contract.md`](worker-evidence-contract.md) for the
-exact shape. Workers return **compact evidence**: verdict, evidence
-pointers (paths/SHAs/run IDs/log excerpts), and blocked/untested surfaces —
-never chain-of-thought, and never a raw log dump. A worker that cannot
-produce a confident `PASS`/`BLOCK` reports `INCONCLUSIVE`, not a rounded-up
-guess.
+Workers return `docs/release-qa-signoff.md` §2's evidence schema
+(`STATUS`/`BASELINE`/`VERIFIED`/`SUSPECTED_FINDINGS`/`UNTESTED_OR_BLOCKED`/
+`CONFIDENCE`) — compact evidence with pointers (paths/SHAs/run IDs), never
+chain-of-thought or a raw log dump. See
+[`worker-evidence-contract.md`](worker-evidence-contract.md) for the one
+thing this skill adds on top (lane tagging) and how a lane result rolls up
+into Step 6's aggregate verdict. A worker that cannot produce a confident
+result reports `STATUS: PARTIAL` or `BLOCKED`, not a rounded-up `COMPLETE`.
 
 ## Step 6 — Aggregate verdict
 
