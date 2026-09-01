@@ -4,6 +4,62 @@ Status: living doc, empirically grounded. Re-verify hook schemas against the
 installed CLI version before an adapter hard-codes field names — all three
 surfaces are actively changing.
 
+## Consolidated compatibility matrix (FORNX-219, v0.0.3)
+
+Every cell below is read directly from each adapter's compiled
+`CapabilityProbe::probe()` (`crates/fornax-adapter-{claude,codex,opencode}/src/lib.rs`),
+not from this doc's prose — this is the "matches conformance-tested reality"
+table FORNX-219's AC requires, and it will drift the moment code changes
+without a corresponding update here. Verify against source before trusting a
+cell in a future release.
+
+States, per `fornax_types::capabilities::SignalAvailability`:
+
+- **Available** — confirmed present and observed for real, no heuristic.
+- **Unsupported** — this runtime fundamentally cannot expose the signal (a
+  structural gap, not a missing translation).
+- **Unavailable** — exists in principle (the provider's real event stream
+  carries it, or another exec-tool configuration on the same provider
+  exposes it) but this adapter version doesn't confirm/translate it.
+- **Unknown** — the adapter does not declare a `CapabilitySignal` for this
+  class at all; `RuntimeCapabilities::state_of` returns `Unknown` for any
+  undeclared class. Distinct from `Unsupported`/`Unavailable`: it means "not
+  yet assessed," not "assessed and found absent."
+
+| `SignalClass` | Claude Code | Codex CLI | opencode |
+|---|---|---|---|
+| `ToolInvocation` (pre-execution interception) | Available | Unsupported — hooks opt-in/admin-suppressible, no input-rewrite support | Available — `tool.execute.before`, observe-only in this adapter |
+| `ToolTrace` (post-execution observation) | Available | Available — via rollout `custom_tool_call`/`_output` pairing, not hooks | Available |
+| `ToolResultPayload` (provider-serialized result body) | Available | Available | Available |
+| `ProcessResult` (literal exit code) | **Unsupported** — Bash `tool_response` carries no literal exit code as of Claude Code v2.1.238; evidence is heuristic from stdout/stderr/interrupted | **Unavailable** — `exec_command_end` not emitted by codex-cli 0.147.0; `custom_tool_call_output` does carry a real parseable exit code when the session's exec tool is `tools.shell_command`, but the default `tools.exec_command` (`unified_exec`) shape exposes none at all, so the provider-wide declaration stays the conservative `Unavailable` | **Available** — `tool.execute.after`'s `output.metadata.exit` is a literal integer, confirmed real against opencode v1.18.25 — the first of the three adapters to expose a genuine (non-heuristic) exit code |
+| `SessionLifecycle` | Available | Available — `task_complete` in rollout | Available — `event` hook's `session.created`/`session.idle` |
+| `SubagentLifecycle` | Available | Unsupported — rollout-tail surfaces no subagent lines; Codex's own hooks exist but are opt-in/unstable/admin-suppressible, same as `ToolInvocation` | **Unsupported** — the `@opencode-ai/plugin` Hooks interface (v1.18.25) has no subagent-specific hook at all, structurally absent |
+| `FinalResponse` | Available | Available | **Unavailable** — the `event` hook's `message.updated`/`message.part.updated` text events genuinely carry the final response, but this adapter version doesn't translate them (scoped out per FORNX-161's single-event-path AC, not a structural gap) |
+| `ReasoningSummary` | Unknown (undeclared) | Unknown (undeclared) | Unsupported — no reasoning-summary hook or message-part type observed in the Hooks interface for a local tool-calling model session |
+| `RawReasoning` | Unknown (undeclared) | Unknown (undeclared) | Unsupported |
+| `TokenLogprobs` | Unknown (undeclared) | Unknown (undeclared) | Unsupported — no logprobs field anywhere in the Hooks interface (v1.18.25) |
+| `InternalModelSignals` | Unknown (undeclared) | Unknown (undeclared) | Unavailable — `message.updated` carries token/cost telemetry in principle, not translated by this adapter version |
+
+Notes:
+
+- Claude Code and Codex CLI declare no `CapabilitySignal` at all for
+  `ReasoningSummary`/`RawReasoning`/`TokenLogprobs`/`InternalModelSignals` —
+  this is not the same claim as opencode's explicit `Unsupported`/
+  `Unavailable` for those classes, which were positively assessed and found
+  absent or untranslated. A future adapter version for Claude Code/Codex may
+  declare these explicitly once assessed; until then, `Unknown` is the
+  honest state, not an implied `Unsupported`.
+- opencode is the sharpest illustration of the three-state design (`SignalAvailability`)
+  paying off: it declares `ProcessResult` `Available` (genuine literal exit
+  code) while declaring `SubagentLifecycle` `Unsupported` (no such hook
+  exists) and `FinalResponse` `Unavailable` (the signal exists in the real
+  event stream, this adapter version just doesn't translate it) — three
+  different states for three materially different reasons, on one adapter.
+- See each adapter's own section below for the full narrative and evidence
+  behind each cell, and `docs/research/0002-third-provider-fitness-report.md`
+  for the opencode architecture-fitness proof this matrix's third column
+  substantiates.
+
 ## Claude Code
 
 Source: this machine's `~/.claude/settings.json` + `~/.claude/statusline.py` +
