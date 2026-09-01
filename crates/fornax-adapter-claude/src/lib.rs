@@ -1602,6 +1602,97 @@ mod tests {
         assert!(!full.contains("x-access-token"));
     }
 
+    /// FORNX-244 coverage-gap closure: a commit *message* embedding a
+    /// canary/secret-shaped token must never reach the stored evidence.
+    /// Unlike the push-remote case above, `parse_commit` never even reads
+    /// the commit message text (only the bracketed `[branch sha]` summary
+    /// line) and `description` is synthesized from the operation/outcome
+    /// labels alone (`format!("git {op_label} {outcome_label}")`), so the
+    /// message text has no path into the payload at all — this test proves
+    /// that structurally, via full-payload serialization, rather than
+    /// assuming it from reading the code.
+    #[test]
+    fn commit_message_with_embedded_secret_never_reaches_stored_evidence() {
+        let marker = "FORNX-CANARY-ghp_SECRETLOOKINGTOKEN1234567890-DO-NOT-LEAK";
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "sess-1",
+            "tool_name": "Bash",
+            "tool_input": {"command": format!("git commit -m 'wip {marker}'")},
+            "tool_response": {
+                "stdout": format!("[main 0e2fbd4] wip {marker}\n 1 file changed, 1 insertion(+)\n"),
+                "stderr": ""
+            }
+        });
+        let msgs = normalize(&raw).into_messages();
+        let ev = git_evidence(&msgs);
+        assert_eq!(ev.payload["observation"]["commit_sha"], "0e2fbd4");
+        let full = serde_json::to_string(ev).unwrap();
+        assert!(
+            !full.contains(marker),
+            "commit message canary leaked into stored evidence: {full}"
+        );
+    }
+
+    /// FORNX-244 coverage-gap closure: `sanitize_remote` strips a query
+    /// string entirely (per its own doc comment), not just userinfo — a
+    /// credential passed as `?token=...` rather than `user:pass@` must also
+    /// never reach storage.
+    #[test]
+    fn credential_in_push_remote_query_string_is_never_stored() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "sess-1",
+            "tool_name": "Bash",
+            "tool_input": {"command": "git push"},
+            "tool_response": {
+                "stdout": "",
+                "stderr": "To https://github.com/o/r.git?token=ghp_QUERYSTRINGTOKEN1234567890\n   a1b2c3d..e4f5a6b  main -> main\n"
+            }
+        });
+        let msgs = normalize(&raw).into_messages();
+        let ev = git_evidence(&msgs);
+        assert_eq!(
+            ev.payload["observation"]["remote"],
+            "https://github.com/o/r.git"
+        );
+        let full = serde_json::to_string(ev).unwrap();
+        assert!(!full.contains("ghp_QUERYSTRINGTOKEN1234567890"));
+        assert!(!full.contains("token="));
+    }
+
+    /// FORNX-244 coverage-gap closure: an scp-style SSH remote
+    /// (`git@github.com:o/r.git`, no `scheme://`) does not match
+    /// `sanitize_remote`'s `scheme://` precondition, so it must come back as
+    /// `None` (omitted) rather than passed through raw — falsification-style,
+    /// mirroring `unparseable_git_output_produces_no_process_observation_evidence`.
+    /// This matters because an scp-style remote can itself carry a
+    /// non-default SSH user (`deploy@host:path`) that should not be stored
+    /// verbatim just because it doesn't look like a `://` URL.
+    #[test]
+    fn scp_style_ssh_remote_is_omitted_not_passed_through_raw() {
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "session_id": "sess-1",
+            "tool_name": "Bash",
+            "tool_input": {"command": "git push"},
+            "tool_response": {
+                "stdout": "",
+                "stderr": "To git@github.com:o/r.git\n   a1b2c3d..e4f5a6b  main -> main\n"
+            }
+        });
+        let msgs = normalize(&raw).into_messages();
+        let ev = git_evidence(&msgs);
+        assert_eq!(ev.payload["observation"]["outcome"], "ref_updated");
+        assert!(
+            ev.payload["observation"]["remote"].is_null(),
+            "scp-style remote must be omitted, not passed through raw: {:?}",
+            ev.payload["observation"]["remote"]
+        );
+        let full = serde_json::to_string(ev).unwrap();
+        assert!(!full.contains("git@github.com"));
+    }
+
     #[test]
     fn claude_git_outcome_sensor_reports_unavailable_with_no_tool_response() {
         let event = AgentEvent {
