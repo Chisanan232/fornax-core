@@ -100,6 +100,16 @@ pub struct Claim {
 }
 
 /// Evidence kind — what was directly observed, independent of any claim.
+///
+/// **Closed on purpose — do not add a variant.** `fornax-cloud` (a separate
+/// repo) mirrors this enum as a closed enum with no catch-all in
+/// `crates/fornax-uploader/src/types.rs` and `crates/fornax-ingest/src/types.rs`.
+/// Adding a new variant here would silently break cloud ingestion for it (a
+/// coordinated two-repo change). A new evidence shape must instead widen an
+/// existing variant's canonical payload struct (see e.g.
+/// [`ProcessObservationPayload`]'s `observation` field, added FORNX-14) —
+/// payload is opaque `serde_json::Value` on the cloud side, so widening a
+/// payload struct's fields is safe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceKind {
@@ -187,12 +197,64 @@ pub struct FileDiffPayload {
     pub diff: String,
 }
 
-/// Not yet produced by any sensor — see [`ExitCodePayload`]'s doc comment
-/// for why these are typed ahead of a producer existing.
+/// `description` predates any producer (see [`ExitCodePayload`]'s doc
+/// comment for why canonical payloads are typed ahead of a producer
+/// existing). `observation` (FORNX-14) is this payload's first real producer
+/// field: `fornax-adapter-claude`'s `ClaudeGitOutcomeSensor` populates it for
+/// a git commit/push outcome observed in a Bash `tool_response`. Widening
+/// this struct's fields — rather than adding a new [`EvidenceKind`] variant —
+/// is the deliberate way to add a new evidence shape; see that enum's doc
+/// comment.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessObservationPayload {
     pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation: Option<ProcessObservationDetail>,
+}
+
+/// Structured detail for a [`ProcessObservationPayload`] (FORNX-14). Only
+/// `VcsOperation` exists today — an `HttpProbe` variant is planned for a
+/// follow-up PR (FORNX-14's HTTP-health work) but deliberately not added
+/// here.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "observation_kind",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum ProcessObservationDetail {
+    VcsOperation {
+        operation: VcsOperation,
+        outcome: VcsOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        commit_sha: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remote: Option<String>,
+    },
+}
+
+/// Which git operation a [`ProcessObservationDetail::VcsOperation`] observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VcsOperation {
+    Commit,
+    Push,
+}
+
+/// What git reported for a [`ProcessObservationDetail::VcsOperation`],
+/// parsed from the real `git` stdout/stderr text Claude Code's `tool_response`
+/// carries for a `git commit`/`git push` Bash invocation — never fabricated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VcsOutcome {
+    Created,
+    NothingToCommit,
+    RefUpdated,
+    UpToDate,
+    Rejected,
 }
 
 /// Not yet produced by any sensor — see [`ExitCodePayload`]'s doc comment
@@ -357,6 +419,37 @@ mod evidence_schema_tests {
             &serde_json::json!({"text": "hello"})
         )
         .is_ok());
+    }
+
+    // --- FORNX-14: ProcessObservationPayload.observation widening ---------
+
+    #[test]
+    fn process_observation_payload_with_vcs_operation_observation_validates() {
+        let good = serde_json::json!({
+            "description": "git commit created",
+            "observation": {
+                "observation_kind": "vcs_operation",
+                "operation": "commit",
+                "outcome": "created",
+                "commit_sha": "abc1234",
+                "branch": "main"
+            }
+        });
+        assert!(validate_canonical_payload(EvidenceKind::ProcessObservation, &good).is_ok());
+    }
+
+    #[test]
+    fn process_observation_payload_observation_with_unknown_field_is_rejected() {
+        let bad = serde_json::json!({
+            "description": "git commit created",
+            "observation": {
+                "observation_kind": "vcs_operation",
+                "operation": "commit",
+                "outcome": "created",
+                "surprise": true
+            }
+        });
+        assert!(validate_canonical_payload(EvidenceKind::ProcessObservation, &bad).is_err());
     }
 
     // --- Evidence::extension is optional and independent of `payload` ----

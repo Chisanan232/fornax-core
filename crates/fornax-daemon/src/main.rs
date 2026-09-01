@@ -9,8 +9,8 @@ use axum::{Json, Router};
 use fornax_types::redact::{redact_json, redact_text};
 use fornax_types::{IngestMessage, RuntimeCapabilities};
 use fornax_verify::{
-    CommandExecutedVerifier, CommandSuccessVerifier, FileModifiedVerifier, TestResultVerifier,
-    Verifier,
+    CommandExecutedVerifier, CommandSuccessVerifier, FileModifiedVerifier, GitOperationVerifier,
+    TestResultVerifier, Verifier,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -296,13 +296,14 @@ async fn handle_message(
 
             // FORNX-14: registry stays a flat Vec, per the ticket's own
             // maintainability requirement ("verifier registry/dispatch only
-            // as complex as the first real verifier set requires") — four
+            // as complex as the first real verifier set requires") — five
             // verifiers dispatched by `applies_to` doesn't yet justify more.
             let verifiers: Vec<Box<dyn Verifier + Send + Sync>> = vec![
                 Box::new(TestResultVerifier),
                 Box::new(CommandExecutedVerifier),
                 Box::new(CommandSuccessVerifier),
                 Box::new(FileModifiedVerifier),
+                Box::new(GitOperationVerifier),
             ];
             for verifier in verifiers.iter().filter(|v| v.applies_to(&claim)) {
                 let finding = verifier.verify(&claim, &evidence, &caps);
@@ -549,6 +550,82 @@ mod tests {
         assert!(
             stored_diff.contains("REDACTED"),
             "expected a redacted placeholder in stored FileDiff evidence: {stored_diff}"
+        );
+    }
+
+    /// FORNX-14 regression: a `ProcessObservation`/`vcs_operation` evidence
+    /// payload must go through the same generic redaction boundary as any
+    /// other evidence payload before storage — mirrors
+    /// `file_diff_evidence_diff_is_redacted_before_storage` above. The
+    /// canary is placed in `description` (a generic string field redact_json
+    /// walks recursively), not in `observation.remote` — the sensor itself
+    /// already sanitizes `remote` before this evidence is ever constructed
+    /// (see `ClaudeGitOutcomeSensor::sanitize_remote`'s own dedicated
+    /// regression coverage in `fornax-adapter-claude`), so `remote` is not a
+    /// meaningful place to prove the *generic* redaction boundary here.
+    #[tokio::test]
+    async fn git_operation_evidence_is_redacted_before_storage() {
+        let state = test_state().await;
+        let mut hint = None;
+        let marker = format!("FORNAX-CANARY-{}-DO-NOT-LEAK", Uuid::new_v4().simple());
+        let session_id = "fornx-14-git-outcome-redaction-regression".to_string();
+
+        let event_id = Uuid::new_v4();
+        let event = AgentEvent {
+            id: event_id,
+            session_id: session_id.clone(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-08-31T00:00:00Z".to_string(),
+            tool_name: Some("Bash".to_string()),
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        handle_message(&state, IngestMessage::Event(event), &mut hint)
+            .await
+            .expect("handle event");
+
+        let evidence = fornax_types::Evidence {
+            id: Uuid::new_v4(),
+            session_id: session_id.clone(),
+            source_event_id: event_id,
+            kind: fornax_types::EvidenceKind::ProcessObservation,
+            observed_at: "2026-08-31T00:00:00Z".to_string(),
+            payload: serde_json::json!({
+                "description": format!("git commit created -- {marker}"),
+                "observation": {
+                    "observation_kind": "vcs_operation",
+                    "operation": "commit",
+                    "outcome": "created",
+                    "commit_sha": "0e2fbd4",
+                    "branch": "main"
+                }
+            }),
+            provenance: "claude_code:1.2.3:PostToolUse:Bash#tool_response:git_commit".to_string(),
+            source: None,
+            extension: None,
+        };
+        handle_message(&state, IngestMessage::Evidence(evidence), &mut hint)
+            .await
+            .expect("handle evidence");
+
+        let stored = state
+            .store
+            .evidence_for_session(&session_id)
+            .await
+            .expect("read back evidence");
+        let stored_description = stored.evidence[0].payload["description"]
+            .as_str()
+            .expect("description field present")
+            .to_string();
+        assert!(
+            !stored_description.contains(&marker),
+            "raw canary marker leaked into stored ProcessObservation evidence: {stored_description}"
+        );
+        assert!(
+            stored_description.contains("REDACTED"),
+            "expected a redacted placeholder in stored ProcessObservation evidence: {stored_description}"
         );
     }
 

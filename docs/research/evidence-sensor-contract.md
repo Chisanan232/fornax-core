@@ -68,9 +68,16 @@ see the crates' test suites.
 | `CodexExecCommandEndSensor` | `fornax-adapter-codex` | The inline `exec_command_end.exit_code` literal-field extraction in `translate_line()` |
 | `CodexCustomToolCallOutputSensor` | `fornax-adapter-codex` | The inline `custom_tool_call_output` "Script completed" heuristic in `translate_line()` |
 
-No Git or CI-signal evidence collection exists in this codebase today — a
-`GitSensor`/`CiSensor` was deliberately not built (FORNX-157 non-goal:
-don't speculatively design sensors for signals that don't exist yet).
+No CI-signal evidence collection exists in this codebase today — a
+`CiSensor` was deliberately not built (FORNX-157 non-goal: don't
+speculatively design sensors for signals that don't exist yet). Git
+evidence collection now does exist (FORNX-14): `ClaudeGitOutcomeSensor`
+(`fornax-adapter-claude`) parses `git commit`/`git push` output from a Bash
+`tool_response` into `EvidenceKind::ProcessObservation` evidence (a
+`ProcessObservationDetail::VcsOperation` payload — no new `EvidenceKind`
+variant, per that enum's closed-enum doc comment). Unlike the migrated paths
+above, its provenance ends `#tool_response:...`, not a heuristic tag: it
+parses git's own real printed output, not a `tool_input` reconstruction.
 
 ## Worked example: a future `ReasoningSummarySensor`
 

@@ -547,6 +547,289 @@ impl Verifier for FileModifiedVerifier {
     }
 }
 
+/// Fifth claim class (FORNX-14): an agent claims a git commit or push
+/// happened (e.g. "I committed with SHA `0e2fbd4`.", "I pushed to `main`.").
+/// One verifier handles both `git_commit`/`git_push` subjects — unlike
+/// `CommandExecutedVerifier`/`CommandSuccessVerifier`'s split, both subjects
+/// here need identical evidence lookup (the same `ProcessObservation`
+/// `vcs_operation` evidence), just a different verdict mapping per subject.
+///
+/// Unlike [`FileModifiedVerifier`] (capped at `Review` because its only
+/// evidence is a `tool_input` reconstruction, never authoritative),
+/// `Verdict::Verified` is reachable here: the commit SHA / branch / remote
+/// come from git's own real printed stdout/stderr, captured verbatim in
+/// Claude Code's `tool_response` — an authoritative-evidence path, not a
+/// heuristic one (see `fornax-adapter-claude`'s `ClaudeGitOutcomeSensor`,
+/// whose provenance ends `#tool_response:...`, never `#heuristic:...`).
+/// **Invariant**: if a future change ever derives this evidence from
+/// `tool_input` instead of `tool_response` (e.g. before the command has
+/// actually run), it must be marked heuristic and capped at `Review`,
+/// mirroring the `FileModifiedVerifier` precedent — never silently promoted
+/// to `Verified`.
+pub struct GitOperationVerifier;
+
+impl GitOperationVerifier {
+    /// True when `s` looks like a git commit SHA (7-40 hex chars) — mirrors
+    /// `fornax-adapter-claude::ClaudeGitOutcomeSensor::looks_sha_shaped`.
+    /// Duplicated rather than imported: `fornax-verify` must not depend on
+    /// an adapter crate (adapters are downstream of core, never the reverse).
+    fn looks_sha_shaped(s: &str) -> bool {
+        (7..=40).contains(&s.len()) && s.chars().all(|c| c.is_ascii_hexdigit())
+    }
+
+    /// Extracts a SHA-shaped literal from claim text, reusing the same
+    /// delimited-literal extraction as `CommandExecutedVerifier`/
+    /// `FileModifiedVerifier`. `None` means the claim names no SHA literal
+    /// to check evidence against.
+    fn extract_sha_literal(text: &str) -> Option<String> {
+        let candidate = extract_delimited(text, '`').or_else(|| extract_delimited(text, '"'))?;
+        if Self::looks_sha_shaped(&candidate) {
+            Some(candidate)
+        } else {
+            None
+        }
+    }
+
+    fn sha_matches(claimed: &str, actual: &str) -> bool {
+        let c = claimed.to_lowercase();
+        let a = actual.to_lowercase();
+        a.starts_with(&c) || c.starts_with(&a)
+    }
+
+    /// True when `e` is `ProcessObservation` evidence for a `vcs_operation`
+    /// observation whose `operation` field matches `operation` (`"commit"`
+    /// or `"push"`).
+    fn matches_operation(e: &Evidence, operation: &str) -> bool {
+        e.kind == EvidenceKind::ProcessObservation
+            && e.payload
+                .pointer("/observation/observation_kind")
+                .and_then(|v| v.as_str())
+                == Some("vcs_operation")
+            && e.payload
+                .pointer("/observation/operation")
+                .and_then(|v| v.as_str())
+                == Some(operation)
+    }
+
+    fn verify_commit(&self, claim: &Claim, evidence: &[Evidence], now: String) -> Finding {
+        let Some(ev) = evidence
+            .iter()
+            .rev()
+            .find(|e| Self::matches_operation(e, "commit"))
+        else {
+            return Finding {
+                id: Uuid::new_v4(),
+                claim_id: claim.id,
+                verdict: Verdict::Unverified,
+                evidence_ids: vec![],
+                verifier_name: self.name().to_string(),
+                rationale: "no git commit evidence observed in this session".to_string(),
+                computed_at: now,
+            };
+        };
+
+        let outcome = ev
+            .payload
+            .pointer("/observation/outcome")
+            .and_then(|v| v.as_str());
+        match outcome {
+            Some("created") => {
+                let actual_sha = ev
+                    .payload
+                    .pointer("/observation/commit_sha")
+                    .and_then(|v| v.as_str());
+                let claimed_sha = Self::extract_sha_literal(&claim.text);
+                match (&claimed_sha, actual_sha) {
+                    (Some(claimed), Some(actual)) if !Self::sha_matches(claimed, actual) => {
+                        Finding {
+                            id: Uuid::new_v4(),
+                            claim_id: claim.id,
+                            verdict: Verdict::Contradicted,
+                            evidence_ids: vec![ev.id],
+                            verifier_name: self.name().to_string(),
+                            rationale: format!(
+                                "claim names commit sha \"{claimed}\", but observed commit sha \
+                             \"{actual}\" ({})",
+                                ev.provenance
+                            ),
+                            computed_at: now,
+                        }
+                    }
+                    _ => Finding {
+                        id: Uuid::new_v4(),
+                        claim_id: claim.id,
+                        verdict: Verdict::Verified,
+                        evidence_ids: vec![ev.id],
+                        verifier_name: self.name().to_string(),
+                        rationale: format!("observed git commit created ({})", ev.provenance),
+                        computed_at: now,
+                    },
+                }
+            }
+            Some("nothing_to_commit") => Finding {
+                id: Uuid::new_v4(),
+                claim_id: claim.id,
+                verdict: Verdict::Contradicted,
+                evidence_ids: vec![ev.id],
+                verifier_name: self.name().to_string(),
+                rationale: format!(
+                    "claim states a commit was made, but git reported nothing to commit ({})",
+                    ev.provenance
+                ),
+                computed_at: now,
+            },
+            _ => Finding {
+                id: Uuid::new_v4(),
+                claim_id: claim.id,
+                verdict: Verdict::Unverified,
+                evidence_ids: vec![],
+                verifier_name: self.name().to_string(),
+                rationale: "git commit evidence found but its outcome was not recognized"
+                    .to_string(),
+                computed_at: now,
+            },
+        }
+    }
+
+    fn verify_push(&self, claim: &Claim, evidence: &[Evidence], now: String) -> Finding {
+        let Some(ev) = evidence
+            .iter()
+            .rev()
+            .find(|e| Self::matches_operation(e, "push"))
+        else {
+            return Finding {
+                id: Uuid::new_v4(),
+                claim_id: claim.id,
+                verdict: Verdict::Unverified,
+                evidence_ids: vec![],
+                verifier_name: self.name().to_string(),
+                rationale: "no git push evidence observed in this session".to_string(),
+                computed_at: now,
+            };
+        };
+
+        let outcome = ev
+            .payload
+            .pointer("/observation/outcome")
+            .and_then(|v| v.as_str());
+        match outcome {
+            Some("ref_updated") => {
+                let actual_branch = ev
+                    .payload
+                    .pointer("/observation/branch")
+                    .and_then(|v| v.as_str());
+                let claimed_branch = extract_delimited(&claim.text, '`')
+                    .or_else(|| extract_delimited(&claim.text, '"'));
+                match (&claimed_branch, actual_branch) {
+                    (Some(claimed), Some(actual)) if !claimed.eq_ignore_ascii_case(actual) => {
+                        Finding {
+                            id: Uuid::new_v4(),
+                            claim_id: claim.id,
+                            verdict: Verdict::Unverified,
+                            evidence_ids: vec![],
+                            verifier_name: self.name().to_string(),
+                            rationale: format!(
+                            "claim names branch \"{claimed}\", but observed push updated branch \
+                             \"{actual}\" -- ambiguous (multi-branch session), not confirmed wrong \
+                             ({})",
+                            ev.provenance
+                        ),
+                            computed_at: now,
+                        }
+                    }
+                    _ => Finding {
+                        id: Uuid::new_v4(),
+                        claim_id: claim.id,
+                        verdict: Verdict::Verified,
+                        evidence_ids: vec![ev.id],
+                        verifier_name: self.name().to_string(),
+                        rationale: format!("observed git push ref updated ({})", ev.provenance),
+                        computed_at: now,
+                    },
+                }
+            }
+            Some("rejected") => Finding {
+                id: Uuid::new_v4(),
+                claim_id: claim.id,
+                verdict: Verdict::Contradicted,
+                evidence_ids: vec![ev.id],
+                verifier_name: self.name().to_string(),
+                rationale: format!(
+                    "claim states the push succeeded, but git rejected the push ({})",
+                    ev.provenance
+                ),
+                computed_at: now,
+            },
+            Some("up_to_date") => Finding {
+                id: Uuid::new_v4(),
+                claim_id: claim.id,
+                verdict: Verdict::Review,
+                evidence_ids: vec![ev.id],
+                verifier_name: self.name().to_string(),
+                rationale: format!(
+                    "git reported nothing to push (\"Everything up-to-date\") for this \
+                     invocation; the branch may have been pushed earlier in the session -- \
+                     flagged for review, not confirmed ({})",
+                    ev.provenance
+                ),
+                computed_at: now,
+            },
+            _ => Finding {
+                id: Uuid::new_v4(),
+                claim_id: claim.id,
+                verdict: Verdict::Unverified,
+                evidence_ids: vec![],
+                verifier_name: self.name().to_string(),
+                rationale: "git push evidence found but its outcome was not recognized".to_string(),
+                computed_at: now,
+            },
+        }
+    }
+}
+
+impl Verifier for GitOperationVerifier {
+    fn name(&self) -> &'static str {
+        "git_operation_verifier_v1"
+    }
+
+    fn applies_to(&self, claim: &Claim) -> bool {
+        claim.subject == "git_commit" || claim.subject == "git_push"
+    }
+
+    /// Deliberately gated on `ToolTrace`/`ToolResultPayload`, NOT
+    /// `FinalResponse` — same divergence as `FileModifiedVerifier` and for
+    /// the same reason: this verifier's only evidence source is
+    /// `EvidenceKind::ProcessObservation`'s `vcs_operation` shape, produced
+    /// solely from a `PostToolUse` `tool_response`, never from transcript
+    /// text. Gating on `FinalResponse` would open this verifier for sessions
+    /// that can never actually produce the evidence it looks for.
+    fn verify(&self, claim: &Claim, evidence: &[Evidence], caps: &RuntimeCapabilities) -> Finding {
+        let now = chrono::Utc::now().to_rfc3339();
+
+        if !caps.is_observable(&SignalClass::ToolTrace)
+            && !caps.is_observable(&SignalClass::ToolResultPayload)
+        {
+            return unavailable(
+                claim.id,
+                self.name(),
+                "runtime does not expose tool-trace/tool-result evidence needed to check git commit/push outcomes",
+                now,
+            );
+        }
+
+        match claim.subject.as_str() {
+            "git_commit" => self.verify_commit(claim, evidence, now),
+            "git_push" => self.verify_push(claim, evidence, now),
+            _ => unavailable(
+                claim.id,
+                self.name(),
+                "applies_to guarantees subject is git_commit or git_push",
+                now,
+            ),
+        }
+    }
+}
+
 /// Extract the substring between the first pair of `delim` characters in
 /// `text`, trimmed. Returns `None` when `delim` doesn't appear twice or the
 /// enclosed text is empty.
@@ -1413,6 +1696,244 @@ mod file_modified_verifier_tests {
             "/Users/x/project/src/lib.rs",
             "-old\n+new\n",
         )];
+        let capabilities = caps();
+
+        let first = v.verify(&c, &ev, &capabilities);
+        let replayed = v.verify(&c, &ev, &capabilities);
+
+        assert_eq!(first.verdict, replayed.verdict);
+        assert_eq!(first.rationale, replayed.rationale);
+        assert_eq!(first.evidence_ids, replayed.evidence_ids);
+    }
+}
+
+#[cfg(test)]
+mod git_operation_verifier_tests {
+    use super::*;
+    use fornax_types::{CapabilitySignal, Provider, SignalAvailability};
+
+    fn caps() -> RuntimeCapabilities {
+        RuntimeCapabilities {
+            schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
+            provider: Provider::ClaudeCode,
+            signals: vec![
+                CapabilitySignal {
+                    class: SignalClass::ToolTrace,
+                    state: SignalAvailability::Available,
+                    detail: None,
+                },
+                CapabilitySignal {
+                    class: SignalClass::ToolResultPayload,
+                    state: SignalAvailability::Available,
+                    detail: None,
+                },
+            ],
+            notes: Default::default(),
+        }
+    }
+
+    fn no_caps() -> RuntimeCapabilities {
+        RuntimeCapabilities {
+            schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
+            provider: Provider::ClaudeCode,
+            signals: vec![
+                CapabilitySignal {
+                    class: SignalClass::ToolTrace,
+                    state: SignalAvailability::Unknown,
+                    detail: None,
+                },
+                CapabilitySignal {
+                    class: SignalClass::ToolResultPayload,
+                    state: SignalAvailability::Unknown,
+                    detail: None,
+                },
+            ],
+            notes: Default::default(),
+        }
+    }
+
+    fn vcs_evidence(observation: serde_json::Value) -> Evidence {
+        Evidence {
+            id: Uuid::new_v4(),
+            session_id: "s1".into(),
+            source_event_id: Uuid::new_v4(),
+            kind: EvidenceKind::ProcessObservation,
+            observed_at: chrono::Utc::now().to_rfc3339(),
+            payload: serde_json::json!({
+                "description": "git observation",
+                "observation": observation,
+            }),
+            provenance: "claude_code:1.2.3:PostToolUse:Bash#tool_response:git_commit".into(),
+            source: None,
+            extension: None,
+        }
+    }
+
+    fn commit_evidence(outcome: &str, commit_sha: Option<&str>, branch: Option<&str>) -> Evidence {
+        vcs_evidence(serde_json::json!({
+            "observation_kind": "vcs_operation",
+            "operation": "commit",
+            "outcome": outcome,
+            "commit_sha": commit_sha,
+            "branch": branch,
+        }))
+    }
+
+    fn push_evidence(outcome: &str, branch: Option<&str>) -> Evidence {
+        vcs_evidence(serde_json::json!({
+            "observation_kind": "vcs_operation",
+            "operation": "push",
+            "outcome": outcome,
+            "branch": branch,
+        }))
+    }
+
+    // --- git_commit ---------------------------------------------------
+
+    #[test]
+    fn created_with_no_sha_literal_in_claim_is_verified() {
+        let v = GitOperationVerifier;
+        let c = crate::tests::claim_for("git_commit", "I committed the change.");
+        let ev = vec![commit_evidence("created", Some("0e2fbd4"), Some("main"))];
+        let f = v.verify(&c, &ev, &caps());
+        assert_eq!(f.verdict, Verdict::Verified);
+        assert_eq!(f.evidence_ids, vec![ev[0].id]);
+    }
+
+    #[test]
+    fn created_with_matching_sha_literal_is_verified() {
+        let v = GitOperationVerifier;
+        let c = crate::tests::claim_for("git_commit", "I committed with sha `0e2fbd4`.");
+        let ev = vec![commit_evidence("created", Some("0e2fbd4"), Some("main"))];
+        let f = v.verify(&c, &ev, &caps());
+        assert_eq!(f.verdict, Verdict::Verified);
+    }
+
+    /// Falsification (required): a mismatched SHA literal must actually
+    /// contradict, not silently pass.
+    #[test]
+    fn created_with_mismatched_sha_literal_is_contradicted() {
+        let v = GitOperationVerifier;
+        let c = crate::tests::claim_for("git_commit", "I committed with sha `deadbee`.");
+        let ev = vec![commit_evidence("created", Some("abc1234"), Some("main"))];
+        let f = v.verify(&c, &ev, &caps());
+        assert_eq!(f.verdict, Verdict::Contradicted);
+        assert_eq!(f.evidence_ids, vec![ev[0].id]);
+    }
+
+    #[test]
+    fn nothing_to_commit_is_contradicted() {
+        let v = GitOperationVerifier;
+        let c = crate::tests::claim_for("git_commit", "I committed the change.");
+        let ev = vec![commit_evidence("nothing_to_commit", None, None)];
+        let f = v.verify(&c, &ev, &caps());
+        assert_eq!(f.verdict, Verdict::Contradicted);
+        assert_eq!(f.evidence_ids, vec![ev[0].id]);
+    }
+
+    #[test]
+    fn no_matching_evidence_is_unverified_for_git_commit() {
+        let v = GitOperationVerifier;
+        let c = crate::tests::claim_for("git_commit", "I committed the change.");
+        let f = v.verify(&c, &[], &caps());
+        assert_eq!(f.verdict, Verdict::Unverified);
+        assert!(f.evidence_ids.is_empty());
+    }
+
+    // --- git_push -------------------------------------------------------
+
+    #[test]
+    fn ref_updated_is_verified() {
+        let v = GitOperationVerifier;
+        let c = crate::tests::claim_for("git_push", "I pushed the branch.");
+        let ev = vec![push_evidence("ref_updated", Some("main"))];
+        let f = v.verify(&c, &ev, &caps());
+        assert_eq!(f.verdict, Verdict::Verified);
+        assert_eq!(f.evidence_ids, vec![ev[0].id]);
+    }
+
+    #[test]
+    fn ref_updated_with_matching_branch_literal_is_verified() {
+        let v = GitOperationVerifier;
+        let c = crate::tests::claim_for("git_push", "I pushed to `main`.");
+        let ev = vec![push_evidence("ref_updated", Some("main"))];
+        let f = v.verify(&c, &ev, &caps());
+        assert_eq!(f.verdict, Verdict::Verified);
+    }
+
+    #[test]
+    fn ref_updated_with_mismatched_branch_literal_is_unverified() {
+        let v = GitOperationVerifier;
+        let c = crate::tests::claim_for("git_push", "I pushed to `develop`.");
+        let ev = vec![push_evidence("ref_updated", Some("main"))];
+        let f = v.verify(&c, &ev, &caps());
+        assert_eq!(f.verdict, Verdict::Unverified);
+    }
+
+    #[test]
+    fn rejected_push_is_contradicted() {
+        let v = GitOperationVerifier;
+        let c = crate::tests::claim_for("git_push", "I pushed the branch.");
+        let ev = vec![push_evidence("rejected", None)];
+        let f = v.verify(&c, &ev, &caps());
+        assert_eq!(f.verdict, Verdict::Contradicted);
+        assert_eq!(f.evidence_ids, vec![ev[0].id]);
+    }
+
+    #[test]
+    fn up_to_date_push_is_review() {
+        let v = GitOperationVerifier;
+        let c = crate::tests::claim_for("git_push", "I pushed the branch.");
+        let ev = vec![push_evidence("up_to_date", None)];
+        let f = v.verify(&c, &ev, &caps());
+        assert_eq!(f.verdict, Verdict::Review);
+        assert_eq!(f.evidence_ids, vec![ev[0].id]);
+    }
+
+    #[test]
+    fn no_matching_evidence_is_unverified_for_git_push() {
+        let v = GitOperationVerifier;
+        let c = crate::tests::claim_for("git_push", "I pushed the branch.");
+        let f = v.verify(&c, &[], &caps());
+        assert_eq!(f.verdict, Verdict::Unverified);
+        assert!(f.evidence_ids.is_empty());
+    }
+
+    // --- capability gate --------------------------------------------------
+
+    #[test]
+    fn capability_gate_closed_is_unavailable_for_git_commit() {
+        let v = GitOperationVerifier;
+        let c = crate::tests::claim_for("git_commit", "I committed the change.");
+        let f = v.verify(&c, &[], &no_caps());
+        assert_eq!(f.verdict, Verdict::Unavailable);
+    }
+
+    #[test]
+    fn capability_gate_closed_is_unavailable_for_git_push() {
+        let v = GitOperationVerifier;
+        let c = crate::tests::claim_for("git_push", "I pushed the branch.");
+        let f = v.verify(&c, &[], &no_caps());
+        assert_eq!(f.verdict, Verdict::Unavailable);
+    }
+
+    // --- applies_to ---------------------------------------------------
+
+    #[test]
+    fn applies_to_both_git_subjects_only() {
+        let v = GitOperationVerifier;
+        assert!(v.applies_to(&crate::tests::claim_for("git_commit", "x")));
+        assert!(v.applies_to(&crate::tests::claim_for("git_push", "x")));
+        assert!(!v.applies_to(&crate::tests::claim_for("test_result", "x")));
+    }
+
+    // --- determinism ----------------------------------------------------
+
+    #[test]
+    fn recomputing_from_the_same_persisted_inputs_is_deterministic() {
+        let v = GitOperationVerifier;
+        let c = crate::tests::claim_for("git_commit", "I committed with sha `0e2fbd4`.");
+        let ev = vec![commit_evidence("created", Some("0e2fbd4"), Some("main"))];
         let capabilities = caps();
 
         let first = v.verify(&c, &ev, &capabilities);

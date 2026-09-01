@@ -94,7 +94,16 @@ fn claude_declares_process_result_unsupported_and_never_emits_a_literal_exit_cod
     for native in claude_native_events() {
         if let NormalizationOutcome::Messages(msgs) = adapter.normalize("fixture-hint", &native) {
             for msg in msgs {
+                // FORNX-14: scoped to `ExitCode` evidence specifically — this
+                // declaration/assertion is about exit codes, not every
+                // evidence kind this adapter emits. A `ProcessObservation`
+                // (e.g. `ClaudeGitOutcomeSensor`'s git commit/push evidence)
+                // carries no `heuristic` field at all and must not be
+                // checked against it.
                 if let IngestMessage::Evidence(ev) = msg {
+                    if ev.kind != EvidenceKind::ExitCode {
+                        continue;
+                    }
                     assert_eq!(
                         ev.payload["heuristic"],
                         serde_json::json!(true),
