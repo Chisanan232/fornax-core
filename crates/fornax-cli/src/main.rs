@@ -57,6 +57,28 @@ enum Commands {
     /// `~/.claude/settings.json` does not exist, in which case it is left
     /// absent rather than created.
     UninstallClaude,
+    /// Idempotently wires Fornax's ambient-status notify script into
+    /// `~/.codex/config.toml`'s `notify` entry (FORNX-16/FORNX-17).
+    ///
+    /// This does **not** configure Codex's evidence-capture path — the
+    /// rollout-JSONL tailer (`fornax-hook-codex`) reads Codex's always-on
+    /// session transcripts directly and needs no Codex-side configuration
+    /// at all; just run it (see the README's Codex section). `notify` is
+    /// the separate, optional ambient-status surface documented in
+    /// `docs/dogfooding-codex-notify.md`.
+    ///
+    /// Codex's `notify` holds exactly one command (unlike Claude's
+    /// per-event hook arrays), so if it is already wired to something else
+    /// this refuses to overwrite it and leaves the file byte-for-byte
+    /// unchanged — wire Fornax in manually instead. Comments and unrelated
+    /// tables in the file are preserved.
+    InstallCodex,
+    /// Reverse of `install-codex`: removes the Fornax `notify` entry from
+    /// `~/.codex/config.toml` if and only if it is the one `install-codex`
+    /// added, leaving every other key/table (and comments) untouched. Safe
+    /// to run when nothing is installed, including when
+    /// `~/.codex/config.toml` does not exist.
+    UninstallCodex,
 }
 
 fn base_url() -> String {
@@ -82,6 +104,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::ExportSpool { session, out } => export_spool(&session, &out).await?,
         Commands::InstallClaude => install_claude()?,
         Commands::UninstallClaude => uninstall_claude()?,
+        Commands::InstallCodex => install_codex()?,
+        Commands::UninstallCodex => uninstall_codex()?,
     }
     Ok(())
 }
@@ -284,6 +308,189 @@ fn install_claude() -> anyhow::Result<()> {
 
 fn uninstall_claude() -> anyhow::Result<()> {
     uninstall_claude_at(&claude_settings_path())
+}
+
+/// Filename marker identifying a Fornax-owned `notify` entry in
+/// `~/.codex/config.toml`. Matched by suffix (rather than requiring a
+/// byte-for-byte absolute-path match) so uninstall still recognizes an
+/// install made from a different checkout of this repo.
+const CODEX_NOTIFY_SCRIPT_MARKER: &str = "fornax-codex-notify.sh";
+
+fn codex_config_path() -> std::path::PathBuf {
+    dirs_home().join(".codex").join("config.toml")
+}
+
+/// Absolute path to `scripts/fornax-codex-notify.sh`, resolved relative to
+/// this crate's location in the workspace at compile time — matches the
+/// documented from-source workflow (`cargo build --workspace` from the
+/// repo root; see `docs/dogfooding-codex-notify.md`).
+fn default_codex_notify_script() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../scripts/fornax-codex-notify.sh")
+}
+
+/// Parses `path` as a format-preserving TOML document (comments and table
+/// ordering survive edits), or an empty document if `path` does not exist.
+/// Unlike `load_settings`'s JSON equivalent, a `~/.codex/config.toml` that
+/// fails to parse as TOML is always a hard error — there is no sensible
+/// "treat it as empty" fallback for a file this consequential.
+fn load_codex_config(path: &std::path::Path) -> anyhow::Result<toml_edit::DocumentMut> {
+    if !path.exists() {
+        return Ok(toml_edit::DocumentMut::new());
+    }
+    let contents = std::fs::read_to_string(path)?;
+    contents.parse::<toml_edit::DocumentMut>().map_err(|e| {
+        anyhow::anyhow!(
+            "{} is not valid TOML — refusing to touch it: {e}",
+            path.display()
+        )
+    })
+}
+
+/// Atomically overwrites `path` with `doc` (write-to-temp then rename, same
+/// pattern `save_settings` uses for Claude's JSON). Additionally preserves
+/// the original file's Unix permissions on the replacement — a real
+/// `~/.codex/config.toml` on this machine is mode 0600, and this repo's own
+/// capability-matrix research (FORNX-33) has found plaintext secrets in
+/// other Codex on-disk files, so silently widening this file to the
+/// process umask's default mode on rename would be a real regression, not
+/// a cosmetic one. A freshly created file gets 0600 rather than an
+/// umask-dependent default.
+fn save_codex_config(path: &std::path::Path, doc: &toml_edit::DocumentMut) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp_path = path.with_extension("toml.tmp");
+    std::fs::write(&tmp_path, doc.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)
+            .map(|m| m.permissions().mode())
+            .unwrap_or(0o600);
+        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(mode))?;
+    }
+    std::fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
+/// True if `notify`'s first element is a Fornax-owned notify script.
+///
+/// Compares the path's basename exactly, not a bare `ends_with` on the
+/// whole string — a foreign script at e.g. `/opt/my-fornax-codex-notify.sh`
+/// would `ends_with(CODEX_NOTIFY_SCRIPT_MARKER)` even though its basename
+/// is a different file, which would make `uninstall-codex` delete a
+/// user's real, unrelated `notify` configuration.
+fn notify_is_fornax(item: &toml_edit::Item) -> bool {
+    item.as_array()
+        .and_then(|a| a.get(0))
+        .and_then(|v| v.as_str())
+        .map(|s| {
+            std::path::Path::new(s).file_name().and_then(|f| f.to_str())
+                == Some(CODEX_NOTIFY_SCRIPT_MARKER)
+        })
+        .unwrap_or(false)
+}
+
+/// Idempotently wires `script_path` into `config_path`'s `notify` entry.
+///
+/// Codex's `notify` holds exactly one command — its first element is the
+/// program, any remaining elements are that program's own extra arguments,
+/// not additional commands (see `docs/dogfooding-codex-notify.md`'s
+/// live-captured invocation shape). So unlike Claude's per-event hook
+/// arrays, this can never safely *add* Fornax alongside an existing
+/// foreign `notify` value — doing so would either replace the user's
+/// configured command outright or corrupt it by appending Fornax's path as
+/// that command's own argument. If `notify` is already set to something
+/// other than this exact script, this refuses to touch the file and
+/// returns an error instead.
+fn install_codex_notify_at(
+    config_path: &std::path::Path,
+    script_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    let mut doc = load_codex_config(config_path)?;
+    let script_str = script_path.to_string_lossy().into_owned();
+
+    if let Some(existing) = doc.get("notify") {
+        anyhow::ensure!(
+            existing.is_array(),
+            "existing \"notify\" value in {} is not an array — refusing to overwrite it",
+            config_path.display()
+        );
+        let existing_first = existing
+            .as_array()
+            .and_then(|a| a.get(0))
+            .and_then(|v| v.as_str());
+        if existing_first == Some(script_str.as_str()) {
+            println!(
+                "Fornax Codex notify already installed in {}",
+                config_path.display()
+            );
+            return Ok(());
+        }
+        anyhow::bail!(
+            "existing \"notify\" in {} is already wired to {:?} — refusing to overwrite it \
+             (Codex's notify holds exactly one command; wire Fornax in manually alongside \
+             it, or remove the existing entry first)",
+            config_path.display(),
+            existing_first.unwrap_or("<non-string entry>")
+        );
+    }
+
+    let mut arr = toml_edit::Array::new();
+    arr.push(script_str);
+    doc["notify"] = toml_edit::Item::Value(toml_edit::Value::Array(arr));
+    save_codex_config(config_path, &doc)?;
+    println!(
+        "Installed Fornax Codex notify wiring in {}",
+        config_path.display()
+    );
+    Ok(())
+}
+
+/// Removes the Fornax `notify` entry from `config_path` iff it is the one
+/// `install-codex` added, leaving every other key/table and comment
+/// exactly as it was.
+fn uninstall_codex_notify_at(config_path: &std::path::Path) -> anyhow::Result<()> {
+    if !config_path.exists() {
+        // Nothing was ever installed — leave the machine exactly as it
+        // was rather than creating a config.toml the user never had.
+        println!(
+            "No Fornax Codex notify wiring to remove ({} does not exist)",
+            config_path.display()
+        );
+        return Ok(());
+    }
+    let mut doc = load_codex_config(config_path)?;
+    let Some(existing) = doc.get("notify") else {
+        println!(
+            "No Fornax Codex notify wiring found in {}",
+            config_path.display()
+        );
+        return Ok(());
+    };
+    if !notify_is_fornax(existing) {
+        println!(
+            "No Fornax Codex notify wiring found in {}",
+            config_path.display()
+        );
+        return Ok(());
+    }
+    doc.remove("notify");
+    save_codex_config(config_path, &doc)?;
+    println!(
+        "Removed Fornax Codex notify wiring from {}",
+        config_path.display()
+    );
+    Ok(())
+}
+
+fn install_codex() -> anyhow::Result<()> {
+    install_codex_notify_at(&codex_config_path(), &default_codex_notify_script())
+}
+
+fn uninstall_codex() -> anyhow::Result<()> {
+    uninstall_codex_notify_at(&codex_config_path())
 }
 
 /// Writes one envelope JSON file into `<out>/pending/<id>.json`, internally
@@ -641,6 +848,223 @@ mod tests {
                 !path.exists(),
                 "uninstall must not create a settings.json the user never had"
             );
+        }
+    }
+
+    // FORNX-16: install-codex / uninstall-codex must idempotently
+    // add/remove the Fornax `notify` entry in a `~/.codex/config.toml`-
+    // shaped fixture without disturbing anything else already in the
+    // file — including comments and unrelated tables, which the JSON-based
+    // Claude equivalent doesn't need to worry about but format-preserving
+    // TOML editing does.
+    mod codex_notify_install_uninstall {
+        use super::*;
+        use uuid::Uuid;
+
+        fn tmp_config_path(name: &str) -> std::path::PathBuf {
+            std::env::temp_dir().join(format!(
+                "fornax-cli-test-codex-config-{name}-{}.toml",
+                Uuid::new_v4()
+            ))
+        }
+
+        fn script_path() -> std::path::PathBuf {
+            std::path::PathBuf::from("/opt/fornax/scripts/fornax-codex-notify.sh")
+        }
+
+        #[test]
+        fn install_adds_notify_to_fresh_file() {
+            let path = tmp_config_path("fresh-install");
+            // No file exists yet — install must create it from scratch.
+
+            install_codex_notify_at(&path, &script_path()).expect("install");
+
+            let contents = std::fs::read_to_string(&path).unwrap();
+            let doc: toml_edit::DocumentMut = contents.parse().unwrap();
+            assert_eq!(
+                doc["notify"][0].as_str().unwrap(),
+                script_path().to_string_lossy()
+            );
+
+            std::fs::remove_file(&path).ok();
+        }
+
+        #[test]
+        fn install_is_idempotent_no_duplicate_or_error() {
+            let path = tmp_config_path("idempotent-install");
+
+            install_codex_notify_at(&path, &script_path()).expect("first install");
+            install_codex_notify_at(&path, &script_path()).expect("second install");
+
+            let contents = std::fs::read_to_string(&path).unwrap();
+            let doc: toml_edit::DocumentMut = contents.parse().unwrap();
+            let notify = doc["notify"].as_array().unwrap();
+            assert_eq!(notify.len(), 1);
+
+            std::fs::remove_file(&path).ok();
+        }
+
+        #[test]
+        fn install_preserves_comments_and_unrelated_tables() {
+            let path = tmp_config_path("preserve-unrelated");
+            let existing = "\
+# a user comment that must survive\n\
+model = \"gpt-5.6-luna\"\n\
+\n\
+[projects.\"/tmp/some-project\"]\n\
+trust_level = \"trusted\"\n";
+            std::fs::write(&path, existing).unwrap();
+
+            install_codex_notify_at(&path, &script_path()).expect("install");
+
+            let contents = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                contents.contains("# a user comment that must survive"),
+                "comment must survive format-preserving edit, got:\n{contents}"
+            );
+            let doc: toml_edit::DocumentMut = contents.parse().unwrap();
+            assert_eq!(doc["model"].as_str().unwrap(), "gpt-5.6-luna");
+            assert_eq!(
+                doc["projects"]["/tmp/some-project"]["trust_level"]
+                    .as_str()
+                    .unwrap(),
+                "trusted"
+            );
+            assert_eq!(
+                doc["notify"][0].as_str().unwrap(),
+                script_path().to_string_lossy()
+            );
+
+            std::fs::remove_file(&path).ok();
+        }
+
+        #[test]
+        fn install_refuses_to_overwrite_foreign_notify() {
+            let path = tmp_config_path("foreign-notify");
+            let existing = "notify = [\"/usr/local/bin/some-other-notifier\", \"extra-arg\"]\n";
+            std::fs::write(&path, existing).unwrap();
+            let before = std::fs::read_to_string(&path).unwrap();
+
+            let err = install_codex_notify_at(&path, &script_path())
+                .expect_err("must refuse to overwrite a foreign notify command");
+            assert!(err.to_string().contains("some-other-notifier"));
+
+            let after = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(
+                before, after,
+                "file must be byte-for-byte unchanged on refusal"
+            );
+
+            std::fs::remove_file(&path).ok();
+        }
+
+        #[test]
+        fn uninstall_does_not_remove_lookalike_foreign_notify() {
+            // Review finding: notify_is_fornax used to compare with a bare
+            // `ends_with` on the whole path string, so a foreign script whose
+            // path merely *ends with* the marker (but has a different
+            // basename) would be misidentified as Fornax-owned and deleted.
+            let path = tmp_config_path("lookalike-foreign-notify-uninstall");
+            let existing = "notify = [\"/opt/my-fornax-codex-notify.sh\"]\n";
+            std::fs::write(&path, existing).unwrap();
+
+            uninstall_codex_notify_at(&path).expect("uninstall must not error");
+
+            let after = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(
+                existing, after,
+                "a lookalike foreign notify entry must survive uninstall untouched"
+            );
+
+            std::fs::remove_file(&path).ok();
+        }
+
+        #[test]
+        fn uninstall_removes_notify_and_leaves_everything_else() {
+            let path = tmp_config_path("uninstall-clean");
+            let existing = "\
+model = \"gpt-5.6-luna\"\n\
+\n\
+[projects.\"/tmp/some-project\"]\n\
+trust_level = \"trusted\"\n";
+            std::fs::write(&path, existing).unwrap();
+
+            install_codex_notify_at(&path, &script_path()).expect("install");
+            uninstall_codex_notify_at(&path).expect("uninstall");
+
+            let contents = std::fs::read_to_string(&path).unwrap();
+            let doc: toml_edit::DocumentMut = contents.parse().unwrap();
+            assert!(doc.get("notify").is_none());
+            assert_eq!(doc["model"].as_str().unwrap(), "gpt-5.6-luna");
+            assert_eq!(
+                doc["projects"]["/tmp/some-project"]["trust_level"]
+                    .as_str()
+                    .unwrap(),
+                "trusted"
+            );
+
+            std::fs::remove_file(&path).ok();
+        }
+
+        #[test]
+        fn uninstall_never_touches_a_foreign_notify() {
+            let path = tmp_config_path("uninstall-foreign");
+            let existing = "notify = [\"/usr/local/bin/some-other-notifier\"]\n";
+            std::fs::write(&path, existing).unwrap();
+
+            uninstall_codex_notify_at(&path).expect("uninstall");
+
+            let contents = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(contents, existing);
+
+            std::fs::remove_file(&path).ok();
+        }
+
+        #[test]
+        fn uninstall_on_never_installed_file_is_a_safe_no_op() {
+            let path = tmp_config_path("uninstall-noop");
+            let existing = "model = \"gpt-5.6-luna\"\n";
+            std::fs::write(&path, existing).unwrap();
+
+            uninstall_codex_notify_at(&path).expect("uninstall on file without fornax notify");
+
+            let contents = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(contents, existing);
+
+            std::fs::remove_file(&path).ok();
+        }
+
+        #[test]
+        fn uninstall_on_missing_file_is_a_safe_no_op_and_creates_nothing() {
+            let path = tmp_config_path("uninstall-missing-file");
+            // No file exists.
+
+            uninstall_codex_notify_at(&path).expect("uninstall on missing file");
+
+            assert!(
+                !path.exists(),
+                "uninstall must not create a config.toml the user never had"
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn install_preserves_existing_file_permissions() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let path = tmp_config_path("preserve-perms");
+            std::fs::write(&path, "model = \"gpt-5.6-luna\"\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+            install_codex_notify_at(&path, &script_path()).expect("install");
+
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "install must not widen an existing file's permissions"
+            );
+
+            std::fs::remove_file(&path).ok();
         }
     }
 
