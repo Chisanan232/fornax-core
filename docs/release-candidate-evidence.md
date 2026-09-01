@@ -38,11 +38,11 @@ are not repeated here except where quoted for the closed vocabularies below.
 Golden-journey `surfaces` and feature-delta `surfaces` (below) are the same
 closed enum, so a P0 journey tagged with a surface is guaranteed comparable to a
 feature-delta item tagged with that same surface — this is the join the coverage
-reconciliation step depends on. Ten of the thirteen values are FORNX-229's own
+reconciliation step depends on. Ten of the fourteen values are FORNX-229's own
 trust-boundary list (`docs/release-assurance-policy.md`, "Risk / change classes"),
-renamed to identifiers; the remaining three cover feature-delta breadth this
-document's scope requires (public API/schema/migrations, infra/config, UI/docs)
-that are not themselves trust boundaries.
+renamed to identifiers; the remaining four cover feature-delta breadth this
+document's scope requires (public API/schema/migrations, infra/config, CLI,
+UI/docs) that are not themselves trust boundaries.
 
 | Surface | Trust boundary? | Meaning |
 |---|---|---|
