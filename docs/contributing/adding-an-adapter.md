@@ -3,6 +3,36 @@
 See `docs/adr/0004-adapter-contract.md` for the full rationale. This is the
 practical checklist and worked example.
 
+Also see, before you start:
+
+- `docs/research/evidence-sensor-contract.md` — the `EvidenceSensor`/
+  `EvidenceSource` contract, trust classes, and provenance requirements a new
+  sensor implements.
+- `docs/research/adapter-capability-matrix.md`'s "Consolidated compatibility
+  matrix" — the canonical, code-grounded per-provider `SignalClass` table;
+  keep it current when your adapter's `probe()` declares new signals.
+- `docs/adr/0005-schema-evolution.md` — if your adapter needs to report
+  something genuinely provider-specific that doesn't fit an existing
+  canonical `EvidenceKind`, this is the `ExtensionEnvelope` contract (schema
+  versioning, unknown-field tolerance, and the promotion-to-canonical
+  criteria) rather than inventing an ad hoc untyped field.
+- `docs/privacy-redaction-policy.md` — **read this before populating
+  `ExtensionEnvelope::fields`**: the redaction boundary in
+  `fornax-daemon`'s `handle_message` currently redacts `Evidence::payload`
+  only, not `Evidence::source`/`Evidence::extension` (a known, disclosed
+  gap, not fixed as of this writing). Do not put raw provider secrets or
+  unredacted sensitive text into an extension payload today.
+
+Together, this file plus the three docs above are the full extension
+contract FORNX-87 originally scoped as a single integration guide. They stay
+as separate, cross-linked documents rather than one merged file — each is
+already living/versioned next to the code it describes (`fornax-types`'s
+`sensor.rs`/`capabilities.rs`/`extension.rs`) and merging them would create
+one large doc no single change actually touches end-to-end. FORNX-87's own
+remaining scope — porting this material into the unified Docusaurus site
+(`fornax-docs`) — is unaffected by this reconciliation and stays tracked on
+that ticket.
+
 ## 1. Create the crate
 
 ```
