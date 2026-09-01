@@ -202,7 +202,7 @@ CONFIDENCE: HIGH | MEDIUM | LOW
 - Environment/test-harness failures are recorded distinctly from product
   findings: an `UNTESTED_OR_BLOCKED` entry whose reason is environmental
   (e.g. "backend/Postgres not stood up this pass" — `v0.0.1-qa-security-signoff.md`
-  §7.3's exact case) is never listed under `SUSPECTED_FINDINGS`. Only a
+  §3.4's exact case) is never listed under `SUSPECTED_FINDINGS`. Only a
   failure attributable to actual product behavior belongs there.
 
 ### Evidence contract by surface
@@ -315,7 +315,7 @@ covered by this recipe — see the still-open `fornax-hook-codex` recipe
 below). It is grounded directly in this repo's own
 `README.md` Quick Start — the exact sequence `v0.0.1-qa-security-signoff.md`'s
 FORNX-34 evidence and this repo's own adversarial/XSS follow-up passes
-(§7.1/§7.2) already executed for real — and follows the seven-field shape
+(§7.1/§7.2) already executed for real — and follows the eight-field shape
 above (working directory, prerequisites, start command, readiness probe,
 minimum verification probe, expected ports/artifacts, cleanup, variant).
 
@@ -323,7 +323,7 @@ Populating the remaining recipes (`fornax-hook-codex`, `fornax` CLI subset,
 `fornax-cloud`/`fornax-website` surfaces) is ongoing work, the same way
 `release/golden-journeys.json`'s four-entry seed catalog is a starting
 point, not a claim of exhaustive coverage — each is added when a real QA
-pass first needs it, following this same seven-field shape.
+pass first needs it, following this same eight-field shape.
 
 ## Validation
 
