@@ -296,21 +296,23 @@ async fn handle_message(
         IngestMessage::Evidence(mut ev) => {
             *session_hint = Some(ev.session_id.clone());
             ev.payload = redact_json(&ev.payload);
-            // FORNX-244: `ExtensionEnvelope::fields`/`unknown` carry
-            // provider-specific content (e.g. opencode's `tool.execute.after`
-            // `title`, which is the literal command string for the bash
-            // tool) exactly as attacker/agent-controlled as `tool_input`/
-            // `Claim.text` were in FORNX-280 — they must go through the same
-            // redaction boundary before persistence/export, not bypass it
-            // just because they arrived through the newer extension escape
-            // hatch instead of a canonical field.
-            if let Some(extension) = ev.extension.as_mut() {
-                extension.fields = redact_json(&extension.fields);
-                extension.unknown = extension
-                    .unknown
-                    .iter()
-                    .map(|(k, v)| (k.clone(), redact_json(v)))
-                    .collect();
+            // FORNX-219/FORNX-244: `extension.fields` is deliberately
+            // schemaless provider-specific JSON (the one escape-hatch field
+            // in the canonical/extension split) and `extension.unknown`
+            // preserves whatever a newer/different binary wrote verbatim —
+            // both are exactly as capable of carrying sensitive free text as
+            // `payload` above, and were never redacted before this fix.
+            // `EvidenceSource` (`ev.source`) is not touched here: every one
+            // of its fields is a short structured identifier/enum/timestamp
+            // with no free-text content to redact.
+            if let Some(ext) = ev.extension.as_mut() {
+                ext.fields = redact_json(&ext.fields);
+                ext.unknown =
+                    match redact_json(&serde_json::Value::Object(std::mem::take(&mut ext.unknown)))
+                    {
+                        serde_json::Value::Object(map) => map,
+                        _ => unreachable!("redact_json preserves the Object variant"),
+                    };
             }
             state.store.insert_evidence(&ev).await?;
         }
@@ -601,6 +603,93 @@ mod tests {
         );
     }
 
+    /// FORNX-219: `ExtensionEnvelope.fields`/`.unknown` are the schemaless
+    /// escape-hatch JSON added by FORNX-158 — a real, populated field for
+    /// the first time via the opencode adapter (FORNX-161) — and were found
+    /// to bypass the redaction boundary entirely while documenting the
+    /// v0.0.3 release (`handle_message` only ever redacted `payload`).
+    /// Proves both `fields` and `unknown` now go through the same boundary,
+    /// mirroring `file_diff_evidence_diff_is_redacted_before_storage` above.
+    #[tokio::test]
+    async fn extension_fields_and_unknown_are_redacted_before_storage() {
+        let state = test_state().await;
+        let mut hint = None;
+        let fields_marker = format!("FORNAX-CANARY-{}-FIELDS", Uuid::new_v4().simple());
+        let unknown_marker = format!("FORNAX-CANARY-{}-UNKNOWN", Uuid::new_v4().simple());
+        let session_id = "fornx-219-extension-redaction-regression".to_string();
+
+        let event_id = Uuid::new_v4();
+        let event = AgentEvent {
+            id: event_id,
+            session_id: session_id.clone(),
+            provider: fornax_types::Provider::OpenCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-09-01T00:00:00Z".to_string(),
+            tool_name: Some("bash".to_string()),
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        handle_message(&state, IngestMessage::Event(event), &mut hint)
+            .await
+            .expect("handle event");
+
+        let mut extension = fornax_types::ExtensionEnvelope::new(
+            fornax_types::Provider::OpenCode,
+            "1.18.25",
+            fornax_types::ContentClass::ToolTelemetry,
+            serde_json::json!({ "title": format!("secret={fields_marker}") }),
+        );
+        extension.unknown.insert(
+            "future_field".to_string(),
+            serde_json::json!(format!("secret={unknown_marker}")),
+        );
+
+        let evidence = fornax_types::Evidence {
+            id: Uuid::new_v4(),
+            session_id: session_id.clone(),
+            source_event_id: event_id,
+            kind: fornax_types::EvidenceKind::ProcessObservation,
+            observed_at: "2026-09-01T00:00:00Z".to_string(),
+            payload: serde_json::json!({}),
+            provenance: "opencode:1.18.25:PostToolUse:bash#tool_response".to_string(),
+            source: None,
+            extension: Some(extension),
+        };
+        handle_message(&state, IngestMessage::Evidence(evidence), &mut hint)
+            .await
+            .expect("handle evidence");
+
+        let stored = state
+            .store
+            .evidence_for_session(&session_id)
+            .await
+            .expect("read back evidence");
+        let stored_extension = stored.evidence[0]
+            .extension
+            .as_ref()
+            .expect("extension present");
+        let stored_fields = stored_extension.fields.to_string();
+        let stored_unknown = serde_json::to_string(&stored_extension.unknown).unwrap();
+
+        assert!(
+            !stored_fields.contains(&fields_marker),
+            "raw canary marker leaked into stored extension.fields: {stored_fields}"
+        );
+        assert!(
+            stored_fields.contains("REDACTED"),
+            "expected a redacted placeholder in stored extension.fields: {stored_fields}"
+        );
+        assert!(
+            !stored_unknown.contains(&unknown_marker),
+            "raw canary marker leaked into stored extension.unknown: {stored_unknown}"
+        );
+        assert!(
+            stored_unknown.contains("REDACTED"),
+            "expected a redacted placeholder in stored extension.unknown: {stored_unknown}"
+        );
+    }
+
     /// FORNX-14 regression: a `ProcessObservation`/`vcs_operation` evidence
     /// payload must go through the same generic redaction boundary as any
     /// other evidence payload before storage — mirrors
@@ -874,100 +963,6 @@ mod tests {
         assert!(
             rationale.contains("exit_code_text"),
             "detail rationale must reference the real Codex evidence provenance: {rationale}"
-        );
-    }
-
-    /// FORNX-244 regression: `Evidence::extension` (`ExtensionEnvelope`) is a
-    /// second, newer path into storage/export alongside `Evidence::payload`
-    /// (FORNX-280's original finding) — provider-specific content placed in
-    /// `fields`/`unknown` must go through the same redaction boundary before
-    /// persistence, not bypass it just because it arrived through the
-    /// extension escape hatch. Mirrors
-    /// `tool_input_and_claim_text_are_redacted_before_storage`'s canary
-    /// technique. Real-world shape: opencode's `tool.execute.after` sensor
-    /// carries the bash tool's own command string in `title`
-    /// (`build_tool_telemetry_extension`, `fornax-adapter-opencode`), which
-    /// is exactly as attacker/agent-controlled as `tool_input`.
-    #[tokio::test]
-    async fn extension_envelope_fields_and_unknown_are_redacted_before_storage() {
-        use fornax_types::{ContentClass, EvidenceKind, ExtensionEnvelope, Provider};
-
-        let state = test_state().await;
-        let mut hint = None;
-        let marker = format!("FORNAX-CANARY-{}-DO-NOT-LEAK", Uuid::new_v4().simple());
-        let session_id = "fornx-244-extension-redaction-regression".to_string();
-
-        let event_id = Uuid::new_v4();
-        let event = AgentEvent {
-            id: event_id,
-            session_id: session_id.clone(),
-            provider: Provider::OpenCode,
-            kind: EventKind::PostToolUse,
-            observed_at: "2026-09-01T00:00:00Z".to_string(),
-            tool_name: Some("bash".to_string()),
-            tool_input: None,
-            tool_response: None,
-            raw: serde_json::json!({}),
-        };
-        handle_message(&state, IngestMessage::Event(event), &mut hint)
-            .await
-            .expect("handle event");
-
-        let mut extension = ExtensionEnvelope::new(
-            Provider::OpenCode,
-            "opencode-adapter-test",
-            ContentClass::ToolTelemetry,
-            serde_json::json!({"title": format!("curl --api-key {marker} https://example.com")}),
-        );
-        // `unknown` is the `#[serde(flatten)]` catch-all preserved verbatim
-        // from the wire (a future field a newer producer/older reader
-        // doesn't share a name for) — equally untrusted, must be redacted
-        // too.
-        extension
-            .unknown
-            .insert("future_field".to_string(), serde_json::json!(marker));
-
-        let evidence = fornax_types::Evidence {
-            id: Uuid::new_v4(),
-            session_id: session_id.clone(),
-            source_event_id: event_id,
-            kind: EvidenceKind::ExitCode,
-            observed_at: "2026-09-01T00:00:00Z".to_string(),
-            payload: serde_json::json!({"command": "curl ...", "exit_code": 0, "heuristic": false}),
-            provenance: "opencode:0.0.1:tool.execute.after#metadata.exit".to_string(),
-            source: None,
-            extension: Some(extension),
-        };
-        handle_message(&state, IngestMessage::Evidence(evidence), &mut hint)
-            .await
-            .expect("handle evidence");
-
-        let stored = state
-            .store
-            .evidence_for_session(&session_id)
-            .await
-            .expect("read back evidence");
-        let stored_extension = stored.evidence[0]
-            .extension
-            .as_ref()
-            .expect("extension present");
-        let fields = stored_extension.fields.to_string();
-        let unknown = serde_json::to_string(&stored_extension.unknown).unwrap();
-        assert!(
-            !fields.contains(&marker),
-            "raw canary marker leaked into stored extension.fields: {fields}"
-        );
-        assert!(
-            fields.contains("REDACTED"),
-            "expected a redacted placeholder in stored extension.fields: {fields}"
-        );
-        assert!(
-            !unknown.contains(&marker),
-            "raw canary marker leaked into stored extension.unknown: {unknown}"
-        );
-        assert!(
-            unknown.contains("REDACTED"),
-            "expected a redacted placeholder in stored extension.unknown: {unknown}"
         );
     }
 
