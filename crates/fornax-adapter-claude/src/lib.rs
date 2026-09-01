@@ -1523,10 +1523,14 @@ mod tests {
         assert_eq!(ev.payload["observation"]["outcome"], "rejected");
     }
 
-    /// Falsification: unparseable git output must never fabricate an
-    /// outcome — no evidence at all, only the Event.
+    /// Falsification: unparseable git output must never fabricate a
+    /// `VcsOperation` outcome — no `ProcessObservation` evidence from this
+    /// sensor. The pre-existing `ClaudeBashExitCodeSensor` still legitimately
+    /// fires on the same event (it's Bash-generic, not git-specific) and
+    /// produces its own `ExitCode` evidence — that's unrelated and expected,
+    /// which is why this asserts on evidence *kind*, not evidence *count*.
     #[test]
-    fn unparseable_git_output_produces_no_evidence() {
+    fn unparseable_git_output_produces_no_process_observation_evidence() {
         let raw = serde_json::json!({
             "hook_event_name": "PostToolUse",
             "session_id": "sess-1",
@@ -1535,11 +1539,16 @@ mod tests {
             "tool_response": {"stdout": "some totally unexpected output\n", "stderr": ""}
         });
         let msgs = normalize(&raw).into_messages();
-        let evidence_count = msgs
+        let process_observation_count = msgs
             .iter()
-            .filter(|m| matches!(m, IngestMessage::Evidence(_)))
+            .filter(|m| {
+                matches!(
+                    m,
+                    IngestMessage::Evidence(ev) if ev.kind == EvidenceKind::ProcessObservation
+                )
+            })
             .count();
-        assert_eq!(evidence_count, 0);
+        assert_eq!(process_observation_count, 0);
     }
 
     /// Falsification: a non-git Bash command must not trigger this sensor at
