@@ -72,3 +72,33 @@ jobs:
       - name: test
         if: steps.has_crates.outputs.present == 'true'
         run: cargo test --workspace
+
+  # Baseline PATCH_LOW_RISK-tier security check every higher risk tier also
+  # inherits (docs/release-security-gate.md, FORNX-233). Installed via
+  # `cargo install` from crates.io rather than a third-party GitHub Action,
+  # so no new action SHA needs pinning (docs/adr/0002-repo-and-ci-conventions.md).
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3 # v2
+      - name: check workspace has crates
+        id: has_crates
+        run: |
+          if [ -n "$(find . -mindepth 3 -maxdepth 3 -name Cargo.toml)" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: install cargo-audit
+        if: steps.has_crates.outputs.present == 'true'
+        # Pinned to the exact version this job's local-equivalent
+        # verification pass ran against (docs/release-security-gate.md,
+        # "Validation") — cargo-audit's audit.toml config-path resolution
+        # is version-sensitive, so an unpinned "latest" could silently
+        # change which .cargo/audit.toml ignores are honored.
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: cargo audit
+        if: steps.has_crates.outputs.present == 'true'
+        run: cargo audit
