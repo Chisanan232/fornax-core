@@ -42,7 +42,7 @@
     "threat_model_version": {
       "type": "integer",
       "minimum": 1,
-      "description": "The docs/security/threat-model.md version this sign-off was reviewed against. Required in practice whenever trust_boundary_delta_ref is non-null; not enforced by this schema's required[] to keep PATCH_LOW_RISK/FEATURE sign-offs simple, but a TRUST_BOUNDARY-or-higher sign-off omitting it is incomplete."
+      "description": "The docs/security/threat-model.md version this sign-off was reviewed against. Required (via this schema's risk_class-conditional allOf) whenever risk_class is TRUST_BOUNDARY or MAJOR_OR_GA; optional for PATCH_LOW_RISK/FEATURE, which never touch a trust boundary."
     },
     "findings": {
       "type": "array",
@@ -100,5 +100,21 @@
       "enum": ["PASS", "BLOCK", "INCONCLUSIVE", "UNTESTED"],
       "description": "Per docs/release-assurance-policy.md's verdict semantics (FORNX-229). Must be the worst of findings[]: any critical/high finding whose disposition is not \"fixed\" or a fully policy-compliant \"waived\" forces BLOCK. This schema cannot itself execute that cross-field rule (JSON Schema has no severity-ordering arithmetic); a conforming producer/consumer must enforce it, and docs/release-security-gate.md documents it as a required invariant, not a suggestion."
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "risk_class": { "enum": ["TRUST_BOUNDARY", "MAJOR_OR_GA"] } } },
+      "then": {
+        "properties": {
+          "trust_boundary_delta_ref": { "type": "string", "minLength": 1 },
+          "threat_model_version": { "type": "integer", "minimum": 1 }
+        },
+        "required": ["threat_model_version"]
+      }
+    },
+    {
+      "if": { "properties": { "risk_class": { "enum": ["PATCH_LOW_RISK", "FEATURE"] } } },
+      "then": { "properties": { "trust_boundary_delta_ref": { "type": "null" } } }
+    }
+  ]
 }

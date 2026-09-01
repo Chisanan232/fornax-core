@@ -93,7 +93,12 @@ jobs:
           fi
       - name: install cargo-audit
         if: steps.has_crates.outputs.present == 'true'
-        run: cargo install cargo-audit --locked
+        # Pinned to the exact version this job's local-equivalent
+        # verification pass ran against (docs/release-security-gate.md,
+        # "Validation") — cargo-audit's audit.toml config-path resolution
+        # is version-sensitive, so an unpinned "latest" could silently
+        # change which .cargo/audit.toml ignores are honored.
+        run: cargo install cargo-audit --version 0.22.2 --locked
       - name: cargo audit
         if: steps.has_crates.outputs.present == 'true'
         run: cargo audit
