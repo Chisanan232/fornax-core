@@ -1,7 +1,7 @@
 {
   "version": "v0.0.1",
   "candidate_repos": [
-    { "name": "fornax-core", "owner": "horonomy", "sha": "1c078ed31c23ffac8f515e8a46c97c1888c76457" },
+    { "name": "fornax-core", "owner": "horonomy", "sha": "9e75d95ea290223b8ca143cb1e4fd9756dc675e8" },
     { "name": "fornax-cloud", "owner": "horonomy", "sha": "84f02a0c8c0a14ca64176c22799ba9f4b50c1b4f" }
   ],
   "risk_class": "TRUST_BOUNDARY",
