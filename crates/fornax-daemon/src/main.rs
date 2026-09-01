@@ -244,8 +244,40 @@ async fn handle_message(
                 .or_else(|| session_hint.clone());
             if let Some(sid) = sid {
                 *session_hint = Some(sid.clone());
+                // The persisted store is correctly scoped to
+                // `(session_id, provider)` (one row per announcing provider,
+                // see `Store::upsert_capabilities`), but this in-memory cache
+                // is a single slot per `session_id` — the one
+                // `handle_message`'s `Claim` arm reads to gate verification.
+                // FORNX-244: `sid` here is provider-controlled data (an
+                // adapter reads it straight off the native payload, e.g.
+                // opencode's `/input/sessionID`), so a malicious/buggy
+                // provider payload could name another provider's live
+                // session id and silently overwrite that session's
+                // capability snapshot with its own — a real capability
+                // *downgrade* (verbatim FORNX-244's Security Focus bullet)
+                // that could suppress verification and hide evidence. Only
+                // the announcing provider may overwrite its own session's
+                // cached snapshot; a same-session announcement from a
+                // different provider is dropped from the cache (the
+                // correctly-scoped store row is still written) rather than
+                // silently clobbering an unrelated provider's capabilities.
                 state.store.upsert_capabilities(&sid, &caps).await?;
-                state.caps.lock().await.insert(sid, caps);
+                let mut cache = state.caps.lock().await;
+                let allow_cache_write = cache
+                    .get(&sid)
+                    .map(|existing| existing.provider == caps.provider)
+                    .unwrap_or(true);
+                if allow_cache_write {
+                    cache.insert(sid, caps);
+                } else {
+                    tracing::warn!(
+                        session_id = %sid,
+                        incoming_provider = ?caps.provider,
+                        "dropping cross-provider capabilities announcement for an \
+                         already-cached session id (possible spoofed session_id)"
+                    );
+                }
             }
         }
         IngestMessage::Event(mut ev) => {
@@ -264,11 +296,11 @@ async fn handle_message(
         IngestMessage::Evidence(mut ev) => {
             *session_hint = Some(ev.session_id.clone());
             ev.payload = redact_json(&ev.payload);
-            // FORNX-219: `extension.fields` is deliberately schemaless
-            // provider-specific JSON (the one escape-hatch field in the
-            // canonical/extension split) and `extension.unknown` preserves
-            // whatever a newer/different binary wrote verbatim — both are
-            // exactly as capable of carrying sensitive free text as
+            // FORNX-219/FORNX-244: `extension.fields` is deliberately
+            // schemaless provider-specific JSON (the one escape-hatch field
+            // in the canonical/extension split) and `extension.unknown`
+            // preserves whatever a newer/different binary wrote verbatim —
+            // both are exactly as capable of carrying sensitive free text as
             // `payload` above, and were never redacted before this fix.
             // `EvidenceSource` (`ev.source`) is not touched here: every one
             // of its fields is a short structured identifier/enum/timestamp
@@ -931,6 +963,77 @@ mod tests {
         assert!(
             rationale.contains("exit_code_text"),
             "detail rationale must reference the real Codex evidence provenance: {rationale}"
+        );
+    }
+
+    /// FORNX-244 regression: `state.caps` is a single in-memory slot per
+    /// `session_id`, but `session_id` here is provider-controlled data (an
+    /// adapter reads it straight off the native payload). A malicious/buggy
+    /// provider payload naming an already-active *other* provider's session
+    /// id must not be able to silently overwrite that session's cached
+    /// capability snapshot with its own — a real capability downgrade that
+    /// could suppress verification (verbatim FORNX-244's "downgrade a real
+    /// capability to hide evidence" Security Focus bullet).
+    #[tokio::test]
+    async fn cross_provider_capabilities_announcement_does_not_clobber_cached_session() {
+        use fornax_types::{CapabilitySignal, Provider, SignalAvailability, SignalClass};
+
+        let state = test_state().await;
+        let mut hint = None;
+        let session_id = "fornx-244-capability-downgrade-regression".to_string();
+
+        let claude_caps = RuntimeCapabilities {
+            schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
+            provider: Provider::ClaudeCode,
+            signals: vec![CapabilitySignal {
+                class: SignalClass::FinalResponse,
+                state: SignalAvailability::Available,
+                detail: None,
+            }],
+            notes: [("session_id".to_string(), session_id.clone())].into(),
+        };
+        handle_message(&state, IngestMessage::Capabilities(claude_caps), &mut hint)
+            .await
+            .expect("handle claude capabilities");
+
+        // A spoofed/buggy announcement naming the same session id but a
+        // different provider, declaring a strictly weaker capability set.
+        let opencode_caps = RuntimeCapabilities {
+            schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
+            provider: Provider::OpenCode,
+            signals: vec![CapabilitySignal {
+                class: SignalClass::FinalResponse,
+                state: SignalAvailability::Unavailable,
+                detail: None,
+            }],
+            notes: [("session_id".to_string(), session_id.clone())].into(),
+        };
+        handle_message(
+            &state,
+            IngestMessage::Capabilities(opencode_caps),
+            &mut hint,
+        )
+        .await
+        .expect("handle opencode capabilities");
+
+        let cached = state
+            .caps
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+            .expect("session must still have a cached capability snapshot");
+        assert_eq!(
+            cached.provider,
+            Provider::ClaudeCode,
+            "a same-session announcement from a different provider must not overwrite the \
+             original provider's cached capability snapshot"
+        );
+        assert_eq!(
+            cached.state_of(&SignalClass::FinalResponse),
+            SignalAvailability::Available,
+            "the real provider's capability must not be silently downgraded by a \
+             cross-provider announcement for the same session id"
         );
     }
 }
