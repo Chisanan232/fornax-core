@@ -105,15 +105,26 @@ broadly — split the lane at Step 2, not by spawning sub-workers under it.
 ## Step 4 — Reuse existing CI evidence before re-running anything
 
 Before a worker re-runs a suite, check whether hosted CI already ran that
-exact suite against the exact candidate SHA and is currently green
-(`scripts/release-readiness.sh`'s `sha_on_main`/evidence checks, or the
-repo's own CI status API for that SHA). If so, the worker **cites** that
-run (SHA, workflow run URL/ID, result) instead of re-executing it.
-Independent reproduction is still required, per FORNX-229's depth table,
-for any suspected High/Critical finding at `TRUST_BOUNDARY`+ risk, and for
-any lane whose existing CI evidence is itself `CI_DEGRADED_EXTERNAL` — in
-that case follow FORNX-229's local-CI-equivalent-manifest policy rather than
-treating the outage itself as a pass or a block.
+exact suite against the exact candidate SHA and is currently green — the
+repo's own Actions/workflow-run status for that SHA (e.g. `gh run list
+--commit <sha>`, `gh pr checks`), or a `CI_DEGRADED_EXTERNAL` local
+CI-equivalent verification manifest per FORNX-229 when hosted CI could not
+execute. `scripts/release-readiness.sh` is a **different** signal and does
+not itself answer this question — it verifies gate-evidence *presence*
+(each of qa/security/docs/stage points at a Done, non-BLOCK,
+candidate-referenced Jira ticket) and that a repo's SHA is real and on
+`main` (`sha_on_main`); it has no awareness of whether any CI suite ran or
+what its result was. Use it only to confirm the SHA a worker is citing CI
+evidence for is genuinely the candidate's SHA, never as the CI-greenness
+source itself.
+
+If hosted CI is green for the exact SHA, the worker **cites** that run
+(SHA, workflow run URL/ID, result) instead of re-executing it. Independent
+reproduction is still required, per FORNX-229's depth table, for any
+suspected High/Critical finding at `TRUST_BOUNDARY`+ risk, and for any lane
+whose existing CI evidence is itself `CI_DEGRADED_EXTERNAL` — in that case
+follow FORNX-229's local-CI-equivalent-manifest policy rather than treating
+the outage itself as a pass or a block.
 
 ## Step 5 — Dispatch workers with a compact evidence contract
 

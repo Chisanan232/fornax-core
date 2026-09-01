@@ -18,7 +18,7 @@ only what no other ticket, done or planned, already owns:
 | Candidate-manifest schema, mechanical gate enforcement (qa/security/docs/stage all required, Done+not-BLOCK+candidate-referenced) | FORNX-234 | Done |
 | Tag/build/publish/promotion execution, tag immutability, yank/deprecate mechanics | FORNX-235 | Done |
 | `/release-qa-gate` orchestration, worker lane sizing | FORNX-230 | Done — `.claude/skills/release-qa-gate/SKILL.md` |
-| Candidate manifest content, feature-delta discovery, golden-journey **catalog** (stable IDs, P0/P1/P2 assignment per journey, evidence contract), coverage reconciliation | FORNX-231 | To Do |
+| Candidate manifest content, feature-delta discovery, golden-journey **catalog** (stable IDs, P0/P1/P2 assignment per journey, evidence contract), coverage reconciliation | FORNX-231 | Done |
 | QA sign-off artifact format, worker evidence schema, finding lifecycle | FORNX-232 | To Do |
 | Security gate skill, versioned threat model, trust-boundary delta record | FORNX-233 | To Do |
 | Post-release smoke/canary/rollback automation | FORNX-236 | To Do |
