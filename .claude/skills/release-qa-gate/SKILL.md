@@ -84,8 +84,11 @@ below).
 
 ## Step 3 — Worker sizing (bounded by actual independent work)
 
-One worker per **selected** lane, never more workers than selected lanes,
-never fewer than the lanes actually need to stay non-overlapping:
+The unit of independent work is a lane, or — when a selected lane's depth
+(Step 2) pulls in multiple non-overlapping golden-journey groups or repos —
+a non-overlapping slice within that lane. Each worker owns exactly one
+lane or slice; two workers never cover the same surface. Total worker
+count across all lanes/slices is bounded by this band:
 
 | Selected lane count | Worker band |
 |---|---|
@@ -93,10 +96,15 @@ never fewer than the lanes actually need to stay non-overlapping:
 | 3–4 lanes (several independent surfaces) | 4–6 workers |
 | 5+ lanes, or any lane at `TRUST_BOUNDARY`+ depth (broad/high-risk) | 6–8 workers |
 
+A single selected lane at `PATCH_LOW_RISK`/`FEATURE` depth with nothing
+further to split stays at the low end of its band (as few as 1–2 workers);
+the band's upper numbers exist for when a lane's required depth genuinely
+splits into that many non-overlapping slices, not as a floor.
+
 **Anti-pattern: the ceiling as a target.** The upper bound of a band is not
-a goal to reach — a genuinely 2-lane `FEATURE` change gets 2–4 workers, full
-stop, even though the table's top band goes to 8. Do not pad worker count to
-look thorough.
+a goal to reach — do not split a lane into slices, or dispatch idle
+workers, merely to reach the top of its band. Worker count follows real
+independent work; it never leads it.
 
 No nested sub-agent explosion: a worker verifies its own lane directly. A
 worker that needs to fan out further is a sign the lane was drawn too
