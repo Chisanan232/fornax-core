@@ -3,7 +3,7 @@
 //! status line, detail command, and dashboard (FORNX-30/31/32). No cloud
 //! dependency on the critical path (D2, ADR 0001).
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use fornax_types::redact::{redact_json, redact_text};
@@ -159,6 +159,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/api/status", get(api_status))
         .route("/api/findings/recent", get(api_findings_recent))
+        .route("/api/capabilities", get(api_capabilities))
         .route("/dashboard", get(dashboard))
         .with_state(state);
 
@@ -410,6 +411,40 @@ async fn api_findings_recent(State(state): State<AppState>) -> Json<serde_json::
     match state.store.recent_findings(50).await {
         Ok(rows) => Json(serde_json::json!({ "findings": rows })),
         Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct CapabilitiesQuery {
+    session: String,
+}
+
+/// FORNX-85: exposes the persisted `RuntimeCapabilities` announcement(s) for
+/// a session — the daemon-side half of the capability UX surface consumed by
+/// `fornax capabilities <session>`. Reads `store.capabilities_for_session`
+/// (one row per announcing provider, FORNX-62) rather than the in-memory
+/// `state.caps` cache: the cache holds only the single most-recently-cached
+/// provider per session id (see the `AppState::caps` field doc comment) and
+/// exists to serve the claim-verification hot path, not to be a general
+/// read API — a session with more than one announcing provider would be
+/// silently under-reported by reading it here instead.
+async fn api_capabilities(
+    State(state): State<AppState>,
+    Query(q): Query<CapabilitiesQuery>,
+) -> Json<serde_json::Value> {
+    match state.store.capabilities_for_session(&q.session).await {
+        Ok(caps) if caps.is_empty() => Json(serde_json::json!({
+            "session": q.session,
+            "announced": false,
+            "reason": "no capabilities announced yet by any adapter for this session",
+            "capabilities": [],
+        })),
+        Ok(caps) => Json(serde_json::json!({
+            "session": q.session,
+            "announced": true,
+            "capabilities": caps,
+        })),
+        Err(e) => Json(serde_json::json!({ "session": q.session, "error": e.to_string() })),
     }
 }
 
@@ -964,6 +999,99 @@ mod tests {
             rationale.contains("exit_code_text"),
             "detail rationale must reference the real Codex evidence provenance: {rationale}"
         );
+    }
+
+    /// FORNX-85: `/api/capabilities?session=<id>` must surface the exact
+    /// signal/state pairs announced by a real capability probe, not a
+    /// collapsed boolean summary — proves both the "announced" shape and
+    /// that individual `SignalClass`/`SignalAvailability` values survive the
+    /// full announce -> persist -> read round trip.
+    #[tokio::test]
+    async fn api_capabilities_surfaces_announced_signals_for_a_session() {
+        use fornax_types::{CapabilitySignal, Provider, SignalAvailability, SignalClass};
+
+        let state = test_state().await;
+        let mut hint = None;
+        let session_id = "fornx-85-capabilities-endpoint".to_string();
+
+        let caps = RuntimeCapabilities {
+            schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
+            provider: Provider::ClaudeCode,
+            signals: vec![
+                CapabilitySignal {
+                    class: SignalClass::ToolInvocation,
+                    state: SignalAvailability::Available,
+                    detail: None,
+                },
+                CapabilitySignal {
+                    class: SignalClass::RawReasoning,
+                    state: SignalAvailability::Redacted,
+                    detail: Some("thinking blocks withheld by privacy boundary".to_string()),
+                },
+                CapabilitySignal {
+                    class: SignalClass::ProcessResult,
+                    state: SignalAvailability::Unsupported,
+                    detail: None,
+                },
+            ],
+            notes: [("session_id".to_string(), session_id.clone())].into(),
+        };
+        handle_message(&state, IngestMessage::Capabilities(caps), &mut hint)
+            .await
+            .expect("handle capabilities");
+
+        let query = Query(CapabilitiesQuery {
+            session: session_id.clone(),
+        });
+        let resp = api_capabilities(State(state), query).await;
+        assert_eq!(
+            resp.0.get("announced").and_then(|b| b.as_bool()),
+            Some(true)
+        );
+        let capabilities = resp.0["capabilities"]
+            .as_array()
+            .expect("capabilities must be an array");
+        assert_eq!(capabilities.len(), 1);
+        let signals = capabilities[0]["signals"]
+            .as_array()
+            .expect("signals must be an array");
+        let tool_invocation = signals
+            .iter()
+            .find(|s| s["class"] == "tool_invocation")
+            .expect("tool_invocation signal present");
+        assert_eq!(tool_invocation["state"], "available");
+        let raw_reasoning = signals
+            .iter()
+            .find(|s| s["class"] == "raw_reasoning")
+            .expect("raw_reasoning signal present");
+        assert_eq!(raw_reasoning["state"], "redacted");
+        let process_result = signals
+            .iter()
+            .find(|s| s["class"] == "process_result")
+            .expect("process_result signal present");
+        assert_eq!(process_result["state"], "unsupported");
+    }
+
+    /// FORNX-85 regression: a session with no capability announcement on
+    /// record must return a clear "not announced" shape distinct from an
+    /// error — never a fabricated capability set (D4/D7: absence of a
+    /// capability must never be silently treated as available).
+    #[tokio::test]
+    async fn api_capabilities_reports_not_announced_for_unknown_session() {
+        let state = test_state().await;
+        let query = Query(CapabilitiesQuery {
+            session: "no-such-session".to_string(),
+        });
+        let resp = api_capabilities(State(state), query).await;
+        assert_eq!(
+            resp.0.get("announced").and_then(|b| b.as_bool()),
+            Some(false)
+        );
+        assert!(resp.0["capabilities"]
+            .as_array()
+            .expect("capabilities must be an array")
+            .is_empty());
+        assert!(resp.0.get("reason").and_then(|s| s.as_str()).is_some());
     }
 
     /// FORNX-244 regression: `state.caps` is a single in-memory slot per
