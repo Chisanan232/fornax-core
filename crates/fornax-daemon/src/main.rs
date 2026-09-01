@@ -1008,9 +1008,13 @@ mod tests {
             }],
             notes: [("session_id".to_string(), session_id.clone())].into(),
         };
-        handle_message(&state, IngestMessage::Capabilities(opencode_caps), &mut hint)
-            .await
-            .expect("handle opencode capabilities");
+        handle_message(
+            &state,
+            IngestMessage::Capabilities(opencode_caps),
+            &mut hint,
+        )
+        .await
+        .expect("handle opencode capabilities");
 
         let cached = state
             .caps
