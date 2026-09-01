@@ -22,6 +22,17 @@ enum Commands {
     Status,
     /// Full evidence/finding detail for recent sessions.
     Detail,
+    /// Per-`SignalClass` capability availability for one session (FORNX-85):
+    /// which signals the announcing runtime(s) actually exposed this
+    /// session — available, unsupported, unavailable, redacted, collection-
+    /// failed, or not yet announced. Reads `GET /api/capabilities` on the
+    /// daemon. Never collapses the six-state availability taxonomy into a
+    /// boolean (`capabilities.rs`'s own doc comments, ADR-0001 D4) — each
+    /// signal class is rendered with its real, distinct state.
+    Capabilities {
+        /// Session id to look up.
+        session: String,
+    },
     /// Export one session's events/claims/evidence/capabilities from the
     /// local store into a directory-based spool, as one wire-compatible
     /// envelope JSON file per message (FORNX-60, FORNX-62). Reads
@@ -98,6 +109,13 @@ async fn main() -> anyhow::Result<()> {
         Commands::Detail => {
             match fetch_json(&format!("{}/api/findings/recent", base_url())).await {
                 Ok(v) => print_detail(&v),
+                Err(_) => println!("fornax: daemon unreachable (is `fornax-daemon` running?)"),
+            }
+        }
+        Commands::Capabilities { session } => {
+            let url = format!("{}/api/capabilities?session={}", base_url(), session);
+            match fetch_json(&url).await {
+                Ok(v) => print!("{}", render_capabilities(&v)),
                 Err(_) => println!("fornax: daemon unreachable (is `fornax-daemon` running?)"),
             }
         }
@@ -647,6 +665,75 @@ fn print_detail(v: &serde_json::Value) {
     }
 }
 
+/// Icon for a `SignalAvailability` state, mirroring `verdict_icon`'s
+/// distinct-per-state convention. FORNX-85/ADR-0001 D4: the six-state
+/// availability taxonomy must never collapse into a boolean — each state
+/// gets its own icon and label, and an unrecognized tag is shown verbatim
+/// rather than mapped onto an existing state.
+fn availability_icon(state: &str) -> &'static str {
+    match state {
+        "available" => "✓",
+        "unsupported" => "⛔",
+        "unavailable" => "—",
+        "redacted" => "▮",
+        "collection_failed" => "✕",
+        "unknown" => "?",
+        _ => "◌",
+    }
+}
+
+/// Renders `GET /api/capabilities`'s response: one section per announcing
+/// provider, one line per declared `SignalClass`, each showing its exact
+/// `SignalAvailability` state (and `detail`, when present) rather than a
+/// summarized available/not-available boolean. Returns the rendered text
+/// (rather than printing directly) so it can be asserted on in tests, the
+/// same shape as `render_status_line`.
+fn render_capabilities(v: &serde_json::Value) -> String {
+    let mut out = String::new();
+    let session = v.get("session").and_then(|s| s.as_str()).unwrap_or("?");
+    let announced = v
+        .get("announced")
+        .and_then(|b| b.as_bool())
+        .unwrap_or(false);
+    out.push_str(&format!("session: {session}\n"));
+    if !announced {
+        let reason = v
+            .get("reason")
+            .and_then(|s| s.as_str())
+            .unwrap_or("no capabilities announced yet");
+        out.push_str(&format!("  no capabilities announced yet ({reason})\n"));
+        return out;
+    }
+    let empty = vec![];
+    let capabilities = v
+        .get("capabilities")
+        .and_then(|c| c.as_array())
+        .unwrap_or(&empty);
+    for caps in capabilities {
+        let provider = caps.get("provider").and_then(|s| s.as_str()).unwrap_or("?");
+        out.push_str(&format!("  provider: {provider}\n"));
+        let empty_signals = vec![];
+        let signals = caps
+            .get("signals")
+            .and_then(|s| s.as_array())
+            .unwrap_or(&empty_signals);
+        if signals.is_empty() {
+            out.push_str("    (no signal classes declared)\n");
+            continue;
+        }
+        for signal in signals {
+            let class = signal.get("class").and_then(|s| s.as_str()).unwrap_or("?");
+            let state = signal.get("state").and_then(|s| s.as_str()).unwrap_or("?");
+            let icon = availability_icon(state);
+            match signal.get("detail").and_then(|s| s.as_str()) {
+                Some(detail) => out.push_str(&format!("    {icon} {class}: {state} ({detail})\n")),
+                None => out.push_str(&format!("    {icon} {class}: {state}\n")),
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -676,6 +763,61 @@ mod tests {
         assert_eq!(verdict_icon("contradicted"), "🛡 ✕");
         assert_eq!(verdict_icon("review"), "🛡 !");
         assert_eq!(verdict_icon("unavailable"), "🛡 —");
+    }
+
+    #[test]
+    fn availability_icon_covers_every_state_distinctly() {
+        assert_eq!(availability_icon("available"), "✓");
+        assert_eq!(availability_icon("unsupported"), "⛔");
+        assert_eq!(availability_icon("unavailable"), "—");
+        assert_eq!(availability_icon("redacted"), "▮");
+        assert_eq!(availability_icon("collection_failed"), "✕");
+        assert_eq!(availability_icon("unknown"), "?");
+        // Forward-compat: an unrecognized tag must not collapse onto an
+        // existing state's icon.
+        assert_eq!(availability_icon("quantum_pending"), "◌");
+    }
+
+    #[test]
+    fn render_capabilities_reports_not_announced_when_absent() {
+        let v = serde_json::json!({
+            "session": "s1",
+            "announced": false,
+            "reason": "no capabilities announced yet by any adapter for this session",
+            "capabilities": [],
+        });
+        let rendered = render_capabilities(&v);
+        assert!(rendered.contains("session: s1"));
+        assert!(rendered.contains("no capabilities announced yet"));
+    }
+
+    /// FORNX-85: the rendering must never collapse the six-state
+    /// availability taxonomy — each declared signal class's real state must
+    /// appear distinctly in the output, including its `detail` when present.
+    #[test]
+    fn render_capabilities_shows_each_signal_class_state_distinctly() {
+        let v = serde_json::json!({
+            "session": "s2",
+            "announced": true,
+            "capabilities": [{
+                "provider": "claude_code",
+                "schema_version": 1,
+                "signals": [
+                    {"class": "tool_invocation", "state": "available"},
+                    {"class": "process_result", "state": "unsupported"},
+                    {"class": "raw_reasoning", "state": "redacted", "detail": "withheld by privacy boundary"},
+                ],
+                "notes": {},
+            }],
+        });
+        let rendered = render_capabilities(&v);
+        assert!(rendered.contains("tool_invocation: available"));
+        assert!(rendered.contains("process_result: unsupported"));
+        assert!(rendered.contains("raw_reasoning: redacted (withheld by privacy boundary)"));
+        // The verdict-vocabulary states and the capability-availability
+        // states must never bleed into each other's rendering.
+        assert!(!rendered.contains("VERIFIED"));
+        assert!(!rendered.contains("CONTRADICTED"));
     }
 
     // FORNX-15: install-claude / uninstall-claude must idempotently
