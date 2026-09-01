@@ -117,6 +117,19 @@ it risks misinterpreting data rather than merely missing an optional detail.
 A version is retired from the supported set only per the deprecation policy
 below, not simply because a newer default version exists.
 
+**Blast radius of an incompatible row (FORNX-289, resolved).** A single
+`evidence` row stamped with an unsupported `schema_version` fails loudly at
+the row level, per above — but it does not take down the whole session's
+evidence read. `fornax-store::evidence_for_session` returns an
+`EvidenceReadOutcome { evidence, failed }`: every row that deserializes
+successfully still comes back in `evidence`, and each row that doesn't is
+named by id in `failed` rather than silently dropped or aborting the whole
+query, per ADR 0001's "observation must never break the session" invariant.
+This is deliberately scoped to *this* session-wide query — a direct
+single-row read or an explicit version check elsewhere still fails loudly
+per the "truly incompatible" rule above; only the session-wide aggregate
+read is hardened to isolate one bad row's failure from the rest.
+
 ### Unknown-field tolerance
 
 `ExtensionEnvelope` carries `#[serde(flatten)] unknown: serde_json::Map<...>`.
