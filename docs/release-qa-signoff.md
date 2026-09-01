@@ -202,7 +202,7 @@ CONFIDENCE: HIGH | MEDIUM | LOW
 - Environment/test-harness failures are recorded distinctly from product
   findings: an `UNTESTED_OR_BLOCKED` entry whose reason is environmental
   (e.g. "backend/Postgres not stood up this pass" — `v0.0.1-qa-security-signoff.md`
-  §7.3's exact case) is never listed under `SUSPECTED_FINDINGS`. Only a
+  §3.4's exact case) is never listed under `SUSPECTED_FINDINGS`. Only a
   failure attributable to actual product behavior belongs there.
 
 ### Evidence contract by surface
