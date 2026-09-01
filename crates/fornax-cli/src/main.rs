@@ -1047,6 +1047,53 @@ trust_level = \"trusted\"\n";
             );
         }
 
+        /// FORNX-244 coverage-gap closure: install -> uninstall -> install
+        /// round-trip must leave exactly one `notify` entry, not accumulate
+        /// duplicates and not fail on the second install after an uninstall.
+        #[test]
+        fn install_uninstall_install_round_trip_leaves_exactly_one_entry() {
+            let path = tmp_config_path("round-trip");
+
+            install_codex_notify_at(&path, &script_path()).expect("first install");
+            uninstall_codex_notify_at(&path).expect("uninstall");
+            install_codex_notify_at(&path, &script_path()).expect("second install after uninstall");
+
+            let contents = std::fs::read_to_string(&path).unwrap();
+            let doc: toml_edit::DocumentMut = contents.parse().unwrap();
+            let notify = doc["notify"].as_array().unwrap();
+            assert_eq!(notify.len(), 1);
+            assert_eq!(
+                notify.get(0).unwrap().as_str().unwrap(),
+                script_path().to_string_lossy()
+            );
+
+            std::fs::remove_file(&path).ok();
+        }
+
+        /// FORNX-244 coverage-gap closure: uninstalling twice in a row must
+        /// be a safe no-op the second time (idempotent unwiring), mirroring
+        /// `install_is_idempotent_no_duplicate_or_error` for the install side.
+        #[test]
+        fn uninstall_is_idempotent_second_call_is_a_safe_no_op() {
+            let path = tmp_config_path("idempotent-uninstall");
+
+            install_codex_notify_at(&path, &script_path()).expect("install");
+            uninstall_codex_notify_at(&path).expect("first uninstall");
+            let after_first = std::fs::read_to_string(&path).unwrap();
+
+            uninstall_codex_notify_at(&path).expect("second uninstall must not error");
+            let after_second = std::fs::read_to_string(&path).unwrap();
+
+            assert_eq!(
+                after_first, after_second,
+                "second uninstall must be a byte-for-byte no-op"
+            );
+            let doc: toml_edit::DocumentMut = after_second.parse().unwrap();
+            assert!(doc.get("notify").is_none());
+
+            std::fs::remove_file(&path).ok();
+        }
+
         #[cfg(unix)]
         #[test]
         fn install_preserves_existing_file_permissions() {
