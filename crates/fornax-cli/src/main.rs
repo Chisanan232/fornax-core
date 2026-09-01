@@ -375,11 +375,20 @@ fn save_codex_config(path: &std::path::Path, doc: &toml_edit::DocumentMut) -> an
 }
 
 /// True if `notify`'s first element is a Fornax-owned notify script.
+///
+/// Compares the path's basename exactly, not a bare `ends_with` on the
+/// whole string — a foreign script at e.g. `/opt/my-fornax-codex-notify.sh`
+/// would `ends_with(CODEX_NOTIFY_SCRIPT_MARKER)` even though its basename
+/// is a different file, which would make `uninstall-codex` delete a
+/// user's real, unrelated `notify` configuration.
 fn notify_is_fornax(item: &toml_edit::Item) -> bool {
     item.as_array()
         .and_then(|a| a.get(0))
         .and_then(|v| v.as_str())
-        .map(|s| s.ends_with(CODEX_NOTIFY_SCRIPT_MARKER))
+        .map(|s| {
+            std::path::Path::new(s).file_name().and_then(|f| f.to_str())
+                == Some(CODEX_NOTIFY_SCRIPT_MARKER)
+        })
         .unwrap_or(false)
 }
 
@@ -944,6 +953,27 @@ trust_level = \"trusted\"\n";
             assert_eq!(
                 before, after,
                 "file must be byte-for-byte unchanged on refusal"
+            );
+
+            std::fs::remove_file(&path).ok();
+        }
+
+        #[test]
+        fn uninstall_does_not_remove_lookalike_foreign_notify() {
+            // Review finding: notify_is_fornax used to compare with a bare
+            // `ends_with` on the whole path string, so a foreign script whose
+            // path merely *ends with* the marker (but has a different
+            // basename) would be misidentified as Fornax-owned and deleted.
+            let path = tmp_config_path("lookalike-foreign-notify-uninstall");
+            let existing = "notify = [\"/opt/my-fornax-codex-notify.sh\"]\n";
+            std::fs::write(&path, existing).unwrap();
+
+            uninstall_codex_notify_at(&path).expect("uninstall must not error");
+
+            let after = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(
+                existing, after,
+                "a lookalike foreign notify entry must survive uninstall untouched"
             );
 
             std::fs::remove_file(&path).ok();
