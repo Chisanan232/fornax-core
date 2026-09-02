@@ -164,6 +164,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/evidence-graph", get(api_evidence_graph))
         .route("/api/fusion", get(api_fusion))
         .route("/api/decision", get(api_decision))
+        .route("/api/judge", get(api_judge))
         .route("/dashboard", get(dashboard))
         .with_state(state);
 
@@ -555,11 +556,26 @@ enum FusionOutcome {
     NotFound { reason: &'static str },
     /// A store/decode error occurred while resolving the claim's evidence.
     Error { message: String },
-    /// A live `FusedFinding` was computed successfully.
-    Found {
-        graph_source: &'static str,
-        fused: fornax_verify::fusion::FusedFinding,
-    },
+    /// A live `FusedFinding` was computed successfully. Boxed: this variant
+    /// carries the claim/graph/evidence pool alongside `fused` (FORNX-94),
+    /// which makes it much larger than `NotFound`/`Error` --
+    /// `clippy::large_enum_variant` wants that size difference contained in
+    /// one heap allocation rather than paid on every `FusionOutcome` value.
+    Found(Box<FusionFound>),
+}
+
+/// Payload of [`FusionOutcome::Found`] (FORNX-94): the claim + resolved
+/// graph/evidence pool that produced `fused` are retained so `/api/judge`
+/// can build a `fornax_verify::judge::JudgeInput` without re-running the
+/// claim-lookup/graph-resolution logic in [`compute_fusion`] a second time.
+/// `/api/fusion`/`/api/decision` ignore `claim`/`graph`/`evidence_pool`,
+/// same as before this ticket.
+struct FusionFound {
+    graph_source: &'static str,
+    fused: fornax_verify::fusion::FusedFinding,
+    claim: fornax_types::Claim,
+    graph: fornax_types::EvidenceGraph,
+    evidence_pool: Vec<fornax_types::Evidence>,
 }
 
 /// FORNX-304 (extended by FORNX-96 to be shared with `/api/decision`):
@@ -651,10 +667,13 @@ async fn compute_fusion(state: &AppState, claim_id: &str, session: &str) -> Fusi
     let computed_at = chrono::Utc::now().to_rfc3339();
     let fused = BaselineFusionPolicy.fuse(&input, &computed_at);
 
-    FusionOutcome::Found {
+    FusionOutcome::Found(Box::new(FusionFound {
         graph_source,
         fused,
-    }
+        claim,
+        graph,
+        evidence_pool: evidence_read.evidence,
+    }))
 }
 
 async fn api_fusion(
@@ -671,15 +690,12 @@ async fn api_fusion(
             "found": false,
             "reason": reason,
         })),
-        FusionOutcome::Found {
-            graph_source,
-            fused,
-        } => Json(serde_json::json!({
+        FusionOutcome::Found(found) => Json(serde_json::json!({
             "claim": q.claim,
             "session": q.session,
             "found": true,
-            "graph_source": graph_source,
-            "fused": fused,
+            "graph_source": found.graph_source,
+            "fused": found.fused,
         })),
     }
 }
@@ -741,17 +757,142 @@ async fn api_decision(
             "found": false,
             "reason": reason,
         })),
-        FusionOutcome::Found {
-            graph_source,
-            fused,
-        } => {
-            let recommendation = DefaultRiskPolicy.decide(&fused, risk);
+        FusionOutcome::Found(found) => {
+            let recommendation = DefaultRiskPolicy.decide(&found.fused, risk);
+            Json(serde_json::json!({
+                "claim": q.claim,
+                "session": q.session,
+                "found": true,
+                "graph_source": found.graph_source,
+                "recommendation": recommendation,
+                "fused": found.fused,
+            }))
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct JudgeQuery {
+    claim: String,
+    session: String,
+    /// Explicit opt-in to send unredacted evidence content to the judge
+    /// (FORNX-94 AC: "raw protected evidence is not sent unless an
+    /// explicit policy permits it"). Defaults to `false` when omitted.
+    #[serde(default)]
+    allow_raw_evidence: bool,
+}
+
+/// Maps a computed `Verdict` to the "does deterministic evidence support the
+/// claim" boolean `JudgeOutput::with_disagreement_check` expects — `None`
+/// for any verdict that isn't a clean yes/no (FORNX-94: disagreement is only
+/// meaningful when there is an actual objective side to disagree with).
+fn objective_supported_for_disagreement_check(verdict: fornax_types::Verdict) -> Option<bool> {
+    match verdict {
+        fornax_types::Verdict::Verified => Some(true),
+        fornax_types::Verdict::Contradicted => Some(false),
+        fornax_types::Verdict::Unverified
+        | fornax_types::Verdict::Unavailable
+        | fornax_types::Verdict::Review => None,
+    }
+}
+
+/// FORNX-94: `GET /api/judge?claim=&session=&allow_raw_evidence=`. Reuses
+/// `compute_fusion`'s claim-lookup/graph-resolution logic (same as
+/// `/api/fusion`/`/api/decision`) to build a `JudgeInput`, then runs the
+/// configured `LocalSelfHostedJudgeProvider` (`[semantic_judge]` in
+/// `$FORNAX_HOME/config.toml`, disabled by default) via `spawn_blocking` —
+/// the judge's HTTP client is sync (`fornax_verify::judge`'s module docs),
+/// so it must not run directly on the async runtime thread.
+///
+/// Always returns the judge output alongside the full `FusedFinding` it was
+/// computed from (same "never show one instead of the other" discipline as
+/// `/api/decision`), plus a `disagreement` field surfaced explicitly rather
+/// than the deterministic fusion result being silently overwritten. A judge
+/// that is disabled/unreachable/timed out still returns `found: true` with
+/// `judge.verdict: "unavailable"` — this is not treated as a daemon error,
+/// since deterministic verification/fusion/decision must keep working
+/// identically regardless of judge availability.
+async fn api_judge(
+    State(state): State<AppState>,
+    Query(q): Query<JudgeQuery>,
+) -> Json<serde_json::Value> {
+    use fornax_verify::judge::{
+        judge_output_to_evidence, JudgeInput, LocalSelfHostedJudgeProvider, SemanticJudgeConfig,
+        SemanticJudgeProvider,
+    };
+
+    match compute_fusion(&state, &q.claim, &q.session).await {
+        FusionOutcome::Error { message } => {
+            Json(serde_json::json!({ "claim": q.claim, "session": q.session, "error": message }))
+        }
+        FusionOutcome::NotFound { reason } => Json(serde_json::json!({
+            "claim": q.claim,
+            "session": q.session,
+            "found": false,
+            "reason": reason,
+        })),
+        FusionOutcome::Found(found) => {
+            let FusionFound {
+                graph_source,
+                fused,
+                claim,
+                graph,
+                evidence_pool,
+            } = *found;
+            let input = JudgeInput::from_claim_and_graph(
+                &claim,
+                &graph,
+                &evidence_pool,
+                q.allow_raw_evidence,
+            );
+            let config = SemanticJudgeConfig::load_default();
+            let objective = objective_supported_for_disagreement_check(fused.verdict);
+
+            let judge_result = tokio::task::spawn_blocking(move || {
+                let provider = LocalSelfHostedJudgeProvider::new(config);
+                provider.judge(&input)
+            })
+            .await;
+
+            let output = match judge_result {
+                Ok(Ok(output)) => output.with_disagreement_check(objective),
+                Ok(Err(e)) => {
+                    return Json(serde_json::json!({
+                        "claim": q.claim,
+                        "session": q.session,
+                        "error": e.to_string(),
+                    }))
+                }
+                Err(e) => {
+                    return Json(serde_json::json!({
+                        "claim": q.claim,
+                        "session": q.session,
+                        "error": format!("judge task panicked: {e}"),
+                    }))
+                }
+            };
+
+            let derived_from_ids: Vec<uuid::Uuid> = graph
+                .links
+                .iter()
+                .map(|l| l.evidence_id)
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let judge_evidence = judge_output_to_evidence(
+                &output,
+                &q.session,
+                claim.source_event_id,
+                derived_from_ids,
+            );
+
             Json(serde_json::json!({
                 "claim": q.claim,
                 "session": q.session,
                 "found": true,
                 "graph_source": graph_source,
-                "recommendation": recommendation,
+                "judge": output,
+                "judge_evidence": judge_evidence,
                 "fused": fused,
             }))
         }
@@ -2112,5 +2253,119 @@ mod tests {
         .await;
         let v = response.0;
         assert!(v.get("error").is_some());
+    }
+
+    // --- FORNX-94: /api/judge -------------------------------------------
+
+    /// Deliberately does not assert `judge.verdict` is a specific value --
+    /// whether the local judge is enabled depends on this test machine's
+    /// `$FORNAX_HOME/config.toml`, which this test must not assume either
+    /// way (and must not mutate, for the same "don't mutate process-global
+    /// env vars shared with other tests" reason `sensor_config`'s own tests
+    /// document). What every environment must produce identically: `found:
+    /// true`, a `judge` object with a real verdict tag, and the SAME full
+    /// `fused` FusedFinding alongside it -- never the judge output instead
+    /// of the deterministic evidence trail.
+    #[tokio::test]
+    async fn api_judge_returns_judge_output_alongside_full_fused_finding() {
+        let state = test_state().await;
+        let session_id = "fornx-94-judge-real-graph";
+        let event_id = test_event(&state, session_id).await;
+        let claim = test_claim(session_id, event_id);
+        let evidence = test_evidence(session_id, event_id);
+        state
+            .store
+            .insert_claim(&claim)
+            .await
+            .expect("insert claim");
+        state
+            .store
+            .insert_evidence(&evidence)
+            .await
+            .expect("insert evidence");
+        let link = fornax_types::EvidenceLink {
+            id: Uuid::new_v4(),
+            session_id: session_id.to_string(),
+            claim_id: claim.id,
+            evidence_id: evidence.id,
+            relation: fornax_types::EvidenceRelation::Supports,
+            linked_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        state
+            .store
+            .insert_evidence_link(&link)
+            .await
+            .expect("insert evidence link");
+
+        let response = api_judge(
+            State(state),
+            Query(JudgeQuery {
+                claim: claim.id.to_string(),
+                session: session_id.to_string(),
+                allow_raw_evidence: false,
+            }),
+        )
+        .await;
+        let v = response.0;
+        assert_eq!(v["found"], serde_json::json!(true));
+        let verdict = v["judge"]["verdict"]
+            .as_str()
+            .expect("judge.verdict must be a string tag");
+        assert!(
+            ["supported", "contradicted", "inconclusive", "unavailable"].contains(&verdict),
+            "unexpected judge verdict tag: {verdict}"
+        );
+        assert!(v["judge"]["model"].is_string());
+        assert!(v["judge"]["endpoint"].is_string());
+        assert!(v["judge"]["rationale"].is_string());
+        // The full deterministic FusedFinding is present alongside the
+        // judge output, never instead of it.
+        assert_eq!(v["fused"]["verdict"], serde_json::json!("verified"));
+        assert_eq!(
+            v["fused"]["counted_link_ids"],
+            serde_json::json!([link.id.to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn api_judge_reports_not_found_for_unknown_claim() {
+        let state = test_state().await;
+        let response = api_judge(
+            State(state),
+            Query(JudgeQuery {
+                claim: Uuid::new_v4().to_string(),
+                session: "fornx-94-judge-unknown-claim".to_string(),
+                allow_raw_evidence: false,
+            }),
+        )
+        .await;
+        let v = response.0;
+        assert_eq!(v["found"], serde_json::json!(false));
+        assert!(v.get("judge").is_none());
+    }
+
+    // --- FORNX-94: objective/disagreement mapping ------------------------
+
+    #[test]
+    fn objective_supported_maps_verified_and_contradicted_only() {
+        assert_eq!(
+            objective_supported_for_disagreement_check(fornax_types::Verdict::Verified),
+            Some(true)
+        );
+        assert_eq!(
+            objective_supported_for_disagreement_check(fornax_types::Verdict::Contradicted),
+            Some(false)
+        );
+        for v in [
+            fornax_types::Verdict::Unverified,
+            fornax_types::Verdict::Unavailable,
+            fornax_types::Verdict::Review,
+        ] {
+            assert_eq!(
+                objective_supported_for_disagreement_check(v),
+                None,
+                "verdict={v:?} has no clean objective side to disagree against"
+            );
+        }
     }
 }
