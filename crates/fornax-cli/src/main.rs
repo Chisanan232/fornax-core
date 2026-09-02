@@ -47,6 +47,21 @@ enum Commands {
         /// Session id the claim belongs to.
         session: String,
     },
+    /// Live fused verdict for one claim (FORNX-304): computes
+    /// `fornax_verify::fusion::BaselineFusionPolicy::fuse` over the claim's
+    /// real evidence graph (FORNX-89), falling back to the `project_graph`
+    /// projection when the real graph is empty — the same fallback FORNX-93
+    /// documents as today's actual production state. Reads `GET
+    /// /api/fusion` on the daemon. Every `RationaleEntry` is rendered
+    /// individually, never collapsed into a summary — the same
+    /// never-collapse-the-taxonomy discipline as `evidence-graph`/
+    /// `capabilities`.
+    Fusion {
+        /// Claim id to look up.
+        claim: String,
+        /// Session id the claim belongs to.
+        session: String,
+    },
     /// Export one session's events/claims/evidence/capabilities from the
     /// local store into a directory-based spool, as one wire-compatible
     /// envelope JSON file per message (FORNX-60, FORNX-62). Reads
@@ -142,6 +157,18 @@ async fn main() -> anyhow::Result<()> {
             );
             match fetch_json(&url).await {
                 Ok(v) => print!("{}", render_evidence_graph(&v)),
+                Err(_) => println!("fornax: daemon unreachable (is `fornax-daemon` running?)"),
+            }
+        }
+        Commands::Fusion { claim, session } => {
+            let url = format!(
+                "{}/api/fusion?claim={}&session={}",
+                base_url(),
+                claim,
+                session
+            );
+            match fetch_json(&url).await {
+                Ok(v) => print!("{}", render_fusion(&v)),
                 Err(_) => println!("fornax: daemon unreachable (is `fornax-daemon` running?)"),
             }
         }
@@ -908,6 +935,136 @@ fn render_evidence_graph(v: &serde_json::Value) -> String {
                     out.push_str(&format!("    {signal_class}: {availability} ({detail})\n"))
                 }
                 None => out.push_str(&format!("    {signal_class}: {availability}\n")),
+            }
+        }
+    }
+
+    out
+}
+
+/// Icon for a `RuleEffect` tag, mirroring `verdict_icon`/`availability_icon`'s
+/// distinct-per-state convention. An unrecognized tag is shown verbatim
+/// rather than mapped onto an existing effect.
+fn rule_effect_icon(effect: &str) -> &'static str {
+    match effect {
+        "counted" => "✚",
+        "discounted" => "✕",
+        "caveat" => "⚠",
+        "decided" => "🛡",
+        _ => "◌",
+    }
+}
+
+/// Renders `GET /api/fusion`'s response (FORNX-304): the live `FusedFinding`
+/// computed from a claim's real evidence graph (FORNX-89/FORNX-93), or the
+/// `project_graph` fallback when that graph is empty. Every
+/// `RationaleEntry` is rendered individually — rule name, effect, every
+/// referenced link/missing-evidence/evidence id, and the detail text —
+/// never collapsed into a summary count, the same never-collapse-the-
+/// taxonomy discipline `render_evidence_graph`/`render_capabilities` follow.
+/// Returns the rendered text (rather than printing directly) so it can be
+/// asserted on in tests.
+fn render_fusion(v: &serde_json::Value) -> String {
+    let mut out = String::new();
+    let claim = v.get("claim").and_then(|s| s.as_str()).unwrap_or("?");
+    let session = v.get("session").and_then(|s| s.as_str()).unwrap_or("?");
+    out.push_str(&format!("claim: {claim}\nsession: {session}\n"));
+
+    if let Some(error) = v.get("error").and_then(|s| s.as_str()) {
+        out.push_str(&format!("  error: {error}\n"));
+        return out;
+    }
+
+    let found = v.get("found").and_then(|b| b.as_bool()).unwrap_or(false);
+    if !found {
+        let reason = v
+            .get("reason")
+            .and_then(|s| s.as_str())
+            .unwrap_or("no claim with this id is on record for this session");
+        out.push_str(&format!("  no such claim on record ({reason})\n"));
+        return out;
+    }
+
+    let graph_source = v
+        .get("graph_source")
+        .and_then(|s| s.as_str())
+        .unwrap_or("?");
+    out.push_str(&format!("  graph_source: {graph_source}\n"));
+
+    let fused = v.get("fused").cloned().unwrap_or_default();
+    let verdict = fused.get("verdict").and_then(|s| s.as_str()).unwrap_or("?");
+    let uncertainty = fused
+        .get("uncertainty")
+        .and_then(|s| s.as_str())
+        .unwrap_or("?");
+    let policy_name = fused
+        .get("policy_name")
+        .and_then(|s| s.as_str())
+        .unwrap_or("?");
+    let policy_version = fused
+        .get("policy_version")
+        .and_then(|n| n.as_u64())
+        .unwrap_or(0);
+    let computed_at = fused
+        .get("computed_at")
+        .and_then(|s| s.as_str())
+        .unwrap_or("?");
+    let unresolved_conflict = fused
+        .get("unresolved_conflict")
+        .and_then(|b| b.as_bool())
+        .unwrap_or(false);
+
+    out.push_str(&format!(
+        "  {} {}  (uncertainty: {})\n",
+        verdict_icon(verdict),
+        verdict.to_uppercase(),
+        uncertainty
+    ));
+    if unresolved_conflict {
+        out.push_str("  ⚠ unresolved conflict: not auto-resolved\n");
+    }
+    out.push_str(&format!(
+        "  policy: {policy_name} v{policy_version}  computed_at: {computed_at}\n"
+    ));
+
+    let empty = vec![];
+    let rationale = fused
+        .get("rationale")
+        .and_then(|r| r.as_array())
+        .unwrap_or(&empty);
+    if rationale.is_empty() {
+        out.push_str("  rationale: (none)\n");
+        return out;
+    }
+    out.push_str(&format!("  rationale ({}):\n", rationale.len()));
+    for entry in rationale {
+        let rule = entry.get("rule").and_then(|s| s.as_str()).unwrap_or("?");
+        let effect = entry.get("effect").and_then(|s| s.as_str()).unwrap_or("?");
+        let detail = entry.get("detail").and_then(|s| s.as_str()).unwrap_or("");
+        out.push_str(&format!(
+            "    {} {} [{}]: {}\n",
+            rule_effect_icon(effect),
+            rule,
+            effect,
+            detail
+        ));
+        let ids_line = |key: &str| -> Option<String> {
+            let ids: Vec<&str> = entry
+                .get(key)
+                .and_then(|a| a.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|id| id.as_str())
+                .collect();
+            if ids.is_empty() {
+                None
+            } else {
+                Some(format!("      {key}: {}\n", ids.join(", ")))
+            }
+        };
+        for key in ["link_ids", "missing_evidence_ids", "evidence_ids"] {
+            if let Some(line) = ids_line(key) {
+                out.push_str(&line);
             }
         }
     }
@@ -2054,5 +2211,107 @@ trust_level = \"trusted\"\n";
             std::fs::remove_file(&db_path).ok();
             std::fs::remove_dir_all(&out_dir).ok();
         }
+    }
+
+    // --- FORNX-304: render_fusion -------------------------------------------
+
+    /// Fixture shaped exactly like `GET /api/fusion`'s real response body —
+    /// a `FusedFinding` with two rationale entries, one `Counted` and one
+    /// `Decided`, so the rendering test below can pin that every entry (and
+    /// every id it names) is shown individually rather than collapsed into a
+    /// summary.
+    fn fusion_fixture() -> serde_json::Value {
+        serde_json::json!({
+            "claim": "c1",
+            "session": "s1",
+            "found": true,
+            "graph_source": "graph",
+            "fused": {
+                "claim_id": "c1",
+                "verdict": "verified",
+                "uncertainty": "qualified",
+                "rationale": [
+                    {
+                        "rule": "independence_unverified",
+                        "effect": "caveat",
+                        "link_ids": ["link-1"],
+                        "missing_evidence_ids": [],
+                        "evidence_ids": ["ev-1"],
+                        "detail": "link link-1's evidence carries no recorded correlation group",
+                    },
+                    {
+                        "rule": "verdict_decided",
+                        "effect": "decided",
+                        "link_ids": ["link-1"],
+                        "missing_evidence_ids": [],
+                        "evidence_ids": [],
+                        "detail": "1 distinct supporting vote(s) survived fusion, no contradicting votes",
+                    },
+                ],
+                "counted_link_ids": ["link-1"],
+                "discounted_link_ids": [],
+                "missing_evidence_ids": [],
+                "unresolved_conflict": false,
+                "policy_name": "deterministic_baseline_v1",
+                "policy_version": 1,
+                "computed_at": "2026-09-02T00:00:00+00:00",
+            },
+        })
+    }
+
+    #[test]
+    fn render_fusion_shows_verdict_and_every_rationale_entry_individually() {
+        let v = fusion_fixture();
+        let rendered = render_fusion(&v);
+        assert!(rendered.contains("claim: c1"));
+        assert!(rendered.contains("session: s1"));
+        assert!(rendered.contains("graph_source: graph"));
+        assert!(rendered.contains("VERIFIED"));
+        assert!(rendered.contains("uncertainty: qualified"));
+        assert!(rendered.contains("policy: deterministic_baseline_v1 v1"));
+        assert!(rendered.contains("computed_at: 2026-09-02T00:00:00+00:00"));
+        // Both rationale entries must appear, each with its rule name,
+        // effect, referenced ids, and detail text -- never collapsed into a
+        // single summary line.
+        assert!(rendered.contains("independence_unverified [caveat]"));
+        assert!(rendered.contains("link link-1's evidence carries no recorded correlation group"));
+        assert!(rendered.contains("verdict_decided [decided]"));
+        assert!(rendered
+            .contains("1 distinct supporting vote(s) survived fusion, no contradicting votes"));
+        assert!(rendered.contains("link_ids: link-1"));
+        assert!(rendered.contains("evidence_ids: ev-1"));
+    }
+
+    #[test]
+    fn render_fusion_reports_not_found_for_unknown_claim() {
+        let v = serde_json::json!({
+            "claim": "c-missing",
+            "session": "s1",
+            "found": false,
+            "reason": "no claim with this id is on record for this session",
+        });
+        let rendered = render_fusion(&v);
+        assert!(rendered.contains("no such claim on record"));
+    }
+
+    #[test]
+    fn render_fusion_shows_daemon_error_distinctly_from_not_found() {
+        let v = serde_json::json!({
+            "claim": "c1",
+            "session": "s1",
+            "error": "database error: disk I/O error",
+        });
+        let rendered = render_fusion(&v);
+        assert!(rendered.contains("error: database error"));
+        assert!(!rendered.contains("no such claim on record"));
+    }
+
+    #[test]
+    fn render_fusion_surfaces_unresolved_conflict_banner() {
+        let mut v = fusion_fixture();
+        v["fused"]["verdict"] = serde_json::json!("review");
+        v["fused"]["unresolved_conflict"] = serde_json::json!(true);
+        let rendered = render_fusion(&v);
+        assert!(rendered.contains("⚠ unresolved conflict"));
     }
 }
