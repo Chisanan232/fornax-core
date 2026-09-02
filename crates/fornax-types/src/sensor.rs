@@ -529,6 +529,21 @@ impl SensorOutcome {
     pub fn has_evidence(&self) -> bool {
         !self.evidence.is_empty()
     }
+
+    /// A sensor configured off (`crate::SensorDisableConfig`, FORNX-302)
+    /// never ran this call — reported explicitly via
+    /// [`crate::SignalAvailability::Disabled`], not by silently returning
+    /// [`SensorOutcome::nothing_to_report`] or omitting the sensor's output
+    /// altogether. `sensor_name` is folded into `detail` so the reason a
+    /// caller sees no evidence from this sensor is legible without
+    /// cross-referencing the config file.
+    pub fn disabled(sensor_name: &str) -> Self {
+        Self {
+            evidence: vec![],
+            state: SignalAvailability::Disabled,
+            detail: Some(format!("sensor '{sensor_name}' disabled via local config")),
+        }
+    }
 }
 
 /// Contract for a component that observes something and turns it into
@@ -592,6 +607,23 @@ pub trait EvidenceSensor {
             .iter()
             .all(|c| caps.is_observable(c))
     }
+}
+
+/// Runs `sensor.collect(event, caps)` unless `disable_config` names this
+/// sensor as disabled, in which case it reports
+/// [`SensorOutcome::disabled`] without calling `collect` at all — the one
+/// call site adapters route every sensor invocation through so the
+/// disable check can't be forgotten at a new call site (FORNX-302).
+pub fn collect_with_disable_check(
+    sensor: &dyn EvidenceSensor,
+    event: &AgentEvent,
+    caps: &RuntimeCapabilities,
+    disable_config: &crate::SensorDisableConfig,
+) -> SensorOutcome {
+    if disable_config.is_disabled(sensor.name()) {
+        return SensorOutcome::disabled(sensor.name());
+    }
+    sensor.collect(event, caps)
 }
 
 #[cfg(test)]
@@ -915,5 +947,47 @@ mod tests {
             detail: None,
         }]);
         assert!(sensor.is_ready(&future_caps));
+    }
+
+    // --- FORNX-302: per-sensor disable configuration ----------------------
+
+    #[test]
+    fn collect_with_disable_check_reports_disabled_without_running_the_sensor() {
+        let sensor = ReasoningSummarySensor;
+        let caps = caps_with(vec![CapabilitySignal {
+            class: SignalClass::ReasoningSummary,
+            state: SignalAvailability::Available,
+            detail: None,
+        }]);
+        // Ready per `is_ready`, so an un-checked `collect` call would run
+        // (returning `nothing_to_report`, i.e. `Available`) — the disable
+        // check must intercept before that happens.
+        assert!(sensor.is_ready(&caps));
+
+        let disable_config = crate::SensorDisableConfig::from_toml_str(
+            "[sensors]\ndisabled = [\"reasoning_summary_sensor_v1\"]\n",
+        )
+        .unwrap();
+        let outcome = collect_with_disable_check(&sensor, &dummy_event(), &caps, &disable_config);
+        assert!(!outcome.has_evidence());
+        assert_eq!(outcome.state, SignalAvailability::Disabled);
+        assert!(outcome
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("reasoning_summary_sensor_v1"));
+    }
+
+    #[test]
+    fn collect_with_disable_check_runs_the_sensor_normally_when_not_disabled() {
+        let sensor = ReasoningSummarySensor;
+        let caps = caps_with(vec![]);
+        let disable_config = crate::SensorDisableConfig::empty();
+        let outcome = collect_with_disable_check(&sensor, &dummy_event(), &caps, &disable_config);
+        // Unaffected by the disable check: same result as calling
+        // `collect` directly (see `future_reasoning_summary_sensor_...`
+        // above) — not ready, so `Unsupported`.
+        assert!(!outcome.has_evidence());
+        assert_eq!(outcome.state, SignalAvailability::Unsupported);
     }
 }
