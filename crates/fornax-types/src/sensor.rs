@@ -235,6 +235,13 @@ pub enum CollectionMethod {
     /// future CI webhook sensor). Not implemented by any sensor yet — typed
     /// ahead of a producer, same as `SignalClass::ReasoningSummary`.
     HttpWebhook,
+    /// An outbound HTTP request Fornax itself issued against an external
+    /// API to *query* current state (e.g. GitHub's check-runs API for a
+    /// given commit SHA) — distinct from [`Self::HttpWebhook`], which is an
+    /// *inbound* request delivered to Fornax on the external system's own
+    /// schedule. `fornax-ci`'s `GitHubCiStatusSensor` (FORNX-302) is the
+    /// first producer.
+    HttpQuery,
     /// Fornax's own host-side process invocation (e.g. a literal `git`
     /// command Fornax ran itself), as opposed to reading something a
     /// provider produced.
@@ -844,6 +851,7 @@ mod tests {
             ("\"hook_callback\"", CollectionMethod::HookCallback),
             ("\"file_poll\"", CollectionMethod::FilePoll),
             ("\"http_webhook\"", CollectionMethod::HttpWebhook),
+            ("\"http_query\"", CollectionMethod::HttpQuery),
             (
                 "\"process_observation\"",
                 CollectionMethod::ProcessObservation,
