@@ -4,6 +4,8 @@
 
 use clap::{Parser, Subcommand};
 
+mod experiment_ux;
+
 #[derive(Parser)]
 #[command(
     name = "fornax",
@@ -167,6 +169,16 @@ enum Commands {
     /// to run when nothing is installed, including when
     /// `~/.codex/config.toml` does not exist.
     UninstallCodex,
+    /// Counterfactual verification flow (FORNX-101): preview/run/render a
+    /// bounded robustness experiment against a claim, wiring together
+    /// FORNX-99's `ExperimentSpec` contract, FORNX-100's isolated
+    /// `ExperimentExecutor`, and FORNX-102's causal evidence mapping. Runs
+    /// entirely client-side against local filesystem paths (no daemon
+    /// dependency) — see `experiment_ux`'s module docs for why.
+    Experiment {
+        #[command(subcommand)]
+        action: experiment_ux::ExperimentAction,
+    },
 }
 
 fn base_url() -> String {
@@ -259,6 +271,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::UninstallClaude => uninstall_claude()?,
         Commands::InstallCodex => install_codex()?,
         Commands::UninstallCodex => uninstall_codex()?,
+        Commands::Experiment { action } => experiment_ux::handle(action, &fornax_home())?,
     }
     Ok(())
 }

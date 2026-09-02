@@ -780,6 +780,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
+ "fornax-experiment-runner",
  "fornax-store",
  "fornax-types",
  "reqwest",
