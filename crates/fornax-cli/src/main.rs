@@ -62,6 +62,32 @@ enum Commands {
         /// Session id the claim belongs to.
         session: String,
     },
+    /// Actionable recommendation for one claim (FORNX-96, local half):
+    /// computes `fornax_verify::fusion::BaselineFusionPolicy::fuse` exactly
+    /// like `fusion`, then applies
+    /// `fornax_verify::decision::DefaultRiskPolicy` for the requested risk
+    /// class to produce a `PROCEED`/`REVIEW`/`BLOCK` recommendation. Reads
+    /// `GET /api/decision` on the daemon.
+    ///
+    /// Never shows the recommendation alone — always renders it together
+    /// with the same full fusion detail `fusion` renders (verdict,
+    /// uncertainty band, every rationale entry), reusing that rendering
+    /// function rather than duplicating it. This is what "user can inspect
+    /// why the recommendation changed" means: the recommendation and its
+    /// full evidence trail are shown together, and re-running with a
+    /// different `--risk` shows how the same evidence can yield a
+    /// different action.
+    Decision {
+        /// Claim id to look up.
+        claim: String,
+        /// Session id the claim belongs to.
+        session: String,
+        /// Risk class to evaluate under: `strict`, `balanced`, or
+        /// `lenient`. Defaults to `balanced` — the class every hard safety
+        /// floor in `fornax_verify::decision` is written against.
+        #[arg(long, default_value = "balanced")]
+        risk: String,
+    },
     /// Export one session's events/claims/evidence/capabilities from the
     /// local store into a directory-based spool, as one wire-compatible
     /// envelope JSON file per message (FORNX-60, FORNX-62). Reads
@@ -169,6 +195,23 @@ async fn main() -> anyhow::Result<()> {
             );
             match fetch_json(&url).await {
                 Ok(v) => print!("{}", render_fusion(&v)),
+                Err(_) => println!("fornax: daemon unreachable (is `fornax-daemon` running?)"),
+            }
+        }
+        Commands::Decision {
+            claim,
+            session,
+            risk,
+        } => {
+            let url = format!(
+                "{}/api/decision?claim={}&session={}&risk={}",
+                base_url(),
+                claim,
+                session,
+                risk
+            );
+            match fetch_json(&url).await {
+                Ok(v) => print!("{}", render_decision(&v)),
                 Err(_) => println!("fornax: daemon unreachable (is `fornax-daemon` running?)"),
             }
         }
@@ -1069,6 +1112,65 @@ fn render_fusion(v: &serde_json::Value) -> String {
         }
     }
 
+    out
+}
+
+/// Icon for a `Recommendation::action` value, mirroring `verdict_icon`'s
+/// never-collapse-the-vocabulary discipline: three actions, three distinct
+/// icons, no default that could be mistaken for a real one.
+fn recommendation_icon(action: &str) -> &'static str {
+    match action {
+        "proceed" => "✓",
+        "review" => "!",
+        "block" => "✕",
+        _ => "?",
+    }
+}
+
+/// Renders `GET /api/decision`'s response (FORNX-96, local half): the
+/// `Recommendation` computed for the requested risk class, followed by the
+/// SAME full fusion detail `render_fusion` renders for `fornax fusion` —
+/// reusing that function rather than duplicating its rendering logic. This
+/// is what "recommendation never replaces the underlying Finding/evidence
+/// graph" means at the CLI layer: both are always shown together. When the
+/// claim isn't found or the daemon reports an error, `render_fusion` alone
+/// already handles both cases correctly (this response shares that shape),
+/// so no `recommendation` block is printed in either case.
+fn render_decision(v: &serde_json::Value) -> String {
+    let mut out = String::new();
+    let found = v.get("found").and_then(|b| b.as_bool()).unwrap_or(false);
+    let has_error = v.get("error").is_some();
+    if found && !has_error {
+        if let Some(rec) = v.get("recommendation") {
+            let action = rec.get("action").and_then(|s| s.as_str()).unwrap_or("?");
+            let risk_class = rec
+                .get("risk_class")
+                .and_then(|s| s.as_str())
+                .unwrap_or("?");
+            let policy_name = rec
+                .get("policy_name")
+                .and_then(|s| s.as_str())
+                .unwrap_or("?");
+            let policy_version = rec
+                .get("policy_version")
+                .and_then(|n| n.as_u64())
+                .unwrap_or(0);
+            let rationale_summary = rec
+                .get("rationale_summary")
+                .and_then(|s| s.as_str())
+                .unwrap_or("");
+            out.push_str(&format!(
+                "recommendation: {} {}  (risk: {}, policy: {} v{})\n  {}\n\n",
+                recommendation_icon(action),
+                action.to_uppercase(),
+                risk_class,
+                policy_name,
+                policy_version,
+                rationale_summary
+            ));
+        }
+    }
+    out.push_str(&render_fusion(v));
     out
 }
 
@@ -2313,5 +2415,81 @@ trust_level = \"trusted\"\n";
         v["fused"]["unresolved_conflict"] = serde_json::json!(true);
         let rendered = render_fusion(&v);
         assert!(rendered.contains("⚠ unresolved conflict"));
+    }
+
+    // --- FORNX-96: render_decision (local half) -----------------------------
+
+    /// Fixture shaped exactly like `GET /api/decision`'s real response body
+    /// -- `fusion_fixture` plus a `recommendation` block.
+    fn decision_fixture() -> serde_json::Value {
+        let mut v = fusion_fixture();
+        v["recommendation"] = serde_json::json!({
+            "claim_id": "c1",
+            "action": "review",
+            "risk_class": "balanced",
+            "policy_name": "default_risk_policy_v1",
+            "policy_version": 1,
+            "rationale_summary": "verdict=Verified uncertainty=Qualified risk=Balanced -> Review",
+        });
+        v
+    }
+
+    #[test]
+    fn render_decision_shows_recommendation_and_full_fusion_detail_together() {
+        let v = decision_fixture();
+        let rendered = render_decision(&v);
+        // The recommendation is shown...
+        assert!(rendered.contains("recommendation: ! REVIEW"));
+        assert!(rendered.contains("risk: balanced"));
+        assert!(rendered.contains("policy: default_risk_policy_v1 v1"));
+        assert!(rendered.contains("verdict=Verified uncertainty=Qualified risk=Balanced -> Review"));
+        // ...together with the SAME full fusion detail `fusion` renders --
+        // never instead of it.
+        assert!(rendered.contains("VERIFIED"));
+        assert!(rendered.contains("uncertainty: qualified"));
+        assert!(rendered.contains("independence_unverified"));
+        assert!(rendered.contains("verdict_decided"));
+    }
+
+    #[test]
+    fn render_decision_icons_cover_all_three_actions_distinctly() {
+        assert_eq!(recommendation_icon("proceed"), "✓");
+        assert_eq!(recommendation_icon("review"), "!");
+        assert_eq!(recommendation_icon("block"), "✕");
+    }
+
+    #[test]
+    fn render_decision_reports_not_found_for_unknown_claim() {
+        let v = serde_json::json!({
+            "claim": "missing",
+            "session": "s1",
+            "found": false,
+            "reason": "no claim with this id is on record for this session",
+        });
+        let rendered = render_decision(&v);
+        assert!(rendered.contains("no such claim on record"));
+        assert!(!rendered.contains("recommendation:"));
+    }
+
+    #[test]
+    fn render_decision_shows_daemon_error_without_a_recommendation_block() {
+        let v = serde_json::json!({
+            "claim": "c1",
+            "session": "s1",
+            "error": "unknown risk class 'reckless' -- expected one of strict, balanced, lenient",
+        });
+        let rendered = render_decision(&v);
+        assert!(rendered.contains("error:"));
+        assert!(!rendered.contains("recommendation:"));
+    }
+
+    #[test]
+    fn render_decision_reflects_a_different_action_under_a_different_risk_class() {
+        let mut strict_view = decision_fixture();
+        strict_view["recommendation"]["action"] = serde_json::json!("block");
+        strict_view["recommendation"]["risk_class"] = serde_json::json!("strict");
+        let rendered = render_decision(&strict_view);
+        assert!(rendered.contains("recommendation: ✕ BLOCK"));
+        assert!(rendered.contains("risk: strict"));
     }
 }
