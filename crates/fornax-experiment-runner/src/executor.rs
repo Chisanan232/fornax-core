@@ -118,8 +118,16 @@ pub struct InterventionObservation {
 /// worktree. Caller-supplied because interpreting what an intervention's
 /// evidence means is domain logic this executor deliberately does not
 /// own — see module docs.
+///
+/// Takes `&StagedWorktree`, not a bare `&Path`, for the same containment
+/// reason [`InterventionApplier`] does (FORNX-107 security review): any
+/// implementation that reads a path named by [`ExperimentSpec`]/
+/// `Intervention::params` must resolve it via
+/// [`StagedWorktree::resolve_contained`] rather than joining it against a
+/// raw root directly — a bare `&Path` gives an implementation no way to do
+/// that even if it wanted to.
 pub trait InterventionObserver {
-    fn observe(&self, staged_root: &Path, spec: &ExperimentSpec) -> InterventionObservation;
+    fn observe(&self, staged: &StagedWorktree, spec: &ExperimentSpec) -> InterventionObservation;
 }
 
 /// Applies an [`Intervention`] this executor has no built-in handling for
@@ -236,7 +244,7 @@ impl<'a> ExperimentExecutor<'a> {
             return blocked("cancelled before evidence could be observed");
         }
 
-        let observation = self.observer.observe(staged.path(), spec);
+        let observation = self.observer.observe(&staged, spec);
 
         if started.elapsed() >= deadline {
             return failed(format!(

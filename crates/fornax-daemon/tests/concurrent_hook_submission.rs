@@ -309,6 +309,29 @@ async fn independent_sessions_submitted_concurrently_are_not_lost_or_mixed_up() 
             claims[0].text
         );
 
+        // Finding computation runs asynchronously *after* the claim is
+        // persisted (verifier dispatch, not part of the claim-write itself),
+        // so waiting only for the claim (above) is not sufficient here --
+        // under concurrent load (10 sessions racing) it can lag behind the
+        // claim by more than a few milliseconds. Poll for it the same way
+        // the claim itself is polled for, rather than reading
+        // `recent_findings` exactly once immediately after the claim
+        // appears (a real, reproducible flake this test previously had:
+        // "session ... should produce exactly its own one finding, got 0").
+        wait_for(Duration::from_secs(15), || {
+            let store = &store;
+            let session = session.clone();
+            async move {
+                store
+                    .recent_findings(500)
+                    .await
+                    .expect("recent findings")
+                    .into_iter()
+                    .any(|f| f.session_id == session)
+            }
+        })
+        .await;
+
         let findings: Vec<_> = store
             .recent_findings(500)
             .await
