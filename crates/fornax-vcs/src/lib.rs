@@ -25,7 +25,7 @@
 //! (`docs/adr/0001-architecture-invariants.md`'s "no cloud dependency on the
 //! local critical path").
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The real, host-observed state of a git working tree at the moment this
 /// was queried — independent of anything a coding agent claimed happened.
@@ -39,11 +39,18 @@ pub struct WorkingTreeStatus {
     /// repository that has no commits yet (an "unborn" `HEAD`) — also not an
     /// error.
     pub head_commit: Option<String>,
-    /// Paths (repo-root-relative) that differ between `HEAD`'s tree, the
-    /// index, and the working tree, or that are untracked — i.e. every path
-    /// this git implementation's own status walk considers not clean, the
-    /// same set `git status --ignored=no` would report. Empty when the
-    /// working tree is clean.
+    /// The working tree's root directory (`None` for a bare repository, or
+    /// when [`Self::is_repo`] is `false`). Kept so a caller holding an
+    /// absolute claimed path can resolve it against [`Self::dirty_paths`]
+    /// via [`Self::is_absolute_path_dirty`] without independently
+    /// re-discovering the repo root.
+    pub work_dir: Option<PathBuf>,
+    /// Paths (repo-root-relative, `/`-separated per git's own convention)
+    /// that differ between `HEAD`'s tree, the index, and the working tree,
+    /// or that are untracked — i.e. every path this git implementation's
+    /// own status walk considers not clean, the same set
+    /// `git status --ignored=no` would report. Empty when the working tree
+    /// is clean.
     pub dirty_paths: Vec<String>,
 }
 
@@ -52,6 +59,7 @@ impl WorkingTreeStatus {
         Self {
             is_repo: false,
             head_commit: None,
+            work_dir: None,
             dirty_paths: Vec::new(),
         }
     }
@@ -61,6 +69,19 @@ impl WorkingTreeStatus {
     /// separator) appears among [`Self::dirty_paths`].
     pub fn is_path_dirty(&self, path: &str) -> bool {
         self.dirty_paths.iter().any(|p| p == path)
+    }
+
+    /// Resolve an absolute (or otherwise host-path-shaped) `path` against
+    /// [`Self::work_dir`] and report whether the result appears in
+    /// [`Self::dirty_paths`]. Returns `None` when there is no known working
+    /// directory to resolve against ([`Self::is_repo`] is `false`, the repo
+    /// is bare) or `path` does not lie inside it — a caller with no
+    /// meaningful yes/no answer, not a `false`.
+    pub fn is_absolute_path_dirty(&self, path: &Path) -> Option<bool> {
+        let work_dir = self.work_dir.as_deref()?;
+        let rel = path.strip_prefix(work_dir).ok()?;
+        let rel_str = rel.to_str()?.replace(std::path::MAIN_SEPARATOR, "/");
+        Some(self.is_path_dirty(&rel_str))
     }
 }
 
@@ -110,12 +131,14 @@ pub fn working_tree_status(repo_path: &Path) -> Result<WorkingTreeStatus, VcsErr
     // state, not a failure — reported as `head_commit: None`, matching
     // `WorkingTreeStatus::head_commit`'s documented contract.
     let head_commit = repo.head_id().ok().map(|id| id.to_string());
+    let work_dir = repo.workdir().map(Path::to_path_buf);
 
     let dirty_paths = collect_dirty_paths(&repo)?;
 
     Ok(WorkingTreeStatus {
         is_repo: true,
         head_commit,
+        work_dir,
         dirty_paths,
     })
 }
@@ -182,6 +205,16 @@ mod tests {
 
         assert!(status.is_repo);
         assert!(status.is_path_dirty("claimed.txt"));
+        assert_eq!(
+            status.is_absolute_path_dirty(&file),
+            Some(true),
+            "an absolute path under work_dir must resolve the same as its relative form"
+        );
+        assert_eq!(
+            status.is_absolute_path_dirty(Path::new("/definitely/outside/repo.txt")),
+            None,
+            "a path outside work_dir has no meaningful dirty/clean answer"
+        );
     }
 
     #[test]
