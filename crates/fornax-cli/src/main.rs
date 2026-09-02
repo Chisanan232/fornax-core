@@ -984,6 +984,109 @@ mod tests {
         assert!(!rendered.contains("CONTRADICTED"));
     }
 
+    #[test]
+    fn relation_icon_covers_all_three_states_never_collapsing() {
+        assert_eq!(relation_icon("supports"), "✚");
+        assert_eq!(relation_icon("contradicts"), "✕");
+        assert_eq!(relation_icon("neutral"), "•");
+        // Forward-compat: an unrecognized tag must not collapse onto an
+        // existing relation's icon.
+        assert_eq!(relation_icon("quantum_pending"), "◌");
+    }
+
+    #[test]
+    fn render_evidence_graph_reports_not_found_for_unknown_claim() {
+        let v = serde_json::json!({
+            "claim": "c1",
+            "session": "s1",
+            "found": false,
+            "reason": "no claim with this id is on record for this session",
+        });
+        let rendered = render_evidence_graph(&v);
+        assert!(rendered.contains("claim: c1"));
+        assert!(rendered.contains("no such claim on record"));
+    }
+
+    /// FORNX-90: the core product invariant — a claim with genuinely zero
+    /// links and zero missing notes ("nobody has looked") must render a
+    /// distinct message from a claim with zero links but one or more
+    /// missing notes ("looked, evidence could not be collected"), and both
+    /// must be distinct from the "claim not found" case above.
+    #[test]
+    fn render_evidence_graph_distinguishes_nobody_looked_from_looked_but_absent() {
+        let nobody_looked = serde_json::json!({
+            "claim": "c1", "session": "s1", "found": true, "links": [], "missing": [],
+        });
+        let rendered = render_evidence_graph(&nobody_looked);
+        assert!(rendered.contains("no evidence linked and no missing-evidence notes recorded"));
+
+        let looked_but_absent = serde_json::json!({
+            "claim": "c1", "session": "s1", "found": true, "links": [],
+            "missing": [{
+                "signal_class": "process_result",
+                "availability": "unavailable",
+                "detail": "no exit code sensor ran for this claim",
+            }],
+        });
+        let rendered2 = render_evidence_graph(&looked_but_absent);
+        assert!(rendered2.contains("no evidence linked to this claim"));
+        assert!(rendered2
+            .contains("process_result: unavailable (no exit code sensor ran for this claim)"));
+        assert_ne!(rendered, rendered2);
+    }
+
+    /// FORNX-90: linked evidence must be grouped by relation and each item
+    /// shown individually — never collapsed into a single count/score.
+    #[test]
+    fn render_evidence_graph_groups_links_by_relation_and_shows_each_item() {
+        let v = serde_json::json!({
+            "claim": "c1", "session": "s1", "found": true,
+            "links": [
+                {"evidence_id": "e1", "relation": "supports", "linked_at": "2026-09-01T00:00:00Z"},
+                {"evidence_id": "e2", "relation": "supports", "linked_at": "2026-09-01T00:00:01Z"},
+                {"evidence_id": "e3", "relation": "contradicts", "linked_at": "2026-09-01T00:00:02Z"},
+            ],
+            "missing": [],
+        });
+        let rendered = render_evidence_graph(&v);
+        assert!(rendered.contains("✚ supports (2)"));
+        assert!(rendered.contains("✕ contradicts (1)"));
+        assert!(rendered.contains("evidence: e1"));
+        assert!(rendered.contains("evidence: e2"));
+        assert!(rendered.contains("evidence: e3"));
+        assert!(!rendered.contains("no evidence linked"));
+    }
+
+    /// FORNX-90 regression: a link with an unrecognized relation tag must
+    /// still be shown, never silently dropped — "show each item" applies
+    /// even to a state this renderer doesn't yet name.
+    #[test]
+    fn render_evidence_graph_never_drops_a_link_with_an_unrecognized_relation() {
+        let v = serde_json::json!({
+            "claim": "c1", "session": "s1", "found": true,
+            "links": [
+                {"evidence_id": "e1", "relation": "quantum_pending", "linked_at": "2026-09-01T00:00:00Z"},
+            ],
+            "missing": [],
+        });
+        let rendered = render_evidence_graph(&v);
+        assert!(rendered.contains("evidence: e1"));
+        assert!(rendered.contains("quantum_pending (1)"));
+    }
+
+    /// FORNX-90 regression: a daemon-side error must render as its own
+    /// distinct outcome, never defaulted into "claim not found" — "we don't
+    /// know" must stay distinguishable from "we looked and it's absent".
+    #[test]
+    fn render_evidence_graph_shows_daemon_error_distinctly_from_not_found() {
+        let v = serde_json::json!({
+            "claim": "c1", "session": "s1", "error": "store unavailable",
+        });
+        let rendered = render_evidence_graph(&v);
+        assert!(rendered.contains("error: store unavailable"));
+        assert!(!rendered.contains("no such claim on record"));
+    }
+
     // FORNX-15: install-claude / uninstall-claude must idempotently
     // add/remove the documented Fornax hook entries in a
     // `~/.claude/settings.json`-shaped fixture without disturbing anything
