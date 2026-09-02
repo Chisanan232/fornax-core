@@ -286,6 +286,43 @@ pub enum ProcessObservationDetail {
         head_commit: Option<String>,
         path_is_dirty: bool,
     },
+    /// FORNX-302: aggregated CI check-run status for one commit SHA, queried
+    /// from the CI provider's own API (GitHub Actions, via the `fornax-ci`
+    /// crate's `GitHubCiStatusSensor` — the one producer today).
+    /// `TrustClass::IndependentExternal` — reported by a system outside both
+    /// the coding agent and the local host, independent of what either
+    /// claims happened.
+    CiCheckStatus {
+        /// `"owner/repo"` slug the check-runs were queried for.
+        repo: String,
+        commit_sha: String,
+        total_count: i64,
+        overall: CiOverallStatus,
+    },
+}
+
+/// Coarse aggregate of a commit's CI check-runs
+/// ([`ProcessObservationDetail::CiCheckStatus`]), derived by the querying
+/// sensor from each individual check-run's `status`/`conclusion` — never a
+/// raw pass-through of GitHub's own per-check vocabulary, so downstream
+/// verifiers have one small, closed vocabulary to match on regardless of how
+/// many individual checks a repository happens to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CiOverallStatus {
+    /// Every check-run completed with a conclusion of `success`, `neutral`,
+    /// or `skipped`.
+    Success,
+    /// At least one check-run completed with `failure`, `timed_out`,
+    /// `cancelled`, or `action_required`.
+    Failure,
+    /// At least one check-run has not yet completed (`queued`/`in_progress`),
+    /// and none have failed.
+    Pending,
+    /// No check-runs were reported for this commit at all (`total_count ==
+    /// 0`), or a check-run reported a conclusion this binary does not
+    /// recognize — an honest "cannot summarize", never guessed as `Success`.
+    Unknown,
 }
 
 /// Which git operation a [`ProcessObservationDetail::VcsOperation`] observed.
