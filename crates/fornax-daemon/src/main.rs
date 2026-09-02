@@ -163,6 +163,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/capabilities", get(api_capabilities))
         .route("/api/evidence-graph", get(api_evidence_graph))
         .route("/api/fusion", get(api_fusion))
+        .route("/api/decision", get(api_decision))
         .route("/dashboard", get(dashboard))
         .with_state(state);
 
@@ -545,7 +546,24 @@ fn finding_row_to_finding(row: &fornax_store::FindingRow) -> anyhow::Result<Find
     })
 }
 
-/// FORNX-304: computes a live `FusedFinding` for one claim —
+/// Outcome of [`compute_fusion`] — the shared claim-lookup/graph-resolution/
+/// fusion logic behind both `/api/fusion` (FORNX-304) and `/api/decision`
+/// (FORNX-96), factored out so neither endpoint duplicates the other's
+/// graph-loading/projection code (FORNX-96 implementation note).
+enum FusionOutcome {
+    /// No claim with this id is on record for this session.
+    NotFound { reason: &'static str },
+    /// A store/decode error occurred while resolving the claim's evidence.
+    Error { message: String },
+    /// A live `FusedFinding` was computed successfully.
+    Found {
+        graph_source: &'static str,
+        fused: fornax_verify::fusion::FusedFinding,
+    },
+}
+
+/// FORNX-304 (extended by FORNX-96 to be shared with `/api/decision`):
+/// computes a live `FusedFinding` for one claim —
 /// `fusion::BaselineFusionPolicy::fuse` run over FORNX-89's real evidence
 /// graph, following the FORNX-90 `api_evidence_graph` precedent
 /// (compute-on-demand, not persisted; no new `fornax-store` migration).
@@ -555,7 +573,7 @@ fn finding_row_to_finding(row: &fornax_store::FindingRow) -> anyhow::Result<Find
 /// actual production state — nothing on the live claim path writes graph
 /// rows yet, per `fusion.rs`'s own module docs), falls back to
 /// `fusion::project_graph()` over the claim's existing `Finding`(s) for this
-/// session. `graph_source` in the response names which path was used.
+/// session. The returned `graph_source` names which path was used.
 ///
 /// `chrono::Utc::now()` is called exactly once, right here, to produce
 /// `computed_at` — the one place in this feature the wall clock is read;
@@ -563,59 +581,51 @@ fn finding_row_to_finding(row: &fornax_store::FindingRow) -> anyhow::Result<Find
 ///
 /// Scoped by `(claim, session)` together, mirroring `api_evidence_graph`'s
 /// own authorization-boundary scoping.
-async fn api_fusion(
-    State(state): State<AppState>,
-    Query(q): Query<FusionQuery>,
-) -> Json<serde_json::Value> {
-    let claims = match state.store.claims_for_session(&q.session).await {
+async fn compute_fusion(state: &AppState, claim_id: &str, session: &str) -> FusionOutcome {
+    let claims = match state.store.claims_for_session(session).await {
         Ok(claims) => claims,
         Err(e) => {
-            return Json(
-                serde_json::json!({ "claim": q.claim, "session": q.session, "error": e.to_string() }),
-            )
+            return FusionOutcome::Error {
+                message: e.to_string(),
+            }
         }
     };
-    let Some(claim) = claims.into_iter().find(|c| c.id.to_string() == q.claim) else {
-        return Json(serde_json::json!({
-            "claim": q.claim,
-            "session": q.session,
-            "found": false,
-            "reason": "no claim with this id is on record for this session",
-        }));
+    let Some(claim) = claims.into_iter().find(|c| c.id.to_string() == claim_id) else {
+        return FusionOutcome::NotFound {
+            reason: "no claim with this id is on record for this session",
+        };
     };
 
     let real_graph = match state
         .store
-        .evidence_graph_for_claim(&q.claim, &q.session)
+        .evidence_graph_for_claim(claim_id, session)
         .await
     {
         Ok(g) => g,
         Err(e) => {
-            return Json(
-                serde_json::json!({ "claim": q.claim, "session": q.session, "error": e.to_string() }),
-            )
+            return FusionOutcome::Error {
+                message: e.to_string(),
+            }
         }
     };
 
     let (graph, graph_source) = if real_graph.links.is_empty() && real_graph.missing.is_empty() {
-        let finding_rows = match state.store.findings_for_session(&q.session).await {
+        let finding_rows = match state.store.findings_for_session(session).await {
             Ok(rows) => rows,
             Err(e) => {
-                return Json(
-                    serde_json::json!({ "claim": q.claim, "session": q.session, "error": e.to_string() }),
-                )
+                return FusionOutcome::Error {
+                    message: e.to_string(),
+                }
             }
         };
         let mut findings = Vec::new();
-        for row in finding_rows.iter().filter(|r| r.claim_id == q.claim) {
+        for row in finding_rows.iter().filter(|r| r.claim_id == claim_id) {
             match finding_row_to_finding(row) {
                 Ok(f) => findings.push(f),
                 Err(e) => {
-                    return Json(serde_json::json!({
-                        "claim": q.claim,
-                        "session": q.session,
-                        "error": format!("failed to decode finding {}: {e}", row.id),
-                    }))
+                    return FusionOutcome::Error {
+                        message: format!("failed to decode finding {}: {e}", row.id),
+                    }
                 }
             }
         }
@@ -624,12 +634,12 @@ async fn api_fusion(
         (real_graph, "graph")
     };
 
-    let evidence_read = match state.store.evidence_for_session(&q.session).await {
+    let evidence_read = match state.store.evidence_for_session(session).await {
         Ok(outcome) => outcome,
         Err(e) => {
-            return Json(
-                serde_json::json!({ "claim": q.claim, "session": q.session, "error": e.to_string() }),
-            )
+            return FusionOutcome::Error {
+                message: e.to_string(),
+            }
         }
     };
 
@@ -641,13 +651,111 @@ async fn api_fusion(
     let computed_at = chrono::Utc::now().to_rfc3339();
     let fused = BaselineFusionPolicy.fuse(&input, &computed_at);
 
-    Json(serde_json::json!({
-        "claim": q.claim,
-        "session": q.session,
-        "found": true,
-        "graph_source": graph_source,
-        "fused": fused,
-    }))
+    FusionOutcome::Found {
+        graph_source,
+        fused,
+    }
+}
+
+async fn api_fusion(
+    State(state): State<AppState>,
+    Query(q): Query<FusionQuery>,
+) -> Json<serde_json::Value> {
+    match compute_fusion(&state, &q.claim, &q.session).await {
+        FusionOutcome::Error { message } => {
+            Json(serde_json::json!({ "claim": q.claim, "session": q.session, "error": message }))
+        }
+        FusionOutcome::NotFound { reason } => Json(serde_json::json!({
+            "claim": q.claim,
+            "session": q.session,
+            "found": false,
+            "reason": reason,
+        })),
+        FusionOutcome::Found {
+            graph_source,
+            fused,
+        } => Json(serde_json::json!({
+            "claim": q.claim,
+            "session": q.session,
+            "found": true,
+            "graph_source": graph_source,
+            "fused": fused,
+        })),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct DecisionQuery {
+    claim: String,
+    session: String,
+    /// Risk class name (`strict`/`balanced`/`lenient`), defaults to
+    /// `balanced` when omitted (FORNX-96 AC-adjacent contract: a caller who
+    /// doesn't specify a risk class gets the class every hard safety floor
+    /// in `fornax_verify::decision` is written against).
+    #[serde(default)]
+    risk: Option<String>,
+}
+
+fn parse_risk_class(s: Option<&str>) -> Result<fornax_verify::decision::RiskClass, String> {
+    use fornax_verify::decision::RiskClass;
+    match s.unwrap_or("balanced") {
+        "strict" => Ok(RiskClass::Strict),
+        "balanced" => Ok(RiskClass::Balanced),
+        "lenient" => Ok(RiskClass::Lenient),
+        other => Err(format!(
+            "unknown risk class '{other}' -- expected one of strict, balanced, lenient"
+        )),
+    }
+}
+
+/// FORNX-96 (local half): `GET /api/decision?claim=&session=&risk=`.
+/// Reuses `compute_fusion` (the same graph-loading/projection logic
+/// `/api/fusion` uses) rather than duplicating it, then applies
+/// `DefaultRiskPolicy` for the requested `RiskClass`. Always returns the
+/// `Recommendation` alongside the full underlying `FusedFinding` in the
+/// same response — never the recommendation alone — which is what "the
+/// recommendation never replaces the underlying Finding/evidence graph"
+/// means operationally at this layer.
+async fn api_decision(
+    State(state): State<AppState>,
+    Query(q): Query<DecisionQuery>,
+) -> Json<serde_json::Value> {
+    use fornax_verify::decision::{DecisionPolicy, DefaultRiskPolicy};
+
+    let risk = match parse_risk_class(q.risk.as_deref()) {
+        Ok(r) => r,
+        Err(message) => {
+            return Json(
+                serde_json::json!({ "claim": q.claim, "session": q.session, "error": message }),
+            )
+        }
+    };
+
+    match compute_fusion(&state, &q.claim, &q.session).await {
+        FusionOutcome::Error { message } => {
+            Json(serde_json::json!({ "claim": q.claim, "session": q.session, "error": message }))
+        }
+        FusionOutcome::NotFound { reason } => Json(serde_json::json!({
+            "claim": q.claim,
+            "session": q.session,
+            "found": false,
+            "reason": reason,
+        })),
+        FusionOutcome::Found {
+            graph_source,
+            fused,
+        } => {
+            let recommendation = DefaultRiskPolicy.decide(&fused, risk);
+            Json(serde_json::json!({
+                "claim": q.claim,
+                "session": q.session,
+                "found": true,
+                "graph_source": graph_source,
+                "recommendation": recommendation,
+                "fused": fused,
+            }))
+        }
+    }
 }
 
 async fn dashboard(State(state): State<AppState>) -> axum::response::Html<String> {
@@ -1811,5 +1919,198 @@ mod tests {
         .await;
         let v = response.0;
         assert_eq!(v["found"], serde_json::json!(false));
+    }
+
+    // --- FORNX-96: /api/decision (local half) -------------------------------
+
+    /// `/api/decision` always returns both the `Recommendation` and the
+    /// full underlying `FusedFinding` in the same response -- FORNX-96 AC:
+    /// "recommendation never replaces the underlying Finding/evidence
+    /// graph". Uses the same real-graph fixture path as
+    /// `api_fusion_uses_the_real_graph_when_populated`.
+    #[tokio::test]
+    async fn api_decision_returns_recommendation_and_full_fused_finding_together() {
+        let state = test_state().await;
+        let session_id = "fornx-96-decision-real-graph";
+        let event_id = test_event(&state, session_id).await;
+        let claim = test_claim(session_id, event_id);
+        let evidence = test_evidence(session_id, event_id);
+        state
+            .store
+            .insert_claim(&claim)
+            .await
+            .expect("insert claim");
+        state
+            .store
+            .insert_evidence(&evidence)
+            .await
+            .expect("insert evidence");
+        let link = fornax_types::EvidenceLink {
+            id: Uuid::new_v4(),
+            session_id: session_id.to_string(),
+            claim_id: claim.id,
+            evidence_id: evidence.id,
+            relation: fornax_types::EvidenceRelation::Supports,
+            linked_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        state
+            .store
+            .insert_evidence_link(&link)
+            .await
+            .expect("insert evidence link");
+
+        let response = api_decision(
+            State(state),
+            Query(DecisionQuery {
+                claim: claim.id.to_string(),
+                session: session_id.to_string(),
+                risk: None,
+            }),
+        )
+        .await;
+        let v = response.0;
+        assert_eq!(v["found"], serde_json::json!(true));
+        // The recommendation is present -- a single Supports link with no
+        // recorded correlation group is Verified+Qualified (an
+        // IndependenceUnverified caveat fires), so the hard AC safety floor
+        // applies: never Proceed, at most Review.
+        assert_eq!(v["fused"]["uncertainty"], serde_json::json!("qualified"));
+        assert_eq!(v["recommendation"]["action"], serde_json::json!("review"));
+        assert_eq!(
+            v["recommendation"]["risk_class"],
+            serde_json::json!("balanced")
+        );
+        assert_eq!(
+            v["recommendation"]["policy_name"],
+            serde_json::json!("default_risk_policy_v1")
+        );
+        // ...and the full FusedFinding is present alongside it, not instead
+        // of it.
+        assert_eq!(v["fused"]["verdict"], serde_json::json!("verified"));
+        assert_eq!(
+            v["fused"]["counted_link_ids"],
+            serde_json::json!([link.id.to_string()])
+        );
+        // The recommendation points back at the claim, never embeds the
+        // fusion rationale itself.
+        assert_eq!(
+            v["recommendation"]["claim_id"],
+            serde_json::json!(claim.id.to_string())
+        );
+        assert!(v["recommendation"].get("rationale").is_none());
+    }
+
+    /// Omitting `risk` defaults to `balanced` -- confirmed above via
+    /// `risk: None`; this test confirms an explicit `risk=strict` changes
+    /// the action for the same underlying evidence (FORNX-96 AC: "same
+    /// finding can yield different actions under explicit policy/risk
+    /// contexts").
+    #[tokio::test]
+    async fn api_decision_risk_query_param_changes_the_recommended_action() {
+        let state = test_state().await;
+        let session_id = "fornx-96-decision-risk-param";
+        let event_id = test_event(&state, session_id).await;
+        let claim = test_claim(session_id, event_id);
+        let evidence = test_evidence(session_id, event_id);
+        state
+            .store
+            .insert_claim(&claim)
+            .await
+            .expect("insert claim");
+        state
+            .store
+            .insert_evidence(&evidence)
+            .await
+            .expect("insert evidence");
+        // A Contradicts link: Corroborated+Contradicted blocks under
+        // Strict/Balanced but only reviews under Lenient.
+        let link = fornax_types::EvidenceLink {
+            id: Uuid::new_v4(),
+            session_id: session_id.to_string(),
+            claim_id: claim.id,
+            evidence_id: evidence.id,
+            relation: fornax_types::EvidenceRelation::Contradicts,
+            linked_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        state
+            .store
+            .insert_evidence_link(&link)
+            .await
+            .expect("insert evidence link");
+
+        let strict = api_decision(
+            State(state.clone()),
+            Query(DecisionQuery {
+                claim: claim.id.to_string(),
+                session: session_id.to_string(),
+                risk: Some("strict".to_string()),
+            }),
+        )
+        .await
+        .0;
+        let lenient = api_decision(
+            State(state),
+            Query(DecisionQuery {
+                claim: claim.id.to_string(),
+                session: session_id.to_string(),
+                risk: Some("lenient".to_string()),
+            }),
+        )
+        .await
+        .0;
+
+        assert_eq!(
+            strict["fused"]["verdict"],
+            serde_json::json!("contradicted")
+        );
+        assert_eq!(
+            lenient["fused"]["verdict"],
+            serde_json::json!("contradicted")
+        );
+        assert_eq!(
+            strict["recommendation"]["action"],
+            serde_json::json!("block")
+        );
+        assert_eq!(
+            lenient["recommendation"]["action"],
+            serde_json::json!("review")
+        );
+        assert_ne!(
+            strict["recommendation"]["action"],
+            lenient["recommendation"]["action"]
+        );
+    }
+
+    #[tokio::test]
+    async fn api_decision_reports_not_found_for_unknown_claim() {
+        let state = test_state().await;
+        let response = api_decision(
+            State(state),
+            Query(DecisionQuery {
+                claim: Uuid::new_v4().to_string(),
+                session: "fornx-96-decision-unknown-claim".to_string(),
+                risk: None,
+            }),
+        )
+        .await;
+        let v = response.0;
+        assert_eq!(v["found"], serde_json::json!(false));
+        assert!(v.get("recommendation").is_none());
+    }
+
+    #[tokio::test]
+    async fn api_decision_reports_error_for_unknown_risk_class() {
+        let state = test_state().await;
+        let response = api_decision(
+            State(state),
+            Query(DecisionQuery {
+                claim: Uuid::new_v4().to_string(),
+                session: "fornx-96-decision-bad-risk".to_string(),
+                risk: Some("reckless".to_string()),
+            }),
+        )
+        .await;
+        let v = response.0;
+        assert!(v.get("error").is_some());
     }
 }
