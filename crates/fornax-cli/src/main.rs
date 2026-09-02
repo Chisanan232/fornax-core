@@ -217,8 +217,13 @@ struct ReliabilityArgs {
     adapter_version: String,
     #[arg(long)]
     task_class: String,
-    /// Comma-separated tool classes, e.g. `shell,file_edit`.
-    #[arg(long, default_value = "")]
+    /// Comma-separated tool classes, e.g. `shell,file_edit`. Required, like
+    /// every other context dimension (FORNX-103's `ReliabilityContextKey`
+    /// deliberately has no `Default`/partial constructor) -- pass `""`
+    /// explicitly for a genuinely tool-less context rather than omitting the
+    /// flag, so an empty toolset is always a stated fact, never an
+    /// accidental omission silently scoping a different cohort.
+    #[arg(long)]
     toolset: String,
     #[arg(long)]
     repository_class: String,
@@ -230,8 +235,10 @@ struct ReliabilityArgs {
     fusion_version: String,
     /// Compare against this model version for a drift check
     /// (`fornax_verify::reliability::detect_drift`) instead of a plain
-    /// reliability read. Must be supplied together with
-    /// `--compare-adapter-version`.
+    /// reliability read. May be supplied independently of
+    /// `--compare-adapter-version` -- either one alone is a legitimate
+    /// drift query; any dimension left unspecified falls back to the
+    /// baseline's own value.
     #[arg(long)]
     compare_model_version: Option<String>,
     #[arg(long)]

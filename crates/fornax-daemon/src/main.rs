@@ -973,19 +973,42 @@ async fn reliability_response(
         });
     }
 
+    let requested_provider: fornax_types::Provider = match parse_context_tag(
+        "provider",
+        &q.provider,
+    ) {
+        Ok(p) => p,
+        Err(message) => {
+            return serde_json::json!({ "session": q.session, "available": true, "error": message })
+        }
+    };
+
     let caps = match state.store.capabilities_for_session(&q.session).await {
         Ok(caps) => caps,
         Err(e) => {
             return serde_json::json!({ "session": q.session, "available": true, "error": e.to_string() })
         }
     };
-    let Some(capabilities) = caps.into_iter().next() else {
+    // `capabilities_for_session` returns one row per announcing provider
+    // (see its own doc comment: "a session with more than one announcing
+    // provider would be silently under-reported" if read from the
+    // single-slot in-memory cache instead). Selecting `.next()` here would
+    // reintroduce exactly that failure at one remove: a session announced by
+    // both `claude_code` and `codex`, queried with `--provider codex`, would
+    // silently build a context key tagged `codex` but fingerprinted from
+    // `claude_code`'s capabilities -- a wrong cohort in precisely the
+    // dimension AC1/AC3 exist to make trustworthy. Match the row to the
+    // provider the caller actually asked about instead.
+    let Some(capabilities) = caps.into_iter().find(|c| c.provider == requested_provider) else {
         return serde_json::json!({
             "session": q.session,
             "available": true,
             "capabilities_announced": false,
-            "reason": "no capabilities announced yet by any adapter for this session -- \
-                       a reliability context key cannot be built without one",
+            "reason": format!(
+                "no capabilities announced for provider `{}` in this session -- \
+                 a reliability context key cannot be built without one",
+                q.provider
+            ),
         });
     };
 
@@ -2624,11 +2647,19 @@ mod tests {
     }
 
     async fn announce_reliability_caps(state: &AppState, session_id: &str) {
-        use fornax_types::{CapabilitySignal, Provider, SignalAvailability, SignalClass};
+        announce_reliability_caps_for(state, session_id, fornax_types::Provider::ClaudeCode).await;
+    }
+
+    async fn announce_reliability_caps_for(
+        state: &AppState,
+        session_id: &str,
+        provider: fornax_types::Provider,
+    ) {
+        use fornax_types::{CapabilitySignal, SignalAvailability, SignalClass};
 
         let caps = RuntimeCapabilities {
             schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
-            provider: Provider::ClaudeCode,
+            provider,
             signals: vec![CapabilitySignal {
                 class: SignalClass::ToolTrace,
                 state: SignalAvailability::Available,
@@ -2749,5 +2780,51 @@ mod tests {
         assert_eq!(v["available"], serde_json::json!(true));
         assert!(v.get("error").is_some());
         assert!(v.get("signal").is_none());
+    }
+
+    /// A session announced by more than one provider must select the
+    /// capabilities row matching the *requested* provider, never just the
+    /// first row `capabilities_for_session` happens to return (its own doc
+    /// comment: rows are `ORDER BY provider ASC`, so `claude_code` always
+    /// sorts before `codex`). Regression for a real bug caught in review:
+    /// querying `--provider codex` on a session also announced by
+    /// `claude_code` must never silently build a `codex`-tagged context key
+    /// fingerprinted from Claude Code's capabilities.
+    #[tokio::test]
+    async fn reliability_response_selects_capabilities_matching_the_requested_provider() {
+        let state = test_state().await;
+        let session_id = "fornx-105-multi-provider-session";
+        // Announce claude_code first (sorts first alphabetically) then codex.
+        announce_reliability_caps_for(&state, session_id, fornax_types::Provider::ClaudeCode).await;
+        announce_reliability_caps_for(&state, session_id, fornax_types::Provider::Codex).await;
+
+        let mut q = reliability_query(session_id);
+        q.provider = "codex".to_string();
+        let v = reliability_response(&state, &q, aggregation_enabled()).await;
+
+        assert_eq!(v["available"], serde_json::json!(true));
+        assert_eq!(v["capabilities_announced"], serde_json::json!(true));
+        assert_eq!(v["signal"]["context_key"]["provider"], "codex");
+    }
+
+    /// The mirror case: a session announced by a provider the query does
+    /// *not* ask about must read "no capabilities announced for provider
+    /// X", never fall back to whatever the first announced row happens to
+    /// be.
+    #[tokio::test]
+    async fn reliability_response_reports_no_capabilities_for_the_requested_provider_specifically()
+    {
+        let state = test_state().await;
+        let session_id = "fornx-105-wrong-provider-only";
+        announce_reliability_caps_for(&state, session_id, fornax_types::Provider::ClaudeCode).await;
+
+        let mut q = reliability_query(session_id);
+        q.provider = "codex".to_string();
+        let v = reliability_response(&state, &q, aggregation_enabled()).await;
+
+        assert_eq!(v["available"], serde_json::json!(true));
+        assert_eq!(v["capabilities_announced"], serde_json::json!(false));
+        let reason = v["reason"].as_str().unwrap_or("");
+        assert!(reason.contains("codex"), "reason was: {reason}");
     }
 }
