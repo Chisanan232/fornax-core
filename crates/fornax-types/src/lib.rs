@@ -18,6 +18,7 @@ pub mod extension;
 pub mod graph;
 pub mod privacy;
 pub mod redact;
+pub mod reliability_context;
 pub mod sensor;
 pub mod sensor_config;
 
@@ -33,6 +34,12 @@ pub use graph::{
     staleness_of, staleness_of_default, EvidenceConflict, EvidenceGraph, EvidenceLink,
     EvidenceRelation, FreshnessWindow, MissingEvidence, StalenessAssessment,
     DEFAULT_EXIT_CODE_FRESHNESS_SECONDS,
+};
+pub use reliability_context::{
+    aggregate_context, capability_fingerprint, cohort_id_for, evaluate_sample_support,
+    CohortIdentity, DatasetLineageTag, ModelFamily, RawReliabilityContext, RawRepositoryContext,
+    ReliabilityContextKey, RepositoryClass, RetentionClass, SampleSupport, TaskClass, TenantRef,
+    ToolClass, MINIMUM_COHORT_SAMPLE_SUPPORT, RELIABILITY_CONTEXT_SCHEMA_VERSION,
 };
 pub use sensor::{
     collect_with_disable_check, ClockSource, CollectionMethod, EvidenceSensor, EvidenceSource,
