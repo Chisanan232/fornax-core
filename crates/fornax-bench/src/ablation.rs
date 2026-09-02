@@ -212,6 +212,64 @@ mod ablation_tests {
         }
     }
 
+    /// Same shape as [`trajectory_supported_by`], but with two independent
+    /// supporting sensors on one claim -- used to prove ablating one of the
+    /// two reports an honestly zero coverage delta, since the other
+    /// sensor's vote still resolves the claim.
+    fn trajectory_supported_by_two_sensors(
+        id: &str,
+        sensor_a: &str,
+        sensor_b: &str,
+    ) -> LabeledTrajectory {
+        let claim = Claim {
+            id: Uuid::new_v4(),
+            session_id: "s1".into(),
+            source_event_id: Uuid::new_v4(),
+            text: "the command exited successfully".into(),
+            subject: "command_succeeded".into(),
+            claimed_at: "2026-01-01T00:00:00Z".into(),
+        };
+        let ev_a = evidence_with_sensor(sensor_a);
+        let ev_b = evidence_with_sensor(sensor_b);
+        let links = vec![
+            EvidenceLink {
+                id: Uuid::new_v4(),
+                session_id: "s1".into(),
+                claim_id: claim.id,
+                evidence_id: ev_a.id,
+                relation: EvidenceRelation::Supports,
+                linked_at: "2026-01-01T00:00:00Z".into(),
+            },
+            EvidenceLink {
+                id: Uuid::new_v4(),
+                session_id: "s1".into(),
+                claim_id: claim.id,
+                evidence_id: ev_b.id,
+                relation: EvidenceRelation::Supports,
+                linked_at: "2026-01-01T00:00:00Z".into(),
+            },
+        ];
+        LabeledTrajectory {
+            id: id.into(),
+            claim,
+            evidence_graph: EvidenceGraph {
+                links,
+                missing: vec![],
+            },
+            evidence_pool: vec![ev_a, ev_b],
+            adjudicated_expected_outcome: AdjudicatedExpectedOutcome {
+                expected_verdict: Verdict::Verified,
+                critical_failure: false,
+                notes: None,
+            },
+            labeling_provenance: LabelingProvenance::SyntheticMechanismTest {
+                created_by: "test".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                notes: None,
+            },
+        }
+    }
+
     fn dataset_of(trajectories: Vec<LabeledTrajectory>) -> Dataset {
         Dataset {
             dataset_version: "0.0.0-mechanism-test".into(),
@@ -252,6 +310,34 @@ mod ablation_tests {
         assert_eq!(r.trajectories_moved_to_unavailable, 0);
         assert_eq!(r.evidence_coverage_delta, Some(0.0));
         assert_eq!(r.baseline, r.ablated);
+    }
+
+    /// A redundant sensor -- one whose evidence a second, independent
+    /// sensor's vote already makes unnecessary -- must report an honestly
+    /// zero coverage/recall/precision delta when ablated, never the
+    /// maximum-marginal-value signal a "did ablation remove anything" check
+    /// would produce (the bug the advisor caught: see
+    /// `crate::harness::evidence_unavailable_for`'s doc comment).
+    #[test]
+    fn ablating_a_redundant_sensor_reports_zero_coverage_delta_not_maximum() {
+        let dataset = dataset_of(vec![trajectory_supported_by_two_sensors(
+            "traj-1",
+            "sensor_a_v1",
+            "sensor_b_v1",
+        )]);
+        let base_config = HarnessConfig::new(RiskClass::Balanced);
+        let mut sensors = BTreeSet::new();
+        sensors.insert("sensor_a_v1".to_string());
+
+        let results = run_ablation(&dataset, &base_config, &sensors, "2026-01-02T00:00:00Z");
+        let r = &results[0];
+        assert_eq!(
+            r.trajectories_moved_to_unavailable, 0,
+            "sensor_b's independent vote still resolves the claim"
+        );
+        assert_eq!(r.evidence_coverage_delta, Some(0.0));
+        assert_eq!(r.baseline.evaluable_count, 1);
+        assert_eq!(r.ablated.evaluable_count, 1);
     }
 
     /// AC: the ablation mechanism must work correctly and report honestly

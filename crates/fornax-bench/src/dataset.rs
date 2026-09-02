@@ -320,6 +320,27 @@ mod tests {
         assert!(matches!(err, DatasetError::Parse { .. }));
     }
 
+    /// The structural refusal gate this module's docs claim: a trajectory
+    /// record with no `labeling_provenance` at all must be rejected, not
+    /// silently accepted as if provenance were optional. `LabelingProvenance`
+    /// carries no `#[serde(default)]`, so serde itself enforces this --
+    /// asserted here so the claim is a tested behavior, not an
+    /// inspection-only property.
+    #[test]
+    fn trajectory_missing_labeling_provenance_is_rejected() {
+        let json = sample_json().replace(
+            r#",
+                    "labeling_provenance": {
+                        "kind": "synthetic_mechanism_test",
+                        "created_by": "test",
+                        "created_at": "2026-01-01T00:00:00Z"
+                    }"#,
+            "",
+        );
+        let err = Dataset::parse_str(&json).unwrap_err();
+        assert!(matches!(err, DatasetError::Parse { .. }));
+    }
+
     #[test]
     fn load_with_missing_file_is_an_io_error() {
         let path =

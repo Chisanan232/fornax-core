@@ -105,8 +105,8 @@ pub struct PredictionRecord {
     pub critical_failure: bool,
     /// True when the evidence this trajectory needed was not actually
     /// resolvable at fusion time — determined from the *input* state
-    /// (concerning missing-evidence notes, unresolvable links, or evidence
-    /// this run's ablation itself stripped), never from
+    /// (concerning missing-evidence notes, unresolvable links, or this run's
+    /// ablation having stripped the last resolvable evidence), never from
     /// `predicted_verdict == Unavailable`. See [`evidence_unavailable_for`]'s
     /// doc comment for why the naive output-based check is circular and
     /// breaks AC 4 under ablation specifically.
@@ -206,9 +206,19 @@ fn apply_ablation(
 /// `graph.missing` carries a concerning [`SignalAvailability`] — a
 /// trajectory with no `MissingEvidence` note at all falls through to
 /// `Verdict::Unverified` instead, even when this run's ablation just
-/// stripped the only evidence that would have resolved the claim. Folding
-/// that case into "incorrect" is exactly what AC 4 forbids; see
-/// `harness_tests::ablation_that_removes_the_only_evidence_is_unavailable_not_incorrect_even_without_a_missing_note`.
+/// stripped the last resolvable evidence that would have resolved the
+/// claim. Folding that case into "incorrect" is exactly what AC 4 forbids;
+/// see `harness_tests::ablation_that_removes_the_only_evidence_is_unavailable_not_incorrect_even_without_a_missing_note`.
+///
+/// The ablation term is deliberately gated on *nothing resolvable
+/// surviving* (`graph.links.is_empty()` after ablation's filtering), not on
+/// "ablation removed something". A trajectory with two independent
+/// supporting sensors, ablating only one, still has a real surviving vote —
+/// treating that as evidence-unavailable would report a fully redundant
+/// sensor as having maximum marginal value (the trajectory looks like it
+/// "lost its evidence" when it didn't), inverting exactly the signal AC 2
+/// exists to measure. See
+/// `harness_tests::ablating_one_of_two_independent_supporting_sensors_leaves_the_trajectory_evaluable`.
 fn evidence_unavailable_for(
     graph: &EvidenceGraph,
     evidence_pool: &[Evidence],
@@ -222,7 +232,8 @@ fn evidence_unavailable_for(
         .links
         .iter()
         .any(|l| !evidence_pool.iter().any(|e| e.id == l.evidence_id));
-    concerning_missing || unresolvable_link || ablation_removed_evidence
+    let ablation_left_nothing_resolvable = ablation_removed_evidence && graph.links.is_empty();
+    concerning_missing || unresolvable_link || ablation_left_nothing_resolvable
 }
 
 /// Runs every trajectory in `dataset` through the real
@@ -463,6 +474,35 @@ mod harness_tests {
         let p = &predictions[0];
         assert!(!p.ablation_removed_evidence);
         assert!(!p.evidence_unavailable);
+        assert_eq!(p.predicted_verdict, Verdict::Verified);
+    }
+
+    /// The case the advisor caught: ablating one of two independent
+    /// supporting sensors must NOT move the trajectory into the
+    /// evidence-unavailable bucket, because a real supporting vote still
+    /// survives. Gating `evidence_unavailable_for`'s ablation term on "did
+    /// ablation remove anything" instead of "did ablation leave nothing
+    /// resolvable" would report a fully redundant sensor as having maximum
+    /// marginal value -- exactly inverted from what AC 2 asks this harness
+    /// to measure.
+    #[test]
+    fn ablating_one_of_two_independent_supporting_sensors_leaves_the_trajectory_evaluable() {
+        let ev_a = evidence_with_sensor("sensor_a_v1");
+        let ev_b = evidence_with_sensor("sensor_b_v1");
+        let t = trajectory("traj-1", vec![ev_a, ev_b], EvidenceRelation::Supports);
+        let dataset = dataset_of(vec![t]);
+        let config = HarnessConfig::new(RiskClass::Balanced).with_sensor_disabled("sensor_a_v1");
+
+        let predictions = run_harness(&dataset, &config, "2026-01-02T00:00:00Z");
+        let p = &predictions[0];
+        assert!(
+            p.ablation_removed_evidence,
+            "ablation did remove sensor_a's evidence"
+        );
+        assert!(
+            !p.evidence_unavailable,
+            "sensor_b's evidence still resolves the claim -- must stay evaluable"
+        );
         assert_eq!(p.predicted_verdict, Verdict::Verified);
     }
 
