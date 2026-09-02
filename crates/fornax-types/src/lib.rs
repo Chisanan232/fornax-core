@@ -19,6 +19,7 @@ pub mod graph;
 pub mod privacy;
 pub mod redact;
 pub mod sensor;
+pub mod sensor_config;
 
 pub use adapter::{AgentAdapter, NormalizationOutcome};
 pub use capabilities::{
@@ -30,9 +31,10 @@ pub use extension::{
 };
 pub use graph::{EvidenceGraph, EvidenceLink, EvidenceRelation, MissingEvidence};
 pub use sensor::{
-    ClockSource, CollectionMethod, EvidenceSensor, EvidenceSource, Freshness, SensorOutcome,
-    TamperBoundary, TrustClass,
+    collect_with_disable_check, ClockSource, CollectionMethod, EvidenceSensor, EvidenceSource,
+    Freshness, SensorOutcome, TamperBoundary, TrustClass,
 };
+pub use sensor_config::{default_fornax_home, SensorConfigError, SensorDisableConfig};
 
 /// Which coding-agent runtime an event/capability originated from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
