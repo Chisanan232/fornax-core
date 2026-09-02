@@ -696,6 +696,8 @@ dependencies = [
  "anyhow",
  "chrono",
  "fornax-types",
+ "fornax-vcs",
+ "gix",
  "serde",
  "serde_json",
  "tokio",

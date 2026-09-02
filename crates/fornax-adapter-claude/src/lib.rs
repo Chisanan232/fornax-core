@@ -10,6 +10,7 @@ use fornax_types::{
     SensorDisableConfig, SensorOutcome, SignalAvailability, SignalClass, TrustClass, VcsOperation,
     VcsOutcome,
 };
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 /// This adapter implementation's own version — independent of the Claude
@@ -553,8 +554,10 @@ impl ClaudeFileWriteConfirmedSensor {
 
     /// Same precedence as [`ClaudeEditWriteDiffSensor::collect`]'s path
     /// extraction: `tool_response`'s `filePath`/`file_path`, falling back to
-    /// `tool_input.file_path`.
-    fn claimed_path(event: &AgentEvent) -> Option<&str> {
+    /// `tool_input.file_path`. `pub(crate)` so [`ClaudeGitWorkingTreeSensor`]
+    /// (FORNX-302) can reuse the exact same extraction rather than
+    /// duplicating it a third time.
+    pub(crate) fn claimed_path(event: &AgentEvent) -> Option<&str> {
         let resp = event.tool_response.as_ref()?;
         resp.get("filePath")
             .and_then(|v| v.as_str())
@@ -1026,6 +1029,175 @@ impl EvidenceSensor for ClaudeGitOutcomeSensor {
     }
 }
 
+/// FORNX-302 "git-native working-tree cross-check" sensor: cross-checks a
+/// claimed Edit/Write/MultiEdit against the *real git working tree*,
+/// queried in-process via `fornax-vcs` (no subprocess spawn — see that
+/// crate's module docs for why it exists as a standalone crate).
+///
+/// Genuinely new signal, not a restatement of either existing sensor for
+/// the same event class:
+/// - [`ClaudeFileWriteConfirmedSensor`] (FORNX-91) only calls
+///   `std::fs::metadata` — it has no notion of git at all, so it cannot
+///   tell "written and already committed" apart from "written and still
+///   dirty".
+/// - [`ClaudeGitOutcomeSensor`] (FORNX-14) parses Claude Code's own reported
+///   `git commit`/`git push` stdout for a *separate* Bash tool call — it
+///   never queries the actual working tree, and produces no evidence at all
+///   unless the agent happened to run one of those two commands.
+///
+/// This sensor instead asks git itself, independent of both: is the
+/// claimed path currently dirty (uncommitted, unstaged, or untracked)
+/// relative to `HEAD`, and what is `HEAD` right now? `TrustClass::
+/// HostObserved`, matching `ClaudeFileWriteConfirmedSensor`'s reasoning —
+/// measured directly by Fornax's own local tooling, independent of what the
+/// agent claims happened.
+struct ClaudeGitWorkingTreeSensor {
+    adapter_version: &'static str,
+}
+
+impl ClaudeGitWorkingTreeSensor {
+    fn build_evidence(
+        &self,
+        event: &AgentEvent,
+        path: &str,
+        status: &fornax_vcs::WorkingTreeStatus,
+        path_is_dirty: bool,
+    ) -> Evidence {
+        let description = if path_is_dirty {
+            format!("git working tree shows {path} as dirty (uncommitted, unstaged, or untracked)")
+        } else {
+            format!("git working tree shows {path} as clean relative to HEAD")
+        };
+
+        Evidence {
+            id: Uuid::new_v4(),
+            session_id: event.session_id.clone(),
+            source_event_id: event.id,
+            kind: EvidenceKind::ProcessObservation,
+            observed_at: event.observed_at.clone(),
+            payload: serde_json::to_value(fornax_types::ProcessObservationPayload {
+                description,
+                observation: Some(ProcessObservationDetail::WorkingTreeStatusObserved {
+                    claimed_path: path.to_string(),
+                    is_repo: status.is_repo,
+                    head_commit: status.head_commit.clone(),
+                    path_is_dirty,
+                }),
+            })
+            .expect("ProcessObservationPayload always serializes"),
+            provenance: format!(
+                "claude_code:{v}:PostToolUse:{tool}#host_observed:git_working_tree",
+                v = self.adapter_version,
+                tool = event.tool_name.as_deref().unwrap_or("")
+            ),
+            source: Some(EvidenceSource::now(
+                self.name(),
+                self.trust_class(),
+                Some(Provider::ClaudeCode),
+                self.collection_method(),
+                self.collector_version(),
+            )),
+            extension: None,
+        }
+    }
+}
+
+impl EvidenceSensor for ClaudeGitWorkingTreeSensor {
+    fn name(&self) -> &'static str {
+        "claude_git_working_tree_sensor_v1"
+    }
+
+    fn required_capabilities(&self) -> &'static [SignalClass] {
+        // Same reasoning as `ClaudeFileWriteConfirmedSensor`: needed to
+        // learn the claimed path, not to query git — the `fornax_vcs` call
+        // below needs no provider capability at all.
+        &[SignalClass::ToolResultPayload]
+    }
+
+    fn trust_class(&self) -> TrustClass {
+        TrustClass::HostObserved
+    }
+
+    fn collection_method(&self) -> CollectionMethod {
+        CollectionMethod::ProcessObservation
+    }
+
+    fn collector_version(&self) -> Option<String> {
+        Some(self.adapter_version.to_string())
+    }
+
+    fn collect(&self, event: &AgentEvent, _caps: &RuntimeCapabilities) -> SensorOutcome {
+        let is_target_tool = matches!(
+            event.tool_name.as_deref(),
+            Some("Edit") | Some("Write") | Some("MultiEdit")
+        );
+        if event.kind != EventKind::PostToolUse || !is_target_tool {
+            return SensorOutcome::not_collected(
+                SignalAvailability::Unknown,
+                Some("not an Edit/Write/MultiEdit PostToolUse event".to_string()),
+            );
+        }
+
+        if event.tool_response.is_none() {
+            return SensorOutcome::not_collected(
+                SignalAvailability::Unavailable,
+                Some("no tool_response present on this event".to_string()),
+            );
+        }
+
+        let Some(path) = ClaudeFileWriteConfirmedSensor::claimed_path(event) else {
+            return SensorOutcome::not_collected(
+                SignalAvailability::Unavailable,
+                Some("no file path found in tool_response or tool_input".to_string()),
+            );
+        };
+
+        let path_buf = PathBuf::from(path);
+        // Query starts from the claimed path's parent directory (or "." if
+        // the claimed path has none) — `fornax_vcs::working_tree_status`
+        // searches upward for a `.git` on its own, matching real `git
+        // status`'s own behavior run from any subdirectory of a working
+        // tree.
+        let start_dir = path_buf.parent().unwrap_or_else(|| Path::new("."));
+
+        let status = match fornax_vcs::working_tree_status(start_dir) {
+            Ok(status) => status,
+            Err(e) => {
+                return SensorOutcome::not_collected(
+                    SignalAvailability::CollectionFailed,
+                    Some(format!("git working-tree query failed for {path}: {e}")),
+                );
+            }
+        };
+
+        if !status.is_repo {
+            return SensorOutcome::not_collected(
+                SignalAvailability::Unavailable,
+                Some(format!("{path} is not inside a git working tree")),
+            );
+        }
+
+        let path_is_dirty = match status.is_absolute_path_dirty(&path_buf) {
+            Some(dirty) => dirty,
+            None => {
+                return SensorOutcome::not_collected(
+                    SignalAvailability::CollectionFailed,
+                    Some(format!(
+                        "could not resolve {path} against the discovered repo's working directory"
+                    )),
+                );
+            }
+        };
+
+        SensorOutcome::collected(vec![self.build_evidence(
+            event,
+            path,
+            &status,
+            path_is_dirty,
+        )])
+    }
+}
+
 fn translate(
     adapter: &ClaudeAdapter,
     session_hint: &str,
@@ -1145,6 +1317,21 @@ fn translate(
         let host_outcome = collect_with_disable_check(&host_sensor, &event, &caps, &sensor_config);
         out.extend(
             host_outcome
+                .evidence
+                .into_iter()
+                .map(IngestMessage::Evidence),
+        );
+
+        // FORNX-302: git-native working-tree cross-check for the same
+        // claim — see `ClaudeGitWorkingTreeSensor` for why this is genuinely
+        // new signal, not a restatement of the host-filesystem sensor above
+        // or `ClaudeGitOutcomeSensor` below.
+        let vcs_sensor = ClaudeGitWorkingTreeSensor {
+            adapter_version: adapter.adapter_version(),
+        };
+        let vcs_outcome = collect_with_disable_check(&vcs_sensor, &event, &caps, &sensor_config);
+        out.extend(
+            vcs_outcome
                 .evidence
                 .into_iter()
                 .map(IngestMessage::Evidence),
