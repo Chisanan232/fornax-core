@@ -11,8 +11,10 @@
 //! individual modules (added incrementally in subsequent commits) for the
 //! staging, orphan-cleanup, and execution pieces.
 
+pub mod orphan;
 pub mod policy;
 pub mod staging;
 
+pub use orphan::{sweep_orphaned_staging_dirs, DEFAULT_ORPHAN_MAX_AGE};
 pub use policy::{is_permitted, ExperimentPolicyError, GlobalExperimentPolicy};
 pub use staging::{staging_root, StagedWorktree, StagingError, EXPERIMENT_STAGING_DIR};
