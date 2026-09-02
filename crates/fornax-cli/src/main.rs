@@ -88,6 +88,28 @@ enum Commands {
         #[arg(long, default_value = "balanced")]
         risk: String,
     },
+    /// Semantic Judge opinion for one claim (FORNX-94): sends the claim plus
+    /// a bounded, structured evidence-graph excerpt to the configured local
+    /// self-hosted judge (Ollama-compatible endpoint, `[semantic_judge]` in
+    /// `$FORNAX_HOME/config.toml`, disabled by default) and renders the
+    /// resulting model-derived verdict alongside the same full fusion detail
+    /// `fusion`/`decision` render — the judge's opinion never replaces or
+    /// hides the deterministic evidence trail. Reads `GET /api/judge` on the
+    /// daemon.
+    ///
+    /// A disabled/unreachable/timed-out judge is rendered honestly as
+    /// unavailable, never a fabricated pass/fail.
+    Judge {
+        /// Claim id to look up.
+        claim: String,
+        /// Session id the claim belongs to.
+        session: String,
+        /// Explicit opt-in to send unredacted evidence content to the
+        /// judge. Off by default — see FORNX-94's "raw protected evidence"
+        /// AC.
+        #[arg(long, default_value_t = false)]
+        allow_raw_evidence: bool,
+    },
     /// Export one session's events/claims/evidence/capabilities from the
     /// local store into a directory-based spool, as one wire-compatible
     /// envelope JSON file per message (FORNX-60, FORNX-62). Reads
@@ -212,6 +234,23 @@ async fn main() -> anyhow::Result<()> {
             );
             match fetch_json(&url).await {
                 Ok(v) => print!("{}", render_decision(&v)),
+                Err(_) => println!("fornax: daemon unreachable (is `fornax-daemon` running?)"),
+            }
+        }
+        Commands::Judge {
+            claim,
+            session,
+            allow_raw_evidence,
+        } => {
+            let url = format!(
+                "{}/api/judge?claim={}&session={}&allow_raw_evidence={}",
+                base_url(),
+                claim,
+                session,
+                allow_raw_evidence
+            );
+            match fetch_json(&url).await {
+                Ok(v) => print!("{}", render_judge(&v)),
                 Err(_) => println!("fornax: daemon unreachable (is `fornax-daemon` running?)"),
             }
         }
@@ -1168,6 +1207,71 @@ fn render_decision(v: &serde_json::Value) -> String {
                 policy_version,
                 rationale_summary
             ));
+        }
+    }
+    out.push_str(&render_fusion(v));
+    out
+}
+
+/// Icon for a `JudgeOutput::verdict` value -- four distinct icons, never
+/// collapsed, mirroring `verdict_icon`/`recommendation_icon`'s discipline.
+/// `unavailable` gets its own icon distinct from `inconclusive` -- "the
+/// judge tried and couldn't decide" must read differently from "the judge
+/// never weighed in at all" (FORNX-94 module docs).
+fn judge_verdict_icon(verdict: &str) -> &'static str {
+    match verdict {
+        "supported" => "✓",
+        "contradicted" => "✕",
+        "inconclusive" => "?",
+        "unavailable" => "—",
+        _ => "?",
+    }
+}
+
+/// Renders `GET /api/judge`'s response (FORNX-94): the Semantic Judge's
+/// model-derived opinion, clearly labeled as such, followed by the same
+/// full fusion detail `render_fusion`/`render_decision` render -- the
+/// judge's opinion is always shown alongside, never instead of, the
+/// deterministic evidence trail. A disagreement between the judge and
+/// already-known deterministic evidence is surfaced as an explicit banner,
+/// never silently dropped.
+fn render_judge(v: &serde_json::Value) -> String {
+    let mut out = String::new();
+    let found = v.get("found").and_then(|b| b.as_bool()).unwrap_or(false);
+    let has_error = v.get("error").is_some();
+    if found && !has_error {
+        if let Some(judge) = v.get("judge") {
+            let verdict = judge.get("verdict").and_then(|s| s.as_str()).unwrap_or("?");
+            let model = judge.get("model").and_then(|s| s.as_str()).unwrap_or("?");
+            let endpoint = judge
+                .get("endpoint")
+                .and_then(|s| s.as_str())
+                .unwrap_or("?");
+            let rationale = judge
+                .get("rationale")
+                .and_then(|s| s.as_str())
+                .unwrap_or("");
+            let called_at = judge
+                .get("called_at")
+                .and_then(|s| s.as_str())
+                .unwrap_or("?");
+            out.push_str(&format!(
+                "judge (model-derived, NOT independent evidence): {} {}\n  \
+                 model: {}  endpoint: {}  called_at: {}\n  rationale: {}\n",
+                judge_verdict_icon(verdict),
+                verdict.to_uppercase(),
+                model,
+                endpoint,
+                called_at,
+                rationale
+            ));
+            if let Some(true) = judge.get("disagreement").and_then(|d| d.as_bool()) {
+                out.push_str(
+                    "  ⚠ disagreement: the judge's verdict differs from the deterministic \
+                     evidence for this claim -- shown, not resolved\n",
+                );
+            }
+            out.push('\n');
         }
     }
     out.push_str(&render_fusion(v));
@@ -2491,5 +2595,89 @@ trust_level = \"trusted\"\n";
         let rendered = render_decision(&strict_view);
         assert!(rendered.contains("recommendation: ✕ BLOCK"));
         assert!(rendered.contains("risk: strict"));
+    }
+
+    fn judge_fixture() -> serde_json::Value {
+        let mut v = fusion_fixture();
+        v["judge"] = serde_json::json!({
+            "verdict": "supported",
+            "rationale": "the evidence excerpt is consistent with the claim",
+            "model": "llama3.1",
+            "endpoint": "http://localhost:11434/v1",
+            "prompt_version": 1,
+            "called_at": "2026-09-02T00:00:00+00:00",
+            "disagreement": false,
+        });
+        v
+    }
+
+    #[test]
+    fn render_judge_shows_labeled_model_derived_opinion_and_full_fusion_detail_together() {
+        let v = judge_fixture();
+        let rendered = render_judge(&v);
+        assert!(rendered.contains("judge (model-derived, NOT independent evidence): ✓ SUPPORTED"));
+        assert!(rendered.contains("model: llama3.1"));
+        assert!(rendered.contains("endpoint: http://localhost:11434/v1"));
+        // ...together with the SAME full fusion detail `fusion` renders --
+        // never instead of it.
+        assert!(rendered.contains("VERIFIED"));
+        assert!(rendered.contains("uncertainty: qualified"));
+    }
+
+    #[test]
+    fn render_judge_icons_cover_all_four_verdicts_distinctly() {
+        assert_eq!(judge_verdict_icon("supported"), "✓");
+        assert_eq!(judge_verdict_icon("contradicted"), "✕");
+        assert_eq!(judge_verdict_icon("inconclusive"), "?");
+        assert_eq!(judge_verdict_icon("unavailable"), "—");
+    }
+
+    #[test]
+    fn render_judge_surfaces_disagreement_banner_without_hiding_it() {
+        let mut v = judge_fixture();
+        v["judge"]["verdict"] = serde_json::json!("contradicted");
+        v["judge"]["disagreement"] = serde_json::json!(true);
+        let rendered = render_judge(&v);
+        assert!(rendered.contains("⚠ disagreement"));
+        // The underlying deterministic verdict is still shown, unresolved --
+        // never overwritten by the judge's disagreement.
+        assert!(rendered.contains("VERIFIED"));
+    }
+
+    #[test]
+    fn render_judge_shows_unavailable_honestly_never_a_fabricated_verdict() {
+        let mut v = judge_fixture();
+        v["judge"]["verdict"] = serde_json::json!("unavailable");
+        v["judge"]["rationale"] =
+            serde_json::json!("semantic judge disabled via [semantic_judge].enabled = false");
+        v["judge"]["disagreement"] = serde_json::Value::Null;
+        let rendered = render_judge(&v);
+        assert!(rendered.contains("— UNAVAILABLE"));
+        assert!(!rendered.contains("⚠ disagreement"));
+    }
+
+    #[test]
+    fn render_judge_reports_not_found_for_unknown_claim() {
+        let v = serde_json::json!({
+            "claim": "missing",
+            "session": "s1",
+            "found": false,
+            "reason": "no claim with this id is on record for this session",
+        });
+        let rendered = render_judge(&v);
+        assert!(rendered.contains("no such claim on record"));
+        assert!(!rendered.contains("judge ("));
+    }
+
+    #[test]
+    fn render_judge_shows_daemon_error_without_a_judge_block() {
+        let v = serde_json::json!({
+            "claim": "c1",
+            "session": "s1",
+            "error": "judge task panicked",
+        });
+        let rendered = render_judge(&v);
+        assert!(rendered.contains("error:"));
+        assert!(!rendered.contains("judge ("));
     }
 }

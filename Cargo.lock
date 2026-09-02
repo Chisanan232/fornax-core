@@ -834,9 +834,11 @@ version = "0.0.1"
 dependencies = [
  "chrono",
  "fornax-types",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror",
+ "toml_edit",
  "uuid",
 ]
 
