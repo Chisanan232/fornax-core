@@ -7,7 +7,8 @@ use axum::extract::{Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use fornax_types::redact::{redact_json, redact_text};
-use fornax_types::{IngestMessage, RuntimeCapabilities};
+use fornax_types::{Finding, IngestMessage, RuntimeCapabilities};
+use fornax_verify::fusion::{project_graph, BaselineFusionPolicy, FusionInput, FusionPolicy};
 use fornax_verify::{
     CommandExecutedVerifier, CommandSuccessVerifier, FileModifiedVerifier, GitOperationVerifier,
     TestResultVerifier, Verifier,
@@ -161,6 +162,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/findings/recent", get(api_findings_recent))
         .route("/api/capabilities", get(api_capabilities))
         .route("/api/evidence-graph", get(api_evidence_graph))
+        .route("/api/fusion", get(api_fusion))
         .route("/dashboard", get(dashboard))
         .with_state(state);
 
@@ -518,6 +520,134 @@ async fn api_evidence_graph(
             serde_json::json!({ "claim": q.claim, "session": q.session, "error": e.to_string() }),
         ),
     }
+}
+
+#[derive(serde::Deserialize)]
+struct FusionQuery {
+    claim: String,
+    session: String,
+}
+
+/// Converts one `Store::findings_for_session` row into a real `Finding`, for
+/// `fusion::project_graph`'s fallback path (see `api_fusion`). Store rows
+/// serialize `verdict` as a bare snake_case tag and `evidence_ids` as a JSON
+/// array string — the same shapes `Store`'s own (private) `tag`/`from_tag`
+/// helpers produce, decoded here since neither is exported.
+fn finding_row_to_finding(row: &fornax_store::FindingRow) -> anyhow::Result<Finding> {
+    Ok(Finding {
+        id: row.id.parse()?,
+        claim_id: row.claim_id.parse()?,
+        verdict: serde_json::from_value(serde_json::Value::String(row.verdict.clone()))?,
+        evidence_ids: serde_json::from_str(&row.evidence_ids)?,
+        verifier_name: row.verifier_name.clone(),
+        rationale: row.rationale.clone(),
+        computed_at: row.computed_at.clone(),
+    })
+}
+
+/// FORNX-304: computes a live `FusedFinding` for one claim —
+/// `fusion::BaselineFusionPolicy::fuse` run over FORNX-89's real evidence
+/// graph, following the FORNX-90 `api_evidence_graph` precedent
+/// (compute-on-demand, not persisted; no new `fornax-store` migration).
+///
+/// Prefers `Store::evidence_graph_for_claim`'s real, persisted graph; when
+/// it comes back with zero links *and* zero missing-evidence notes (today's
+/// actual production state — nothing on the live claim path writes graph
+/// rows yet, per `fusion.rs`'s own module docs), falls back to
+/// `fusion::project_graph()` over the claim's existing `Finding`(s) for this
+/// session. `graph_source` in the response names which path was used.
+///
+/// `chrono::Utc::now()` is called exactly once, right here, to produce
+/// `computed_at` — the one place in this feature the wall clock is read;
+/// `fusion.rs` itself stays clock-free (FORNX-304 AC).
+///
+/// Scoped by `(claim, session)` together, mirroring `api_evidence_graph`'s
+/// own authorization-boundary scoping.
+async fn api_fusion(
+    State(state): State<AppState>,
+    Query(q): Query<FusionQuery>,
+) -> Json<serde_json::Value> {
+    let claims = match state.store.claims_for_session(&q.session).await {
+        Ok(claims) => claims,
+        Err(e) => {
+            return Json(
+                serde_json::json!({ "claim": q.claim, "session": q.session, "error": e.to_string() }),
+            )
+        }
+    };
+    let Some(claim) = claims.into_iter().find(|c| c.id.to_string() == q.claim) else {
+        return Json(serde_json::json!({
+            "claim": q.claim,
+            "session": q.session,
+            "found": false,
+            "reason": "no claim with this id is on record for this session",
+        }));
+    };
+
+    let real_graph = match state
+        .store
+        .evidence_graph_for_claim(&q.claim, &q.session)
+        .await
+    {
+        Ok(g) => g,
+        Err(e) => {
+            return Json(
+                serde_json::json!({ "claim": q.claim, "session": q.session, "error": e.to_string() }),
+            )
+        }
+    };
+
+    let (graph, graph_source) = if real_graph.links.is_empty() && real_graph.missing.is_empty() {
+        let finding_rows = match state.store.findings_for_session(&q.session).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                return Json(
+                    serde_json::json!({ "claim": q.claim, "session": q.session, "error": e.to_string() }),
+                )
+            }
+        };
+        let mut findings = Vec::new();
+        for row in finding_rows.iter().filter(|r| r.claim_id == q.claim) {
+            match finding_row_to_finding(row) {
+                Ok(f) => findings.push(f),
+                Err(e) => {
+                    return Json(serde_json::json!({
+                        "claim": q.claim,
+                        "session": q.session,
+                        "error": format!("failed to decode finding {}: {e}", row.id),
+                    }))
+                }
+            }
+        }
+        (project_graph(&claim, &findings), "projected")
+    } else {
+        (real_graph, "graph")
+    };
+
+    let evidence_read = match state.store.evidence_for_session(&q.session).await {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            return Json(
+                serde_json::json!({ "claim": q.claim, "session": q.session, "error": e.to_string() }),
+            )
+        }
+    };
+
+    let input = FusionInput {
+        claim: &claim,
+        graph: &graph,
+        evidence: &evidence_read.evidence,
+    };
+    let computed_at = chrono::Utc::now().to_rfc3339();
+    let fused = BaselineFusionPolicy.fuse(&input, &computed_at);
+
+    Json(serde_json::json!({
+        "claim": q.claim,
+        "session": q.session,
+        "found": true,
+        "graph_source": graph_source,
+        "fused": fused,
+    }))
 }
 
 async fn dashboard(State(state): State<AppState>) -> axum::response::Html<String> {
@@ -1502,5 +1632,184 @@ mod tests {
             "the real provider's capability must not be silently downgraded by a \
              cross-provider announcement for the same session id"
         );
+    }
+
+    // --- FORNX-304: /api/fusion --------------------------------------------
+
+    /// Inserts a real `AgentEvent` and returns its id — `claims.source_event_id`
+    /// and `evidence.source_event_id` are both foreign keys into
+    /// `agent_events` (0006_evidence_graph.sql), so fixtures for either must
+    /// reference a row already stored via this, not a bare `Uuid::new_v4()`.
+    async fn test_event(state: &AppState, session_id: &str) -> Uuid {
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: session_id.to_string(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".to_string(),
+            tool_name: Some("Bash".to_string()),
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        state
+            .store
+            .insert_event(&event)
+            .await
+            .expect("insert event");
+        event.id
+    }
+
+    fn test_claim(session_id: &str, source_event_id: Uuid) -> Claim {
+        Claim {
+            id: Uuid::new_v4(),
+            session_id: session_id.to_string(),
+            source_event_id,
+            text: "the command exited successfully".to_string(),
+            subject: "command_succeeded".to_string(),
+            claimed_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    fn test_evidence(session_id: &str, source_event_id: Uuid) -> fornax_types::Evidence {
+        fornax_types::Evidence {
+            id: Uuid::new_v4(),
+            session_id: session_id.to_string(),
+            source_event_id,
+            kind: fornax_types::EvidenceKind::ExitCode,
+            observed_at: "2026-01-01T00:00:00Z".to_string(),
+            payload: serde_json::json!({}),
+            provenance: "test".to_string(),
+            source: None,
+            extension: None,
+        }
+    }
+
+    /// A claim with a real, persisted `claim_evidence_links` row must compute
+    /// fusion straight from `Store::evidence_graph_for_claim` — the
+    /// `project_graph` fallback must never fire when the real graph is
+    /// already populated (FORNX-304 AC).
+    #[tokio::test]
+    async fn api_fusion_uses_the_real_graph_when_populated() {
+        let state = test_state().await;
+        let session_id = "fornx-304-real-graph";
+        let event_id = test_event(&state, session_id).await;
+        let claim = test_claim(session_id, event_id);
+        let evidence = test_evidence(session_id, event_id);
+        state
+            .store
+            .insert_claim(&claim)
+            .await
+            .expect("insert claim");
+        state
+            .store
+            .insert_evidence(&evidence)
+            .await
+            .expect("insert evidence");
+        let link = fornax_types::EvidenceLink {
+            id: Uuid::new_v4(),
+            session_id: session_id.to_string(),
+            claim_id: claim.id,
+            evidence_id: evidence.id,
+            relation: fornax_types::EvidenceRelation::Supports,
+            linked_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        state
+            .store
+            .insert_evidence_link(&link)
+            .await
+            .expect("insert evidence link");
+
+        let response = api_fusion(
+            State(state),
+            Query(FusionQuery {
+                claim: claim.id.to_string(),
+                session: session_id.to_string(),
+            }),
+        )
+        .await;
+        let v = response.0;
+        assert_eq!(v["found"], serde_json::json!(true));
+        assert_eq!(v["graph_source"], serde_json::json!("graph"));
+        let fused = &v["fused"];
+        assert_eq!(fused["verdict"], serde_json::json!("verified"));
+        assert_eq!(
+            fused["counted_link_ids"],
+            serde_json::json!([link.id.to_string()])
+        );
+    }
+
+    /// A claim with a real `Finding` but nothing in the evidence-graph
+    /// tables must fall back to `fusion::project_graph` over that finding
+    /// (FORNX-304 AC: the projection fallback is today's actual production
+    /// state, per `fusion.rs`'s own module docs).
+    #[tokio::test]
+    async fn api_fusion_projects_from_findings_when_the_real_graph_is_empty() {
+        let state = test_state().await;
+        let session_id = "fornx-304-projection-fallback";
+        let event_id = test_event(&state, session_id).await;
+        let claim = test_claim(session_id, event_id);
+        let evidence = test_evidence(session_id, event_id);
+        state
+            .store
+            .insert_claim(&claim)
+            .await
+            .expect("insert claim");
+        state
+            .store
+            .insert_evidence(&evidence)
+            .await
+            .expect("insert evidence");
+        let finding = Finding {
+            id: Uuid::new_v4(),
+            claim_id: claim.id,
+            verdict: fornax_types::Verdict::Verified,
+            evidence_ids: vec![evidence.id],
+            verifier_name: "command_success_verifier_v1".to_string(),
+            rationale: "exit code 0 observed".to_string(),
+            computed_at: "2026-01-01T00:00:01Z".to_string(),
+        };
+        state
+            .store
+            .insert_finding(&finding)
+            .await
+            .expect("insert finding");
+
+        // No claim_evidence_links / claim_missing_evidence rows exist for
+        // this claim -- the real graph is empty, so this must fall back.
+        let real_graph = state
+            .store
+            .evidence_graph_for_claim(&claim.id.to_string(), session_id)
+            .await
+            .expect("read real graph");
+        assert!(real_graph.links.is_empty() && real_graph.missing.is_empty());
+
+        let response = api_fusion(
+            State(state),
+            Query(FusionQuery {
+                claim: claim.id.to_string(),
+                session: session_id.to_string(),
+            }),
+        )
+        .await;
+        let v = response.0;
+        assert_eq!(v["found"], serde_json::json!(true));
+        assert_eq!(v["graph_source"], serde_json::json!("projected"));
+        assert_eq!(v["fused"]["verdict"], serde_json::json!("verified"));
+    }
+
+    #[tokio::test]
+    async fn api_fusion_reports_not_found_for_unknown_claim() {
+        let state = test_state().await;
+        let response = api_fusion(
+            State(state),
+            Query(FusionQuery {
+                claim: Uuid::new_v4().to_string(),
+                session: "fornx-304-unknown-claim".to_string(),
+            }),
+        )
+        .await;
+        let v = response.0;
+        assert_eq!(v["found"], serde_json::json!(false));
     }
 }
