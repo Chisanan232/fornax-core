@@ -1,0 +1,24 @@
+[package]
+name = "fornax-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "fornax_bench"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fornax-bench"
+path = "src/main.rs"
+
+[dependencies]
+fornax-types = { path = "../fornax-types" }
+fornax-verify = { path = "../fornax-verify" }
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
