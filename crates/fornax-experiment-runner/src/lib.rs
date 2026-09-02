@@ -9,4 +9,8 @@
 //! actually runs it, inside an ephemeral, isolated boundary the primary
 //! working tree can never see, and produces the outcome. See this crate's
 //! individual modules (added incrementally in subsequent commits) for the
-//! staging, policy, orphan-cleanup, and execution pieces.
+//! staging, orphan-cleanup, and execution pieces.
+
+pub mod policy;
+
+pub use policy::{is_permitted, ExperimentPolicyError, GlobalExperimentPolicy};
