@@ -747,6 +747,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "fornax-bench"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "fornax-types",
+ "fornax-verify",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "fornax-ci"
 version = "0.0.1"
 dependencies = [
