@@ -1880,6 +1880,8 @@ trust_level = \"trusted\"\n";
                         &fornax_types::TrustClass::AgentAdjacent,
                         &fornax_types::CollectionMethod::FilePoll,
                     ),
+                    correlation_group: None,
+                    derived_from: Vec::new(),
                 }),
                 extension: None,
             };

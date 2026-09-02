@@ -838,6 +838,8 @@ mod tests {
                     &fornax_types::TrustClass::HostObserved,
                     &fornax_types::CollectionMethod::ProcessObservation,
                 ),
+                correlation_group: None,
+                derived_from: Vec::new(),
             }),
             extension: None,
         };
