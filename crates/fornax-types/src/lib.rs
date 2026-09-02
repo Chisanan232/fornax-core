@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 pub mod adapter;
 pub mod capabilities;
+pub mod causal;
 pub mod experiment;
 pub mod extension;
 pub mod graph;
@@ -27,6 +28,10 @@ pub use adapter::{AgentAdapter, NormalizationOutcome};
 pub use capabilities::{
     CapabilityProbe, CapabilitySignal, LegacyCapabilitiesWire, RuntimeCapabilities,
     SignalAvailability, SignalClass, CAPABILITY_SCHEMA_VERSION,
+};
+pub use causal::{
+    causal_evidence_from_experiment_result, CausalEvidenceLink, CausalExperimentEvidence,
+    EvidenceProvenanceClass, InterventionalProvenance,
 };
 pub use experiment::{
     Baseline, CompletedExperiment, ExpectedObservation, ExperimentKind, ExperimentOutcome,
