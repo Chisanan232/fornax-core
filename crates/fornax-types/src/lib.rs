@@ -15,6 +15,7 @@ use uuid::Uuid;
 pub mod adapter;
 pub mod capabilities;
 pub mod extension;
+pub mod graph;
 pub mod privacy;
 pub mod redact;
 pub mod sensor;
@@ -27,6 +28,7 @@ pub use capabilities::{
 pub use extension::{
     ContentClass, ExtensionEnvelope, EXTENSION_SCHEMA_VERSION, SUPPORTED_EXTENSION_SCHEMA_VERSIONS,
 };
+pub use graph::{EvidenceGraph, EvidenceLink, EvidenceRelation, MissingEvidence};
 pub use sensor::{
     ClockSource, CollectionMethod, EvidenceSensor, EvidenceSource, Freshness, SensorOutcome,
     TamperBoundary, TrustClass,
