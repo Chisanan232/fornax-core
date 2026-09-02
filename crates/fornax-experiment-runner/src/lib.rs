@@ -12,5 +12,7 @@
 //! staging, orphan-cleanup, and execution pieces.
 
 pub mod policy;
+pub mod staging;
 
 pub use policy::{is_permitted, ExperimentPolicyError, GlobalExperimentPolicy};
+pub use staging::{staging_root, StagedWorktree, StagingError, EXPERIMENT_STAGING_DIR};
