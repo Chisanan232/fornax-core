@@ -268,6 +268,24 @@ pub enum ProcessObservationDetail {
     /// see `fornax-adapter-opencode`'s `OpenCodeCommandDurationSensor`, the
     /// one producer that exists today, for the exact fields it reads).
     CommandDuration { duration_ms: i64 },
+    /// FORNX-302: whether the *real git working tree* (queried in-process
+    /// via `fornax-vcs`, independent of anything a provider claimed)
+    /// considers `claimed_path` dirty (uncommitted/unstaged/untracked),
+    /// cross-checking a claimed Edit/Write/MultiEdit or `git commit`/`git
+    /// push` against actual working-tree/HEAD state. Distinct from
+    /// [`Self::FileWriteObserved`] (plain `std::fs::metadata`, no git
+    /// awareness) and from [`Self::VcsOperation`] (parses a provider's own
+    /// reported `git` stdout/stderr, `TrustClass::AgentAdjacent`) — this
+    /// variant is produced by a `TrustClass::HostObserved` sensor that
+    /// queries git itself. Produced today only by
+    /// `fornax-adapter-claude`'s `ClaudeGitWorkingTreeSensor`.
+    WorkingTreeStatusObserved {
+        claimed_path: String,
+        is_repo: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        head_commit: Option<String>,
+        path_is_dirty: bool,
+    },
 }
 
 /// Which git operation a [`ProcessObservationDetail::VcsOperation`] observed.
