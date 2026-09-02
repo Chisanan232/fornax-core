@@ -9,6 +9,8 @@ use fornax_types::{
 };
 use uuid::Uuid;
 
+pub mod fusion;
+
 pub trait Verifier {
     /// Verifier's stable name, recorded on every `Finding` it produces.
     fn name(&self) -> &'static str;
