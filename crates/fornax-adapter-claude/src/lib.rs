@@ -4,10 +4,11 @@
 //! JSON into canonical `fornax_types::IngestMessage`s.
 
 use fornax_types::{
-    AgentAdapter, AgentEvent, CapabilityProbe, Claim, CollectionMethod, EventKind, Evidence,
-    EvidenceKind, EvidenceSensor, EvidenceSource, IngestMessage, NormalizationOutcome,
-    ProcessObservationDetail, Provider, RuntimeCapabilities, SensorOutcome, SignalAvailability,
-    SignalClass, TrustClass, VcsOperation, VcsOutcome,
+    collect_with_disable_check, AgentAdapter, AgentEvent, CapabilityProbe, Claim, CollectionMethod,
+    EventKind, Evidence, EvidenceKind, EvidenceSensor, EvidenceSource, IngestMessage,
+    NormalizationOutcome, ProcessObservationDetail, Provider, RuntimeCapabilities,
+    SensorDisableConfig, SensorOutcome, SignalAvailability, SignalClass, TrustClass, VcsOperation,
+    VcsOutcome,
 };
 use uuid::Uuid;
 
@@ -1095,6 +1096,11 @@ fn translate(
     // the daemon never learns this session can expose exit-code evidence,
     // and every claim resolves Unavailable regardless of Evidence present.
     let caps = stamped_capabilities(adapter, &session_id);
+    // FORNX-302: loaded once per event, not once per sensor — every sensor
+    // call below routes through `collect_with_disable_check` so a sensor
+    // named in `$FORNAX_HOME/config.toml`'s `[sensors].disabled` reports
+    // `SignalAvailability::Disabled` instead of running.
+    let sensor_config = SensorDisableConfig::load_default();
     let mut out = vec![
         IngestMessage::Capabilities(caps.clone()),
         IngestMessage::Event(event.clone()),
@@ -1110,7 +1116,7 @@ fn translate(
         let sensor = ClaudeBashExitCodeSensor {
             adapter_version: adapter.adapter_version(),
         };
-        let outcome = sensor.collect(&event, &caps);
+        let outcome = collect_with_disable_check(&sensor, &event, &caps, &sensor_config);
         out.extend(outcome.evidence.into_iter().map(IngestMessage::Evidence));
     }
 
@@ -1126,7 +1132,7 @@ fn translate(
         let sensor = ClaudeEditWriteDiffSensor {
             adapter_version: adapter.adapter_version(),
         };
-        let outcome = sensor.collect(&event, &caps);
+        let outcome = collect_with_disable_check(&sensor, &event, &caps, &sensor_config);
         out.extend(outcome.evidence.into_iter().map(IngestMessage::Evidence));
 
         // FORNX-91: independent host-filesystem corroboration/contradiction
@@ -1136,7 +1142,7 @@ fn translate(
         // `tool_input`.
         let host_sensor =
             ClaudeFileWriteConfirmedSensor::with_default_tolerance(adapter.adapter_version());
-        let host_outcome = host_sensor.collect(&event, &caps);
+        let host_outcome = collect_with_disable_check(&host_sensor, &event, &caps, &sensor_config);
         out.extend(
             host_outcome
                 .evidence
@@ -1154,7 +1160,7 @@ fn translate(
         let sensor = ClaudeGitOutcomeSensor {
             adapter_version: adapter.adapter_version(),
         };
-        let outcome = sensor.collect(&event, &caps);
+        let outcome = collect_with_disable_check(&sensor, &event, &caps, &sensor_config);
         out.extend(outcome.evidence.into_iter().map(IngestMessage::Evidence));
     }
 
