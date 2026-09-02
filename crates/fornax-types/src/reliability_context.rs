@@ -50,7 +50,7 @@
 //! | Adapter version | `String` | Medium — one per adapter release | Same as model version. | Same mitigation. |
 //! | Task/claim class | [`TaskClass`] | Low, closed set | None. | Closed enum + escape hatch. |
 //! | Toolset | `Vec<`[`ToolClass`]`>` | Medium — combinatorial in principle, but drawn from a small closed vocabulary | Low; sorted+deduped so two callers reporting the same tools in different orders produce the same key. | Closed enum, canonical sort order. |
-//! | Repository/environment class | [`RepositoryClass`] | Low (coarse buckets only) | **High if this were a literal repo path/name** — a repo identifier can itself identify a customer or a private codebase. | The raw identifier is never a field on the output key at all — [`RawRepositoryContext`] (the aggregation *input*) carries it, [`aggregate_context`] drops it on the floor and keeps only the caller-classified coarse [`RepositoryClass`] tag. This is a structural guarantee, not a redaction pass: `redact_text` alone would **not** catch an ordinary-looking repo path (it is not high-entropy and is not an env-assignment shape), which is exactly why generalization, not text-scrubbing, is the primary guard here. |
+//! | Repository/environment class | [`RepositoryClass`] | Low (coarse buckets only) | **High if this were a literal repo path/name** — a repo identifier can itself identify a customer or a private codebase. | The raw identifier is never a field on the output key at all — [`RawRepositoryContext`] (the aggregation *input*) carries it and does not even derive `Serialize`/`Deserialize` (cannot be persisted or transmitted through this type), and [`aggregate_context`] drops it on the floor, keeping only the caller-classified coarse [`RepositoryClass`] tag. This is a structural guarantee, not a redaction pass: `redact_text` alone would **not** catch an ordinary-looking repo path (it is not high-entropy and is not an env-assignment shape), which is exactly why generalization, not text-scrubbing, is the primary guard here. |
 //! | Policy/verifier/fusion version | `String` (×3) | Medium — one per release | Same as model version. | Same mitigation (`redact_text` + length cap). |
 //! | Capability state | fingerprint derived from [`crate::RuntimeCapabilities`] | Medium — grows with `SignalClass` variants | Low; `RuntimeCapabilities::notes` (a free-text `HashMap`) is deliberately **excluded** from the fingerprint — it can carry session ids or other operator-written text unrelated to what capabilities were actually available. | [`capability_fingerprint`] extracts only `(class, state)` pairs plus `schema_version`, sorted and deduped; `notes` is never read. |
 //!
@@ -119,6 +119,29 @@ pub const MINIMUM_COHORT_SAMPLE_SUPPORT: u32 = 30;
 fn sanitize_version_string(raw: &str) -> String {
     let redacted = redact_text(raw);
     redacted.chars().take(MAX_VERSION_STRING_LEN).collect()
+}
+
+/// Normalize a value of one of this module's `Unrecognized(String)`-tailed
+/// enums (or a collection of them) to its canonical Rust representation by
+/// round-tripping through its wire form.
+///
+/// Every enum in this module follows `capabilities.rs`'s
+/// `SignalAvailability`/`TrustClass` pattern: `Unrecognized("public_oss")` and
+/// `PublicOss` are *not* equal under `PartialEq` (different Rust values) but
+/// serialize to the *same* JSON string (`"public_oss"`) — the exact asymmetry
+/// `SignalAvailability::from_tag`'s doc comment warns about. Left
+/// unnormalized, that asymmetry would let two `ReliabilityContextKey` values
+/// that are `!=` under `PartialEq` collapse to the same `cohort_id` (which
+/// hashes the *wire* bytes), silently misgrouping cohorts. `aggregate_context`
+/// is the single chokepoint that produces a `ReliabilityContextKey`, so this
+/// is called there for every dimension a caller could plausibly construct as
+/// `Unrecognized` — reparsing a value already in canonical form is a no-op.
+fn normalize_enum<T>(value: T) -> T
+where
+    T: Serialize + for<'de> Deserialize<'de>,
+{
+    let wire = serde_json::to_value(&value).expect("module enums always serialize");
+    serde_json::from_value(wire).expect("re-parsing a value's own wire form always succeeds")
 }
 
 /// Which underlying model family produced a session's output. Deliberately
@@ -204,10 +227,12 @@ pub enum RepositoryClass {
 /// caller's own side; [`aggregate_context`] never reads it into the output
 /// key — it is dropped, not redacted, because a repo path does not reliably
 /// trip `redact_text`'s secret-shape detectors (see this module's AC-2
-/// table).
+/// table). Neither this type nor [`RawReliabilityContext`] derives
+/// `Serialize`/`Deserialize` — the raw identifier cannot be persisted or sent
+/// over the wire through this type at all, a stronger guarantee than
+/// "dropped during aggregation."
 #[derive(Debug, Clone)]
 pub struct RawRepositoryContext {
-    #[allow(dead_code)]
     pub identifying_hint: Option<String>,
     /// The caller-supplied coarse classification. Aggregation trusts this
     /// value verbatim — classifying a repo as public vs. private is a policy
@@ -306,19 +331,23 @@ pub fn capability_fingerprint(caps: &RuntimeCapabilities) -> Vec<(String, String
 ///   through [`redact_text`] and truncated to [`MAX_VERSION_STRING_LEN`],
 ///   catching a secret accidentally pasted into a version field.
 pub fn aggregate_context(raw: RawReliabilityContext) -> ReliabilityContextKey {
-    let mut toolset = raw.toolset;
+    // Normalize each tool class to its canonical wire-equivalent form before
+    // sorting/deduping — otherwise a caller-supplied `Unrecognized("shell")`
+    // would sort/dedupe against `ToolClass::Shell` by Rust `PartialEq`
+    // (unequal) rather than by wire identity (equal), leaving both in the set.
+    let mut toolset: Vec<ToolClass> = raw.toolset.into_iter().map(normalize_enum).collect();
     toolset.sort();
     toolset.dedup();
 
     ReliabilityContextKey {
         schema_version: RELIABILITY_CONTEXT_SCHEMA_VERSION,
         provider: raw.provider,
-        model_family: raw.model_family,
+        model_family: normalize_enum(raw.model_family),
         model_version: sanitize_version_string(&raw.model_version),
         adapter_version: sanitize_version_string(&raw.adapter_version),
-        task_class: raw.task_class,
+        task_class: normalize_enum(raw.task_class),
         toolset,
-        repository_class: raw.repository.class,
+        repository_class: normalize_enum(raw.repository.class),
         policy_version: sanitize_version_string(&raw.policy_version),
         verifier_version: sanitize_version_string(&raw.verifier_version),
         fusion_version: sanitize_version_string(&raw.fusion_version),
@@ -394,9 +423,10 @@ pub enum SampleSupport {
 }
 
 /// Gate a raw sample count into a [`SampleSupport`] verdict against
-/// [`MINIMUM_COHORT_SAMPLE_SUPPORT`]. The only way to learn whether a cohort
-/// is confident — there is no path that reads `sample_count` directly and
-/// treats it as a usable statistic below the threshold.
+/// [`MINIMUM_COHORT_SAMPLE_SUPPORT`]. The gate never *produces* a numeric
+/// estimate below the threshold — `InsufficientSupport`'s `sample_count`
+/// field stays visible (deliberately, e.g. to display "3 of 30 observed")
+/// but is never packaged as, or substituted for, a reliability statistic.
 pub fn evaluate_sample_support(sample_count: u32) -> SampleSupport {
     if sample_count >= MINIMUM_COHORT_SAMPLE_SUPPORT {
         SampleSupport::Confident { sample_count }
@@ -678,6 +708,61 @@ mod tests {
             class: RepositoryClass::PrivateMonorepo,
         })));
         assert_ne!(a.cohort_id, b.cohort_id);
+    }
+
+    /// Pins `cohort_id_for`'s output for a fully-specified key. `cohort_id`
+    /// hashes the key's canonical JSON serialization, which depends on
+    /// `ReliabilityContextKey`'s *field declaration order* — a future no-op
+    /// field reorder would silently repartition every historical cohort with
+    /// no other test catching it (AC 5: historical attribution must not
+    /// silently drift). If this test ever needs updating, that is itself the
+    /// signal to double check nothing downstream assumed cohort ids were
+    /// stable across the change.
+    #[test]
+    fn cohort_id_is_pinned_for_a_known_context_key() {
+        let key = aggregate_context(sample_raw(RawRepositoryContext {
+            identifying_hint: None,
+            class: RepositoryClass::PublicOss,
+        }));
+        assert_eq!(
+            cohort_id_for(&key).to_string(),
+            "25032472-861c-5e2f-9ad8-9704b1269722"
+        );
+    }
+
+    /// `Unrecognized("public_oss")` and `RepositoryClass::PublicOss` are
+    /// unequal Rust values (matching `SignalAvailability`'s documented
+    /// asymmetry) but must serialize identically — and `aggregate_context`
+    /// must normalize the former to the latter, so two keys that mean the
+    /// same thing on the wire always compare equal and hash to the same
+    /// cohort id.
+    #[test]
+    fn aggregation_normalizes_an_unrecognized_tag_matching_a_known_variant() {
+        let canonical = RepositoryClass::PublicOss;
+        let unrecognized = RepositoryClass::Unrecognized("public_oss".to_string());
+        assert_ne!(
+            canonical, unrecognized,
+            "sanity: these are distinct Rust values"
+        );
+        assert_eq!(
+            serde_json::to_value(&canonical).unwrap(),
+            serde_json::to_value(&unrecognized).unwrap(),
+            "sanity: but identical on the wire"
+        );
+
+        let key_a = aggregate_context(sample_raw(RawRepositoryContext {
+            identifying_hint: None,
+            class: canonical,
+        }));
+        let key_b = aggregate_context(sample_raw(RawRepositoryContext {
+            identifying_hint: None,
+            class: unrecognized,
+        }));
+        assert_eq!(
+            key_a, key_b,
+            "aggregate_context must normalize Unrecognized(\"public_oss\") to PublicOss"
+        );
+        assert_eq!(cohort_id_for(&key_a), cohort_id_for(&key_b));
     }
 
     #[test]
