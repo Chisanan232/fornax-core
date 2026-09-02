@@ -30,10 +30,11 @@
 //! canonical signal class mapped to it yet, not a parse failure.
 
 use fornax_types::{
-    AgentAdapter, AgentEvent, CapabilityProbe, CollectionMethod, ContentClass, EventKind, Evidence,
-    EvidenceKind, EvidenceSensor, EvidenceSource, ExtensionEnvelope, IngestMessage,
-    NormalizationOutcome, ProcessObservationDetail, ProcessObservationPayload, Provider,
-    RuntimeCapabilities, SensorOutcome, SignalAvailability, TrustClass,
+    collect_with_disable_check, AgentAdapter, AgentEvent, CapabilityProbe, CollectionMethod,
+    ContentClass, EventKind, Evidence, EvidenceKind, EvidenceSensor, EvidenceSource,
+    ExtensionEnvelope, IngestMessage, NormalizationOutcome, ProcessObservationDetail,
+    ProcessObservationPayload, Provider, RuntimeCapabilities, SensorDisableConfig, SensorOutcome,
+    SignalAvailability, TrustClass,
 };
 use uuid::Uuid;
 
@@ -551,6 +552,11 @@ fn translate(
                 raw: native.clone(),
             };
             let caps = stamped_capabilities(adapter, &session_id);
+            // FORNX-302: loaded once per event; every sensor call below
+            // routes through `collect_with_disable_check` so a sensor named
+            // in `$FORNAX_HOME/config.toml`'s `[sensors].disabled` reports
+            // `SignalAvailability::Disabled` instead of running.
+            let sensor_config = SensorDisableConfig::load_default();
             let mut out = vec![
                 IngestMessage::Capabilities(caps.clone()),
                 IngestMessage::Event(event.clone()),
@@ -558,7 +564,7 @@ fn translate(
             let sensor = OpenCodeExitCodeSensor {
                 adapter_version: adapter.adapter_version(),
             };
-            let outcome = sensor.collect(&event, &caps);
+            let outcome = collect_with_disable_check(&sensor, &event, &caps, &sensor_config);
             out.extend(outcome.evidence.into_iter().map(IngestMessage::Evidence));
 
             // FORNX-91: promote time.start/time.end (already reaching this
@@ -567,7 +573,8 @@ fn translate(
             let duration_sensor = OpenCodeCommandDurationSensor {
                 adapter_version: adapter.adapter_version(),
             };
-            let duration_outcome = duration_sensor.collect(&event, &caps);
+            let duration_outcome =
+                collect_with_disable_check(&duration_sensor, &event, &caps, &sensor_config);
             out.extend(
                 duration_outcome
                     .evidence
