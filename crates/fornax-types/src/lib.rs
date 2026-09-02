@@ -215,10 +215,16 @@ pub struct ProcessObservationPayload {
     pub observation: Option<ProcessObservationDetail>,
 }
 
-/// Structured detail for a [`ProcessObservationPayload`] (FORNX-14). Only
-/// `VcsOperation` exists today — an `HttpProbe` variant is planned for a
-/// follow-up PR (FORNX-14's HTTP-health work) but deliberately not added
-/// here.
+/// Structured detail for a [`ProcessObservationPayload`] (FORNX-14). An
+/// `HttpProbe` variant is planned for a follow-up PR (FORNX-14's HTTP-health
+/// work) but deliberately not added here.
+///
+/// `FileWriteObserved` and `CommandDuration` (FORNX-91) are the second and
+/// third real producers, following the same "widen this enum, no new
+/// `EvidenceKind` variant, no new `fornax-store` column" precedent
+/// `VcsOperation` established — see this enum's home module doc
+/// ([`EvidenceKind`]'s "closed on purpose" note) for why a new evidence
+/// shape lands here rather than as a new top-level kind.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "observation_kind",
@@ -236,6 +242,26 @@ pub enum ProcessObservationDetail {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         remote: Option<String>,
     },
+    /// FORNX-91: whether the *actual host filesystem* (independent of
+    /// anything a provider claimed) shows `claimed_path` existing, and
+    /// whether its modification time is consistent with the claim. Produced
+    /// by a `TrustClass::HostObserved` sensor that calls `std::fs::metadata`
+    /// itself, never by parsing a provider's own tool-result text — see
+    /// `fornax-adapter-claude`'s `ClaudeFileWriteConfirmedSensor` for the one
+    /// producer that exists today.
+    FileWriteObserved {
+        claimed_path: String,
+        exists: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        modified_at: Option<String>,
+        consistent_with_claim: bool,
+    },
+    /// FORNX-91: a command's actual wall-clock duration, computed from
+    /// provider-reported start/end timestamps already present on a tool
+    /// result payload (not a new OS-level process-monitoring mechanism —
+    /// see `fornax-adapter-opencode`'s `OpenCodeCommandDurationSensor`, the
+    /// one producer that exists today, for the exact fields it reads).
+    CommandDuration { duration_ms: i64 },
 }
 
 /// Which git operation a [`ProcessObservationDetail::VcsOperation`] observed.
