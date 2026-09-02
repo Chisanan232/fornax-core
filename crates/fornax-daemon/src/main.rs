@@ -160,6 +160,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/status", get(api_status))
         .route("/api/findings/recent", get(api_findings_recent))
         .route("/api/capabilities", get(api_capabilities))
+        .route("/api/evidence-graph", get(api_evidence_graph))
         .route("/dashboard", get(dashboard))
         .with_state(state);
 
@@ -445,6 +446,77 @@ async fn api_capabilities(
             "capabilities": caps,
         })),
         Err(e) => Json(serde_json::json!({ "session": q.session, "error": e.to_string() })),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct EvidenceGraphQuery {
+    claim: String,
+    session: String,
+}
+
+/// FORNX-90: exposes `Store::evidence_graph_for_claim` (FORNX-89) as the
+/// daemon-side half of the local Evidence Explorer — `fornax evidence-graph
+/// <claim> <session>` reads this. This endpoint surfaces only `EvidenceLink`/
+/// `MissingEvidence` rows — evidence ids and relation/availability metadata,
+/// no evidence payload content at all (`EvidenceLink` doesn't carry one) —
+/// so no redaction step applies on this path. A redaction-safe payload
+/// drill-down (this ticket's AC also asks for one) is not built here; were
+/// it added, it would need to read the already-redacted `Evidence` rows
+/// (`handle_message` runs every `Evidence`/`Claim` through
+/// `redact_json`/`redact_text` on ingest, see the `*_redacted_before_storage`
+/// regression tests above), which would already satisfy that boundary
+/// without any further redaction step of its own.
+///
+/// Distinguishes three cases, matching this ticket's core invariant that
+/// "no evidence found" must never be silently conflated with "the claim
+/// itself doesn't exist" or "evidence was expected but is missing":
+/// - the claim id is not on record for this session at all -> `found: false`
+/// - the claim exists but has zero links and zero missing-evidence notes
+///   ("nobody has looked") -> `found: true`, empty `links`/`missing`
+/// - the claim exists with links and/or missing notes -> `found: true`,
+///   populated `links`/`missing`
+///
+/// Scoped by `(claim, session)` together, mirroring
+/// `evidence_graph_for_claim`'s own authorization-boundary scoping — a
+/// caller cannot probe another session's claim ids.
+async fn api_evidence_graph(
+    State(state): State<AppState>,
+    Query(q): Query<EvidenceGraphQuery>,
+) -> Json<serde_json::Value> {
+    let claims = match state.store.claims_for_session(&q.session).await {
+        Ok(claims) => claims,
+        Err(e) => {
+            return Json(
+                serde_json::json!({ "claim": q.claim, "session": q.session, "error": e.to_string() }),
+            )
+        }
+    };
+    let claim_exists = claims.iter().any(|c| c.id.to_string() == q.claim);
+    if !claim_exists {
+        return Json(serde_json::json!({
+            "claim": q.claim,
+            "session": q.session,
+            "found": false,
+            "reason": "no claim with this id is on record for this session",
+        }));
+    }
+
+    match state
+        .store
+        .evidence_graph_for_claim(&q.claim, &q.session)
+        .await
+    {
+        Ok(graph) => Json(serde_json::json!({
+            "claim": q.claim,
+            "session": q.session,
+            "found": true,
+            "links": graph.links,
+            "missing": graph.missing,
+        })),
+        Err(e) => Json(
+            serde_json::json!({ "claim": q.claim, "session": q.session, "error": e.to_string() }),
+        ),
     }
 }
 
@@ -1092,6 +1164,273 @@ mod tests {
             .expect("capabilities must be an array")
             .is_empty());
         assert!(resp.0.get("reason").and_then(|s| s.as_str()).is_some());
+    }
+
+    /// FORNX-90: `/api/evidence-graph` must surface every linked-evidence
+    /// relation and every missing-evidence note for a real claim, not a
+    /// collapsed count — proves the full round trip through
+    /// `evidence_graph_for_claim`.
+    #[tokio::test]
+    async fn api_evidence_graph_surfaces_links_and_missing_for_a_real_claim() {
+        use fornax_types::{
+            EvidenceLink, EvidenceRelation, MissingEvidence, SignalAvailability, SignalClass,
+        };
+
+        let state = test_state().await;
+        let mut hint = None;
+        let session_id = "fornx-90-evidence-graph-endpoint".to_string();
+
+        let event_id = Uuid::new_v4();
+        let event = AgentEvent {
+            id: event_id,
+            session_id: session_id.clone(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-09-01T00:00:00Z".to_string(),
+            tool_name: Some("Bash".to_string()),
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        handle_message(&state, IngestMessage::Event(event), &mut hint)
+            .await
+            .expect("handle event");
+
+        let claim = Claim {
+            id: Uuid::new_v4(),
+            session_id: session_id.clone(),
+            source_event_id: event_id,
+            text: "all tests passed".to_string(),
+            subject: "test_result".to_string(),
+            claimed_at: "2026-09-01T00:00:00Z".to_string(),
+        };
+        handle_message(&state, IngestMessage::Claim(claim.clone()), &mut hint)
+            .await
+            .expect("handle claim");
+
+        // `claim_evidence_links.evidence_id` is a foreign key into `evidence`
+        // (0006_evidence_graph.sql) — a linked evidence id must reference a
+        // real, already-stored `Evidence` row.
+        let evidence_id = Uuid::new_v4();
+        let evidence = fornax_types::Evidence {
+            id: evidence_id,
+            session_id: session_id.clone(),
+            source_event_id: event_id,
+            kind: fornax_types::EvidenceKind::ProcessObservation,
+            observed_at: "2026-09-01T00:00:00Z".to_string(),
+            payload: serde_json::json!({}),
+            provenance: "claude_code:1.2.3:PostToolUse:Bash#tool_response".to_string(),
+            source: None,
+            extension: None,
+        };
+        handle_message(&state, IngestMessage::Evidence(evidence), &mut hint)
+            .await
+            .expect("handle evidence");
+
+        state
+            .store
+            .insert_evidence_link(&EvidenceLink {
+                id: Uuid::new_v4(),
+                session_id: session_id.clone(),
+                claim_id: claim.id,
+                evidence_id,
+                relation: EvidenceRelation::Contradicts,
+                linked_at: "2026-09-01T00:00:01Z".to_string(),
+            })
+            .await
+            .expect("insert evidence link");
+        state
+            .store
+            .insert_missing_evidence(&MissingEvidence {
+                id: Uuid::new_v4(),
+                session_id: session_id.clone(),
+                claim_id: claim.id,
+                signal_class: SignalClass::ProcessResult,
+                availability: SignalAvailability::Unavailable,
+                detail: Some("no exit code sensor ran for this claim".to_string()),
+                noted_at: "2026-09-01T00:00:02Z".to_string(),
+            })
+            .await
+            .expect("insert missing evidence");
+
+        let query = Query(EvidenceGraphQuery {
+            claim: claim.id.to_string(),
+            session: session_id,
+        });
+        let resp = api_evidence_graph(State(state), query).await;
+        assert_eq!(resp.0.get("found").and_then(|b| b.as_bool()), Some(true));
+        let links = resp.0["links"].as_array().expect("links must be an array");
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0]["relation"], "contradicts");
+        let missing = resp.0["missing"]
+            .as_array()
+            .expect("missing must be an array");
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0]["signal_class"], "process_result");
+        assert_eq!(missing[0]["availability"], "unavailable");
+    }
+
+    /// FORNX-90 regression: an unknown claim id must report `found: false`,
+    /// never a fabricated empty graph — "the claim doesn't exist" must stay
+    /// distinguishable from "the claim exists but nobody has looked".
+    #[tokio::test]
+    async fn api_evidence_graph_reports_not_found_for_unknown_claim() {
+        let state = test_state().await;
+        let query = Query(EvidenceGraphQuery {
+            claim: Uuid::new_v4().to_string(),
+            session: "no-such-session".to_string(),
+        });
+        let resp = api_evidence_graph(State(state), query).await;
+        assert_eq!(resp.0.get("found").and_then(|b| b.as_bool()), Some(false));
+        assert!(resp.0.get("reason").and_then(|s| s.as_str()).is_some());
+    }
+
+    /// FORNX-90 regression: a real claim with zero links and zero missing
+    /// notes ("nobody has looked") must still report `found: true` with
+    /// empty arrays — distinct from both the not-found case above and the
+    /// looked-but-absent case covered by
+    /// `api_evidence_graph_surfaces_links_and_missing_for_a_real_claim`.
+    #[tokio::test]
+    async fn api_evidence_graph_distinguishes_nobody_looked_from_not_found() {
+        let state = test_state().await;
+        let mut hint = None;
+        let session_id = "fornx-90-nobody-looked".to_string();
+
+        let event_id = Uuid::new_v4();
+        let event = AgentEvent {
+            id: event_id,
+            session_id: session_id.clone(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-09-01T00:00:00Z".to_string(),
+            tool_name: Some("Bash".to_string()),
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        handle_message(&state, IngestMessage::Event(event), &mut hint)
+            .await
+            .expect("handle event");
+
+        let claim = Claim {
+            id: Uuid::new_v4(),
+            session_id: session_id.clone(),
+            source_event_id: event_id,
+            text: "nobody has linked evidence to this claim yet".to_string(),
+            subject: "test_result".to_string(),
+            claimed_at: "2026-09-01T00:00:00Z".to_string(),
+        };
+        handle_message(&state, IngestMessage::Claim(claim.clone()), &mut hint)
+            .await
+            .expect("handle claim");
+
+        let query = Query(EvidenceGraphQuery {
+            claim: claim.id.to_string(),
+            session: session_id,
+        });
+        let resp = api_evidence_graph(State(state), query).await;
+        assert_eq!(resp.0.get("found").and_then(|b| b.as_bool()), Some(true));
+        assert!(resp.0["links"]
+            .as_array()
+            .expect("links must be an array")
+            .is_empty());
+        assert!(resp.0["missing"]
+            .as_array()
+            .expect("missing must be an array")
+            .is_empty());
+    }
+
+    /// FORNX-90 regression, direct read of the AC bullet "graph queries
+    /// cannot cross tenant/session authorization boundaries": a claim that
+    /// really exists in session A must report `found: false` — not A's
+    /// graph — when queried under a different session id B, exactly like
+    /// querying a claim id that doesn't exist anywhere.
+    #[tokio::test]
+    async fn api_evidence_graph_does_not_leak_a_claim_across_sessions() {
+        use fornax_types::{EvidenceLink, EvidenceRelation};
+
+        let state = test_state().await;
+        let mut hint = None;
+        let owning_session = "fornx-90-owning-session".to_string();
+        let other_session = "fornx-90-other-session".to_string();
+
+        let event_id = Uuid::new_v4();
+        let event = AgentEvent {
+            id: event_id,
+            session_id: owning_session.clone(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-09-01T00:00:00Z".to_string(),
+            tool_name: Some("Bash".to_string()),
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        handle_message(&state, IngestMessage::Event(event), &mut hint)
+            .await
+            .expect("handle event");
+
+        let claim = Claim {
+            id: Uuid::new_v4(),
+            session_id: owning_session.clone(),
+            source_event_id: event_id,
+            text: "belongs to the owning session only".to_string(),
+            subject: "test_result".to_string(),
+            claimed_at: "2026-09-01T00:00:00Z".to_string(),
+        };
+        handle_message(&state, IngestMessage::Claim(claim.clone()), &mut hint)
+            .await
+            .expect("handle claim");
+
+        // `claim_evidence_links.evidence_id` is a foreign key into
+        // `evidence` (0006_evidence_graph.sql) — needs a real stored row.
+        let evidence_id = Uuid::new_v4();
+        let evidence = fornax_types::Evidence {
+            id: evidence_id,
+            session_id: owning_session.clone(),
+            source_event_id: event_id,
+            kind: fornax_types::EvidenceKind::ProcessObservation,
+            observed_at: "2026-09-01T00:00:00Z".to_string(),
+            payload: serde_json::json!({}),
+            provenance: "claude_code:1.2.3:PostToolUse:Bash#tool_response".to_string(),
+            source: None,
+            extension: None,
+        };
+        handle_message(&state, IngestMessage::Evidence(evidence), &mut hint)
+            .await
+            .expect("handle evidence");
+
+        state
+            .store
+            .insert_evidence_link(&EvidenceLink {
+                id: Uuid::new_v4(),
+                session_id: owning_session.clone(),
+                claim_id: claim.id,
+                evidence_id,
+                relation: EvidenceRelation::Supports,
+                linked_at: "2026-09-01T00:00:01Z".to_string(),
+            })
+            .await
+            .expect("insert evidence link");
+
+        let cross_session_query = Query(EvidenceGraphQuery {
+            claim: claim.id.to_string(),
+            session: other_session,
+        });
+        let resp = api_evidence_graph(State(state.clone()), cross_session_query).await;
+        assert_eq!(
+            resp.0.get("found").and_then(|b| b.as_bool()),
+            Some(false),
+            "a real claim queried under a different session id must not leak as found"
+        );
+
+        // Sanity: the same claim id under its real session does resolve.
+        let same_session_query = Query(EvidenceGraphQuery {
+            claim: claim.id.to_string(),
+            session: owning_session,
+        });
+        let resp2 = api_evidence_graph(State(state), same_session_query).await;
+        assert_eq!(resp2.0.get("found").and_then(|b| b.as_bool()), Some(true));
     }
 
     /// FORNX-244 regression: `state.caps` is a single in-memory slot per
