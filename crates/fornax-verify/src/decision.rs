@@ -320,7 +320,184 @@ mod decision_tests {
         UncertaintyBand::Conflicted,
     ];
 
-    // --- Full mapping table, one assertion per (verdict, band, risk) ------
+    // --- Full mapping table, pinned exactly (not just "never Proceed") ----
+
+    /// Pins `DefaultRiskPolicy::action_for`'s entire mapping table -- every
+    /// (verdict, band) row, every risk class -- to its exact expected
+    /// `RecommendationAction`, not merely "not Proceed". This is what makes
+    /// the table this PR documents an actually-reviewable artifact: a
+    /// single row flipping (e.g. `Contradicted`/`Corroborated`/`Lenient`
+    /// silently changing from `Review` to `Block`) fails here even though
+    /// it would satisfy every narrower "never Proceed" safety test below.
+    #[test]
+    fn mapping_table_is_pinned_exactly_for_every_verdict_band_risk_combination() {
+        use RecommendationAction::{Block, Proceed, Review};
+
+        // (verdict, band, strict, balanced, lenient)
+        let table: [(
+            Verdict,
+            UncertaintyBand,
+            RecommendationAction,
+            RecommendationAction,
+            RecommendationAction,
+        ); 20] = [
+            (
+                Verdict::Verified,
+                UncertaintyBand::Corroborated,
+                Proceed,
+                Proceed,
+                Proceed,
+            ),
+            (
+                Verdict::Verified,
+                UncertaintyBand::Qualified,
+                Review,
+                Review,
+                Review,
+            ),
+            (
+                Verdict::Verified,
+                UncertaintyBand::Undetermined,
+                Review,
+                Review,
+                Review,
+            ),
+            (
+                Verdict::Verified,
+                UncertaintyBand::Conflicted,
+                Review,
+                Review,
+                Review,
+            ),
+            (
+                Verdict::Contradicted,
+                UncertaintyBand::Corroborated,
+                Block,
+                Block,
+                Review,
+            ),
+            (
+                Verdict::Contradicted,
+                UncertaintyBand::Qualified,
+                Block,
+                Review,
+                Review,
+            ),
+            (
+                Verdict::Contradicted,
+                UncertaintyBand::Undetermined,
+                Block,
+                Block,
+                Block,
+            ),
+            (
+                Verdict::Contradicted,
+                UncertaintyBand::Conflicted,
+                Block,
+                Block,
+                Block,
+            ),
+            (
+                Verdict::Unverified,
+                UncertaintyBand::Corroborated,
+                Block,
+                Review,
+                Review,
+            ),
+            (
+                Verdict::Unverified,
+                UncertaintyBand::Qualified,
+                Block,
+                Review,
+                Review,
+            ),
+            (
+                Verdict::Unverified,
+                UncertaintyBand::Undetermined,
+                Block,
+                Review,
+                Review,
+            ),
+            (
+                Verdict::Unverified,
+                UncertaintyBand::Conflicted,
+                Block,
+                Review,
+                Review,
+            ),
+            (
+                Verdict::Unavailable,
+                UncertaintyBand::Corroborated,
+                Block,
+                Block,
+                Review,
+            ),
+            (
+                Verdict::Unavailable,
+                UncertaintyBand::Qualified,
+                Block,
+                Block,
+                Review,
+            ),
+            (
+                Verdict::Unavailable,
+                UncertaintyBand::Undetermined,
+                Block,
+                Block,
+                Review,
+            ),
+            (
+                Verdict::Unavailable,
+                UncertaintyBand::Conflicted,
+                Block,
+                Block,
+                Review,
+            ),
+            (
+                Verdict::Review,
+                UncertaintyBand::Corroborated,
+                Block,
+                Block,
+                Block,
+            ),
+            (
+                Verdict::Review,
+                UncertaintyBand::Qualified,
+                Block,
+                Block,
+                Block,
+            ),
+            (
+                Verdict::Review,
+                UncertaintyBand::Undetermined,
+                Block,
+                Block,
+                Block,
+            ),
+            (
+                Verdict::Review,
+                UncertaintyBand::Conflicted,
+                Block,
+                Block,
+                Block,
+            ),
+        ];
+
+        for (verdict, band, strict_expected, balanced_expected, lenient_expected) in table {
+            let f = fused(verdict, band, verdict == Verdict::Review);
+            for (risk, expected) in [
+                (RiskClass::Strict, strict_expected),
+                (RiskClass::Balanced, balanced_expected),
+                (RiskClass::Lenient, lenient_expected),
+            ] {
+                let rec = DefaultRiskPolicy.decide(&f, risk);
+                assert_eq!(
+                    rec.action, expected,
+                    "verdict={verdict:?} band={band:?} risk={risk:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn verified_corroborated_is_the_only_path_to_proceed() {
