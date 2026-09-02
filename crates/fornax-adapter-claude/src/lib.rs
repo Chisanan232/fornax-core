@@ -487,6 +487,251 @@ impl EvidenceSensor for ClaudeEditWriteDiffSensor {
     }
 }
 
+/// FORNX-91 "independent filesystem evidence" sensor: cross-checks a claimed
+/// Edit/Write/MultiEdit against the *actual* file on disk, independent of
+/// anything Claude Code itself reported.
+///
+/// Unlike [`ClaudeEditWriteDiffSensor`] (which reconstructs a diff-*shaped*
+/// string purely from `tool_input` — Claude's own account of what it wrote,
+/// `TrustClass::AgentAdjacent`), this sensor calls `std::fs::metadata` on the
+/// claimed path itself, on the same host the Fornax daemon and the Claude
+/// Code process both run on (`docs/adr/0001-architecture-invariants.md`'s
+/// "no cloud dependency on the local critical path") — `TrustClass::
+/// HostObserved`.
+///
+/// **Deliberately not a `git`-based sensor.** A working-tree `git status`/
+/// `git diff` observation was the original design for this ticket, but it
+/// is blocked by two independent constraints: `crates/fornax-daemon/tests/
+/// adversarial_daemon_input.rs::subprocess_surface_is_still_zero_in_production_code`
+/// (FORNX-238) asserts a zero subprocess-spawn surface (no `std` process-
+/// spawning API, no shell `-c` invocation) across every production module
+/// in this workspace, and
+/// `docs/contributing/adding-an-adapter.md`'s "Allowed core dependencies"
+/// restricts an adapter crate to depending on `fornax-types` only, which
+/// rules out a pure-Rust git library (`gix`/`git2`) as an in-process
+/// alternative. A real git-backed sensor therefore needs either a new
+/// non-adapter crate carrying that dependency or an ADR amendment — noted
+/// as follow-up scope for FORNX-91, not silently worked around here.
+///
+/// `EvidenceSource::provider` is `Some(ClaudeCode)` here — accurate, since
+/// this sensor runs under that adapter connection — even though what it
+/// measures (the real filesystem) is independent of what Claude Code
+/// reported.
+///
+/// **What it can observe**: whether the claimed path exists at all, and
+/// (from the same `std::fs::Metadata` call, no second syscall) whether its
+/// modification time is recent enough to be consistent with this specific
+/// tool call having just run, using a generous tolerance window — this
+/// sensor cannot know the exact moment the write syscall completed, only
+/// that it should be close to `AgentEvent::observed_at`.
+/// **What it cannot observe**: file *content* correctness (only
+/// existence/mtime), a change later reverted before this sensor runs (looks
+/// identical to "never happened" from mtime alone once enough time passes),
+/// or anything when the host clock and the claimed-observation clock are
+/// skewed by more than the tolerance window.
+struct ClaudeFileWriteConfirmedSensor {
+    adapter_version: &'static str,
+    /// How far a file's mtime may lag (or lead, under clock skew)
+    /// `AgentEvent::observed_at` and still count as consistent with the
+    /// claim. A named field, not a magic number inlined at the comparison
+    /// site — see [`Self::with_default_tolerance`] for the value this
+    /// sensor is actually constructed with.
+    tolerance: chrono::Duration,
+}
+
+impl ClaudeFileWriteConfirmedSensor {
+    fn with_default_tolerance(adapter_version: &'static str) -> Self {
+        Self {
+            adapter_version,
+            // Generous on purpose: this sensor only needs to catch "this
+            // path was never touched" or "this path was last touched days
+            // ago", not to measure precise latency.
+            tolerance: chrono::Duration::seconds(300),
+        }
+    }
+
+    /// Same precedence as [`ClaudeEditWriteDiffSensor::collect`]'s path
+    /// extraction: `tool_response`'s `filePath`/`file_path`, falling back to
+    /// `tool_input.file_path`.
+    fn claimed_path(event: &AgentEvent) -> Option<&str> {
+        let resp = event.tool_response.as_ref()?;
+        resp.get("filePath")
+            .and_then(|v| v.as_str())
+            .or_else(|| resp.get("file_path").and_then(|v| v.as_str()))
+            .or_else(|| {
+                event
+                    .tool_input
+                    .as_ref()
+                    .and_then(|ti| ti.get("file_path"))
+                    .and_then(|v| v.as_str())
+            })
+    }
+
+    fn build_evidence(
+        &self,
+        event: &AgentEvent,
+        path: &str,
+        exists: bool,
+        modified_at: Option<String>,
+        consistent_with_claim: bool,
+    ) -> Evidence {
+        let description = if !exists {
+            format!("host filesystem shows no file at claimed path {path}")
+        } else if consistent_with_claim {
+            format!("host filesystem confirms {path} was written consistent with the claim")
+        } else {
+            format!(
+                "host filesystem shows {path} exists but its modification time is not \
+                 consistent with this claim"
+            )
+        };
+
+        Evidence {
+            id: Uuid::new_v4(),
+            session_id: event.session_id.clone(),
+            source_event_id: event.id,
+            kind: EvidenceKind::ProcessObservation,
+            observed_at: event.observed_at.clone(),
+            payload: serde_json::to_value(fornax_types::ProcessObservationPayload {
+                description,
+                observation: Some(ProcessObservationDetail::FileWriteObserved {
+                    claimed_path: path.to_string(),
+                    exists,
+                    modified_at,
+                    consistent_with_claim,
+                }),
+            })
+            .expect("ProcessObservationPayload always serializes"),
+            provenance: format!(
+                "claude_code:{v}:PostToolUse:{tool}#host_observed:fs_metadata",
+                v = self.adapter_version,
+                tool = event.tool_name.as_deref().unwrap_or("")
+            ),
+            source: Some(EvidenceSource::now(
+                self.name(),
+                self.trust_class(),
+                Some(Provider::ClaudeCode),
+                self.collection_method(),
+                self.collector_version(),
+            )),
+            extension: None,
+        }
+    }
+}
+
+impl EvidenceSensor for ClaudeFileWriteConfirmedSensor {
+    fn name(&self) -> &'static str {
+        "claude_file_write_confirmed_sensor_v1"
+    }
+
+    fn required_capabilities(&self) -> &'static [SignalClass] {
+        // Needed to learn *what was claimed* (the file path), not to read
+        // the filesystem — the `std::fs::metadata` call below needs no
+        // provider capability at all.
+        &[SignalClass::ToolResultPayload]
+    }
+
+    fn trust_class(&self) -> TrustClass {
+        TrustClass::HostObserved
+    }
+
+    fn collection_method(&self) -> CollectionMethod {
+        // `ProcessObservation`'s doc names a literal `git` invocation as its
+        // example, but its defining contrast is "Fornax's own host-side
+        // [...] as opposed to reading something a provider produced" — a
+        // direct filesystem read fits that same contrast exactly, and no
+        // other variant does (same kind of reasonable broadening
+        // `OpenCodeExitCodeSensor::collection_method` already documents for
+        // `HookCallback`).
+        CollectionMethod::ProcessObservation
+    }
+
+    fn collector_version(&self) -> Option<String> {
+        Some(self.adapter_version.to_string())
+    }
+
+    fn collect(&self, event: &AgentEvent, _caps: &RuntimeCapabilities) -> SensorOutcome {
+        let is_target_tool = matches!(
+            event.tool_name.as_deref(),
+            Some("Edit") | Some("Write") | Some("MultiEdit")
+        );
+        if event.kind != EventKind::PostToolUse || !is_target_tool {
+            return SensorOutcome::not_collected(
+                SignalAvailability::Unknown,
+                Some("not an Edit/Write/MultiEdit PostToolUse event".to_string()),
+            );
+        }
+
+        if event.tool_response.is_none() {
+            return SensorOutcome::not_collected(
+                SignalAvailability::Unavailable,
+                Some("no tool_response present on this event".to_string()),
+            );
+        }
+
+        let Some(path) = Self::claimed_path(event) else {
+            return SensorOutcome::not_collected(
+                SignalAvailability::Unavailable,
+                Some("no file path found in tool_response or tool_input".to_string()),
+            );
+        };
+
+        let meta = match std::fs::metadata(path) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // A genuine, useful negative: the claimed path does not
+                // exist on disk at all — collected, not discarded, per
+                // `SensorOutcome`'s "partial/negative collection is still
+                // collection" contract.
+                return SensorOutcome::collected(vec![
+                    self.build_evidence(event, path, false, None, false)
+                ]);
+            }
+            Err(e) => {
+                return SensorOutcome::not_collected(
+                    SignalAvailability::CollectionFailed,
+                    Some(format!("failed to stat {path}: {e}")),
+                );
+            }
+        };
+
+        let Ok(modified) = meta.modified() else {
+            return SensorOutcome::not_collected(
+                SignalAvailability::CollectionFailed,
+                Some(format!(
+                    "filesystem/platform does not report a modification time for {path}"
+                )),
+            );
+        };
+        let modified_at: chrono::DateTime<chrono::Utc> = modified.into();
+
+        let consistent = match chrono::DateTime::parse_from_rfc3339(&event.observed_at) {
+            Ok(observed_at) => {
+                let observed_at = observed_at.with_timezone(&chrono::Utc);
+                let delta = observed_at - modified_at;
+                // The file may have been written slightly before the hook
+                // fired (delta > 0, bounded by `tolerance`) or, under clock
+                // skew, appear to land slightly after it (delta < 0,
+                // likewise bounded) — both directions are tolerated
+                // symmetrically rather than assuming which clock is ahead.
+                delta <= self.tolerance && delta >= -self.tolerance
+            }
+            // Can't check timing without a parseable observed_at — fall
+            // back to the existence check alone rather than fabricating a
+            // timing verdict.
+            Err(_) => true,
+        };
+
+        SensorOutcome::collected(vec![self.build_evidence(
+            event,
+            path,
+            true,
+            Some(modified_at.to_rfc3339()),
+            consistent,
+        )])
+    }
+}
+
 /// FORNX-14 "git commit/push claim" class: parses `git commit`/`git push`
 /// output from a Bash `tool_response` into structured `VcsOperation`
 /// evidence.
@@ -875,6 +1120,21 @@ fn translate(
         };
         let outcome = sensor.collect(&event, &caps);
         out.extend(outcome.evidence.into_iter().map(IngestMessage::Evidence));
+
+        // FORNX-91: independent host-filesystem corroboration/contradiction
+        // for the same Edit/Write/MultiEdit claim — see
+        // `ClaudeFileWriteConfirmedSensor` for why this is `TrustClass::
+        // HostObserved` rather than a second heuristic reading of
+        // `tool_input`.
+        let host_sensor =
+            ClaudeFileWriteConfirmedSensor::with_default_tolerance(adapter.adapter_version());
+        let host_outcome = host_sensor.collect(&event, &caps);
+        out.extend(
+            host_outcome
+                .evidence
+                .into_iter()
+                .map(IngestMessage::Evidence),
+        );
     }
 
     // PostToolUse for a Bash call whose command looks like `git commit`/
@@ -1229,6 +1489,24 @@ mod tests {
 
     // --- FORNX-14: ClaudeEditWriteDiffSensor -------------------------------
 
+    /// Finds the first `FileDiff` evidence message — used instead of a fixed
+    /// `msgs[2]` index because FORNX-91's `ClaudeFileWriteConfirmedSensor`
+    /// now also fires on every Edit/Write/MultiEdit event with a
+    /// `tool_response`, adding a second (`ProcessObservation`) evidence
+    /// message after this one. These fixtures' paths (`/repo/...`) don't
+    /// exist on the real filesystem the test runs on, so that second
+    /// message is an honest `exists: false` observation — itself proof the
+    /// new sensor is independent of `tool_input`/`tool_response` content —
+    /// not a regression in this sensor's own behavior.
+    fn file_diff_evidence(msgs: &[IngestMessage]) -> &Evidence {
+        msgs.iter()
+            .find_map(|m| match m {
+                IngestMessage::Evidence(ev) if ev.kind == EvidenceKind::FileDiff => Some(ev),
+                _ => None,
+            })
+            .expect("expected a FileDiff Evidence message")
+    }
+
     #[test]
     fn post_tool_use_edit_produces_file_diff_evidence() {
         let raw = serde_json::json!({
@@ -1243,18 +1521,13 @@ mod tests {
             "tool_response": {"filePath": "/repo/src/lib.rs"}
         });
         let msgs = normalize(&raw).into_messages();
-        assert_eq!(msgs.len(), 3);
-        match &msgs[2] {
-            IngestMessage::Evidence(ev) => {
-                assert_eq!(ev.kind, EvidenceKind::FileDiff);
-                assert_eq!(ev.payload["path"], "/repo/src/lib.rs");
-                let diff = ev.payload["diff"].as_str().unwrap();
-                assert!(diff.contains("-fn old() {}"));
-                assert!(diff.contains("+fn new() {}"));
-                assert!(ev.provenance.ends_with("#heuristic:tool_input"));
-            }
-            other => panic!("expected Evidence, got {other:?}"),
-        }
+        assert_eq!(msgs.len(), 4);
+        let ev = file_diff_evidence(&msgs);
+        assert_eq!(ev.payload["path"], "/repo/src/lib.rs");
+        let diff = ev.payload["diff"].as_str().unwrap();
+        assert!(diff.contains("-fn old() {}"));
+        assert!(diff.contains("+fn new() {}"));
+        assert!(ev.provenance.ends_with("#heuristic:tool_input"));
     }
 
     #[test]
@@ -1270,18 +1543,13 @@ mod tests {
             "tool_response": {"filePath": "/repo/src/new_file.rs"}
         });
         let msgs = normalize(&raw).into_messages();
-        assert_eq!(msgs.len(), 3);
-        match &msgs[2] {
-            IngestMessage::Evidence(ev) => {
-                assert_eq!(ev.kind, EvidenceKind::FileDiff);
-                let diff = ev.payload["diff"].as_str().unwrap();
-                assert!(diff.contains("+line one"));
-                assert!(diff.contains("+line two"));
-                assert!(!diff.contains('-'));
-                assert!(ev.provenance.ends_with("#heuristic:tool_input"));
-            }
-            other => panic!("expected Evidence, got {other:?}"),
-        }
+        assert_eq!(msgs.len(), 4);
+        let ev = file_diff_evidence(&msgs);
+        let diff = ev.payload["diff"].as_str().unwrap();
+        assert!(diff.contains("+line one"));
+        assert!(diff.contains("+line two"));
+        assert!(!diff.contains('-'));
+        assert!(ev.provenance.ends_with("#heuristic:tool_input"));
     }
 
     #[test]
@@ -1300,20 +1568,15 @@ mod tests {
             "tool_response": {"filePath": "/repo/src/lib.rs"}
         });
         let msgs = normalize(&raw).into_messages();
-        assert_eq!(msgs.len(), 3);
-        match &msgs[2] {
-            IngestMessage::Evidence(ev) => {
-                assert_eq!(ev.kind, EvidenceKind::FileDiff);
-                let diff = ev.payload["diff"].as_str().unwrap();
-                assert!(diff.contains("-a1"));
-                assert!(diff.contains("+a2"));
-                assert!(diff.contains("-b1"));
-                assert!(diff.contains("+b2"));
-            }
-            other => panic!("expected Evidence, got {other:?}"),
-        }
-        // Single evidence entry, not one per edit.
-        assert_eq!(msgs.len(), 3);
+        let ev = file_diff_evidence(&msgs);
+        let diff = ev.payload["diff"].as_str().unwrap();
+        assert!(diff.contains("-a1"));
+        assert!(diff.contains("+a2"));
+        assert!(diff.contains("-b1"));
+        assert!(diff.contains("+b2"));
+        // Single FileDiff evidence entry, not one per edit (plus FORNX-91's
+        // independent filesystem observation alongside it).
+        assert_eq!(msgs.len(), 4);
     }
 
     #[test]
@@ -1380,6 +1643,150 @@ mod tests {
             IngestMessage::Evidence(ev) => assert_eq!(ev.kind, EvidenceKind::ExitCode),
             other => panic!("expected Evidence, got {other:?}"),
         }
+    }
+
+    // --- FORNX-91: ClaudeFileWriteConfirmedSensor --------------------------
+    //
+    // No subprocess spawning anywhere in this module: FORNX-238's
+    // `subprocess_surface_is_still_zero_in_production_code` invariant
+    // (`crates/fornax-daemon/tests/adversarial_daemon_input.rs`) scans every
+    // production `.rs` file in the workspace, including files under `src/`
+    // that only contain `#[cfg(test)]` code — so these fixtures use
+    // `std::fs` only, matching the sensor under test.
+
+    /// Creates a fresh temp file (named with a `Uuid` for uniqueness,
+    /// matching how the rest of this crate already depends on `uuid` — no
+    /// new test-only dependency needed) and returns its absolute path.
+    /// Callers must remove it when done.
+    fn temp_file(contents: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("fornax-fornx91-{}.txt", Uuid::new_v4()));
+        std::fs::write(&path, contents).expect("write temp file");
+        path
+    }
+
+    fn file_write_event(tool_name: &str, file_path: &str, observed_at: &str) -> AgentEvent {
+        AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "sess-1".into(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: observed_at.into(),
+            tool_name: Some(tool_name.into()),
+            tool_input: Some(serde_json::json!({"file_path": file_path})),
+            tool_response: Some(serde_json::json!({"filePath": file_path})),
+            raw: serde_json::json!({}),
+        }
+    }
+
+    /// Real success case: the claimed path genuinely exists and was just
+    /// modified — `exists: true`, `consistent_with_claim: true`,
+    /// `TrustClass::HostObserved`, independent of any provider-reported
+    /// claim content.
+    #[test]
+    fn file_write_confirmed_sensor_confirms_a_genuinely_written_file() {
+        let file = temp_file("changed\n");
+        let observed_at = chrono::Utc::now().to_rfc3339();
+        let event = file_write_event("Write", file.to_str().unwrap(), &observed_at);
+        let sensor = ClaudeFileWriteConfirmedSensor::with_default_tolerance(ADAPTER_VERSION);
+        let outcome = sensor.collect(&event, &ClaudeAdapter.probe());
+
+        std::fs::remove_file(&file).ok();
+
+        assert!(outcome.has_evidence());
+        assert_eq!(outcome.state, SignalAvailability::Available);
+        let ev = &outcome.evidence[0];
+        assert_eq!(ev.kind, EvidenceKind::ProcessObservation);
+        let source = ev.source.as_ref().expect("evidence must carry source");
+        assert_eq!(source.trust_class, fornax_types::TrustClass::HostObserved);
+        assert_eq!(
+            source.collection_method,
+            fornax_types::CollectionMethod::ProcessObservation
+        );
+        assert_eq!(ev.payload["observation"]["exists"], true);
+        assert_eq!(ev.payload["observation"]["consistent_with_claim"], true);
+    }
+
+    /// Honest negative: the claimed path does not exist at all on disk —
+    /// the sensor must say so, never silently omit evidence just because
+    /// the claim didn't pan out.
+    #[test]
+    fn file_write_confirmed_sensor_reports_exists_false_for_a_missing_path() {
+        let observed_at = chrono::Utc::now().to_rfc3339();
+        let event = file_write_event(
+            "Edit",
+            "/nonexistent/fornax-fornx91-missing-path.txt",
+            &observed_at,
+        );
+        let sensor = ClaudeFileWriteConfirmedSensor::with_default_tolerance(ADAPTER_VERSION);
+        let outcome = sensor.collect(&event, &ClaudeAdapter.probe());
+
+        assert!(outcome.has_evidence());
+        assert_eq!(outcome.state, SignalAvailability::Available);
+        let ev = &outcome.evidence[0];
+        assert_eq!(ev.payload["observation"]["exists"], false);
+        assert_eq!(ev.payload["observation"]["consistent_with_claim"], false);
+        assert!(ev.payload["observation"]["modified_at"].is_null());
+    }
+
+    /// The file exists but was last modified far outside the tolerance
+    /// window around `observed_at` — a stale file must not be reported as
+    /// consistent with a claim that it was *just* written.
+    #[test]
+    fn file_write_confirmed_sensor_reports_inconsistent_for_a_stale_file() {
+        let file = temp_file("stale\n");
+        let sensor = ClaudeFileWriteConfirmedSensor::with_default_tolerance(ADAPTER_VERSION);
+        // Well outside the sensor's own tolerance window in either
+        // direction, relative to the file's real mtime (now) — derived from
+        // `sensor.tolerance` rather than a hardcoded duration, so this test
+        // stays correct if the default tolerance is ever retuned.
+        let observed_at = (chrono::Utc::now() + sensor.tolerance * 2).to_rfc3339();
+        let event = file_write_event("Write", file.to_str().unwrap(), &observed_at);
+        let outcome = sensor.collect(&event, &ClaudeAdapter.probe());
+
+        std::fs::remove_file(&file).ok();
+
+        assert!(outcome.has_evidence());
+        let ev = &outcome.evidence[0];
+        assert_eq!(ev.payload["observation"]["exists"], true);
+        assert_eq!(ev.payload["observation"]["consistent_with_claim"], false);
+    }
+
+    #[test]
+    fn file_write_confirmed_sensor_reports_unavailable_with_no_tool_response() {
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "sess-1".into(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: Some("Edit".into()),
+            tool_input: Some(serde_json::json!({"file_path": "/tmp/x"})),
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        let sensor = ClaudeFileWriteConfirmedSensor::with_default_tolerance(ADAPTER_VERSION);
+        let outcome = sensor.collect(&event, &ClaudeAdapter.probe());
+        assert!(!outcome.has_evidence());
+        assert_eq!(outcome.state, SignalAvailability::Unavailable);
+    }
+
+    #[test]
+    fn file_write_confirmed_sensor_ignores_non_edit_write_events() {
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "sess-1".into(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: Some("Bash".into()),
+            tool_input: Some(serde_json::json!({"command": "pytest"})),
+            tool_response: Some(serde_json::json!({"exit_code": 0})),
+            raw: serde_json::json!({}),
+        };
+        let sensor = ClaudeFileWriteConfirmedSensor::with_default_tolerance(ADAPTER_VERSION);
+        let outcome = sensor.collect(&event, &ClaudeAdapter.probe());
+        assert!(!outcome.has_evidence());
+        assert_eq!(outcome.state, SignalAvailability::Unknown);
     }
 
     // --- FORNX-14: ClaudeGitOutcomeSensor ----------------------------------
