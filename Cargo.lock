@@ -821,9 +821,11 @@ version = "0.0.1"
 dependencies = [
  "chrono",
  "fornax-types",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror",
+ "toml_edit",
  "uuid",
 ]
 
@@ -2873,7 +2875,9 @@ dependencies = [
  "base64",
  "bytes",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
+ "futures-util",
  "h2",
  "http",
  "http-body",
