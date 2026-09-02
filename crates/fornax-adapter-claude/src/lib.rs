@@ -10,7 +10,7 @@ use fornax_types::{
     SensorDisableConfig, SensorOutcome, SignalAvailability, SignalClass, TrustClass, VcsOperation,
     VcsOutcome,
 };
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use uuid::Uuid;
 
 /// This adapter implementation's own version — independent of the Claude
@@ -1060,13 +1060,17 @@ impl ClaudeGitWorkingTreeSensor {
         &self,
         event: &AgentEvent,
         path: &str,
-        status: &fornax_vcs::WorkingTreeStatus,
+        status: &fornax_vcs::PathStatus,
         path_is_dirty: bool,
     ) -> Evidence {
+        // Deliberately not phrased as "clean" — `path_is_dirty: false` also
+        // covers "never written" and "gitignored", not only "committed and
+        // unmodified"; see `fornax_vcs::PathStatus::is_dirty`'s doc for the
+        // exact boundary this sensor inherits.
         let description = if path_is_dirty {
             format!("git working tree shows {path} as dirty (uncommitted, unstaged, or untracked)")
         } else {
-            format!("git working tree shows {path} as clean relative to HEAD")
+            format!("git's status walk reports no pending change for {path}")
         };
 
         Evidence {
@@ -1153,14 +1157,11 @@ impl EvidenceSensor for ClaudeGitWorkingTreeSensor {
         };
 
         let path_buf = PathBuf::from(path);
-        // Query starts from the claimed path's parent directory (or "." if
-        // the claimed path has none) — `fornax_vcs::working_tree_status`
-        // searches upward for a `.git` on its own, matching real `git
-        // status`'s own behavior run from any subdirectory of a working
-        // tree.
-        let start_dir = path_buf.parent().unwrap_or_else(|| Path::new("."));
-
-        let status = match fornax_vcs::working_tree_status(start_dir) {
+        // `fornax_vcs::path_status` restricts the underlying git status
+        // walk to this one path (a pathspec) rather than the whole working
+        // tree — see that function's doc for why that matters on a hook
+        // that fires on every single Edit/Write/MultiEdit.
+        let status = match fornax_vcs::path_status(&path_buf) {
             Ok(status) => status,
             Err(e) => {
                 return SensorOutcome::not_collected(
@@ -1177,23 +1178,11 @@ impl EvidenceSensor for ClaudeGitWorkingTreeSensor {
             );
         }
 
-        let path_is_dirty = match status.is_absolute_path_dirty(&path_buf) {
-            Some(dirty) => dirty,
-            None => {
-                return SensorOutcome::not_collected(
-                    SignalAvailability::CollectionFailed,
-                    Some(format!(
-                        "could not resolve {path} against the discovered repo's working directory"
-                    )),
-                );
-            }
-        };
-
         SensorOutcome::collected(vec![self.build_evidence(
             event,
             path,
             &status,
-            path_is_dirty,
+            status.is_dirty,
         )])
     }
 }
@@ -2061,16 +2050,47 @@ mod tests {
     /// sensor must not fabricate dirtiness just because the claimed path
     /// happens to sit inside a repo.
     #[test]
-    fn git_working_tree_sensor_reports_clean_when_nothing_is_dirty() {
+    fn git_working_tree_sensor_reports_clean_for_a_committed_unmodified_file() {
+        // Real "clean" per the task brief: committed, indexed, and the
+        // working-tree copy is byte-identical — not merely "a repo with
+        // nothing in it yet" (which is trivially "clean" only because
+        // there is nothing to compare against).
         let dir = temp_repo_dir();
         std::fs::create_dir_all(&dir).expect("create temp repo dir");
-        gix::init(&dir).expect("gix::init");
-        // The claimed path itself does not exist in the working tree at
-        // all, and the repo has nothing else to report — this sensor's
-        // dirty/clean answer is about git's own status walk, independent of
-        // whether the claimed path exists on disk (that's
-        // `ClaudeFileWriteConfirmedSensor`'s job).
-        let file = dir.join("never-written.txt");
+        std::env::set_var("GIT_AUTHOR_NAME", "Fornax Test");
+        std::env::set_var("GIT_AUTHOR_EMAIL", "fornax-test@example.invalid");
+        std::env::set_var("GIT_COMMITTER_NAME", "Fornax Test");
+        std::env::set_var("GIT_COMMITTER_EMAIL", "fornax-test@example.invalid");
+
+        let repo = gix::init(&dir).expect("gix::init");
+        let file = dir.join("claimed.txt");
+        std::fs::write(&file, "hello\n").expect("write working-tree file");
+        let blob_id = repo
+            .write_blob(b"hello\n".as_slice())
+            .expect("write blob")
+            .detach();
+        let tree = gix::objs::Tree {
+            entries: vec![gix::objs::tree::Entry {
+                mode: gix::objs::tree::EntryKind::Blob.into(),
+                filename: "claimed.txt".into(),
+                oid: blob_id,
+            }],
+        };
+        let tree_id = repo.write_object(&tree).expect("write tree").detach();
+        repo.commit(
+            "HEAD",
+            "initial commit",
+            tree_id,
+            std::iter::empty::<gix::ObjectId>(),
+        )
+        .expect("commit");
+        let index_state = gix::index::State::from_tree(&tree_id, &repo.objects, Default::default())
+            .expect("build index state from tree");
+        let mut index_file =
+            gix::index::File::from_state(index_state, repo.git_dir().join("index"));
+        index_file
+            .write(gix::index::write::Options::default())
+            .expect("persist index");
 
         let observed_at = chrono::Utc::now().to_rfc3339();
         let event = file_write_event("Write", file.to_str().unwrap(), &observed_at);
@@ -2085,6 +2105,7 @@ mod tests {
         let ev = &outcome.evidence[0];
         assert_eq!(ev.payload["observation"]["is_repo"], true);
         assert_eq!(ev.payload["observation"]["path_is_dirty"], false);
+        assert!(ev.payload["observation"]["head_commit"].is_string());
     }
 
     #[test]
@@ -2110,7 +2131,7 @@ mod tests {
     #[test]
     fn git_working_tree_sensor_reports_collection_failed_when_the_query_errors() {
         // A path that does not exist as a directory at all makes
-        // `fornax_vcs::working_tree_status`'s discovery step fail outright
+        // `fornax_vcs::path_status`'s discovery step fail outright
         // (a genuine access failure, not "no repo found here") — see
         // `fornax-vcs`'s own
         // `reports_open_failure_for_a_path_discovery_cannot_even_access`
