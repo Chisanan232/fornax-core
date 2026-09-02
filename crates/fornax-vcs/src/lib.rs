@@ -335,30 +335,40 @@ mod tests {
         );
     }
 
-    /// Sets the process-wide `GIT_AUTHOR_*`/`GIT_COMMITTER_*` env vars
-    /// `gix::Repository::commit`'s author/committer lookup reads (matching
-    /// real git's own fallback order: repo config, then these env vars,
-    /// then `user.name`/`user.email`). SAFETY-relevant only in the sense
-    /// that it mutates process-wide state; acceptable in a test binary.
-    fn set_test_git_identity() {
-        std::env::set_var("GIT_AUTHOR_NAME", "Fornax Test");
-        std::env::set_var("GIT_AUTHOR_EMAIL", "fornax-test@example.invalid");
-        std::env::set_var("GIT_COMMITTER_NAME", "Fornax Test");
-        std::env::set_var("GIT_COMMITTER_EMAIL", "fornax-test@example.invalid");
+    /// Writes a `[user]` section into `repo_dir/.git/config` and re-opens
+    /// the repository so `gix`'s author/committer lookup resolves it.
+    ///
+    /// Earlier this set the process-wide `GIT_AUTHOR_*`/`GIT_COMMITTER_*`
+    /// env vars instead. `std::env::set_var`/`var` mutate/read global
+    /// process state that is not synchronized against other threads, and
+    /// `cargo test` runs tests concurrently by default — a thread could
+    /// call `repo.commit(..)` (which reads those env vars once, caching
+    /// the result for the `gix::Repository` instance) in the brief window
+    /// where another thread's `set_var` call was still in flight,
+    /// intermittently observing an empty value and failing with
+    /// `AuthorMissing` (seen in CI, not locally, exactly the profile of
+    /// this race). Writing identity into this test's own repo-local
+    /// config file instead touches no shared state, so it can't race.
+    fn test_repo_with_identity(repo_dir: &Path) -> gix::Repository {
+        let config_path = repo_dir.join(".git").join("config");
+        let mut config = std::fs::read_to_string(&config_path).unwrap_or_default();
+        config.push_str("\n[user]\n\tname = Fornax Test\n\temail = fornax-test@example.invalid\n");
+        std::fs::write(&config_path, config).expect("write git config");
+        gix::open(repo_dir).expect("re-open repo with identity config")
     }
 
     /// Writes `content` as a single-file commit named `filename` at the
-    /// root of `repo` — object database only, via `gix`'s own write/commit
-    /// APIs (no `git` CLI, matching FORNX-238's zero-subprocess invariant).
-    /// Returns the tree and commit IDs so callers can build a matching
-    /// index (see `commit_and_index_single_file` for the fully-synced
-    /// variant).
+    /// root of the repo at `repo_dir` — object database only, via `gix`'s
+    /// own write/commit APIs (no `git` CLI, matching FORNX-238's
+    /// zero-subprocess invariant). Returns the tree and commit IDs so
+    /// callers can build a matching index (see
+    /// `commit_and_index_single_file` for the fully-synced variant).
     fn commit_single_file(
-        repo: &gix::Repository,
+        repo_dir: &Path,
         filename: &str,
         content: &[u8],
     ) -> (gix::ObjectId, gix::ObjectId) {
-        set_test_git_identity();
+        let repo = test_repo_with_identity(repo_dir);
         let blob_id = repo.write_blob(content).expect("write blob").detach();
         let tree = gix::objs::Tree {
             entries: vec![gix::objs::tree::Entry {
@@ -393,7 +403,7 @@ mod tests {
         content: &[u8],
     ) -> gix::ObjectId {
         std::fs::write(repo_dir.join(filename), content).expect("write working-tree file");
-        let (tree_id, commit_id) = commit_single_file(repo, filename, content);
+        let (tree_id, commit_id) = commit_single_file(repo_dir, filename, content);
 
         let index_state = gix::index::State::from_tree(&tree_id, &repo.objects, Default::default())
             .expect("build index state from tree");
@@ -409,8 +419,8 @@ mod tests {
     #[test]
     fn reports_head_commit_after_a_real_commit() {
         let dir = temp_dir();
-        let repo = gix::init(&dir).expect("gix::init");
-        let (_tree_id, commit_id) = commit_single_file(&repo, "claimed.txt", b"hello\n");
+        gix::init(&dir).expect("gix::init");
+        let (_tree_id, commit_id) = commit_single_file(&dir, "claimed.txt", b"hello\n");
 
         let status = working_tree_status(&dir).expect("query should not error");
         std::fs::remove_dir_all(&dir).ok();
