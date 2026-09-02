@@ -77,6 +77,15 @@ pub enum SignalAvailability {
     /// Ordinary absence: no adapter has declared an opinion about this
     /// signal class. The default when a class is missing from `signals`.
     Unknown,
+    /// The producing sensor was turned off by local configuration
+    /// (`fornax_types::sensor_config::SensorDisableConfig`, FORNX-302) — the
+    /// sensor never ran this call, as opposed to running and finding nothing
+    /// (`Unavailable`) or being incapable in principle (`Unsupported`).
+    /// Reused on [`crate::SensorOutcome::disabled`] rather than a sensor
+    /// silently producing no evidence and no explanation, matching this
+    /// enum's own governing rule: a missing signal must always be an
+    /// explicit, distinct state, never silent omission.
+    Disabled,
     /// Forward-compatibility catch-all: a state tag this binary doesn't
     /// recognize (e.g. persisted by a newer binary). Carries the original
     /// string so a tolerant reader that re-serializes the value does not
@@ -102,6 +111,7 @@ impl SignalAvailability {
             "redacted" => Self::Redacted,
             "collection_failed" => Self::CollectionFailed,
             "unknown" => Self::Unknown,
+            "disabled" => Self::Disabled,
             other => Self::Unrecognized(other.to_string()),
         }
     }
@@ -441,6 +451,7 @@ mod tests {
                 SignalAvailability::CollectionFailed,
             ),
             ("\"unknown\"", SignalAvailability::Unknown),
+            ("\"disabled\"", SignalAvailability::Disabled),
         ];
         for (json, expected) in cases {
             let v: SignalAvailability = serde_json::from_str(json).unwrap();
@@ -608,6 +619,7 @@ mod tests {
             SignalAvailability::Redacted,
             SignalAvailability::CollectionFailed,
             SignalAvailability::Unknown,
+            SignalAvailability::Disabled,
             SignalAvailability::Unrecognized("future_state".to_string()),
         ];
         for state in states {
