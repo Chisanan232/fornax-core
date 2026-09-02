@@ -9,6 +9,7 @@ use fornax_types::{
 };
 use uuid::Uuid;
 
+pub mod decision;
 pub mod fusion;
 
 pub trait Verifier {
