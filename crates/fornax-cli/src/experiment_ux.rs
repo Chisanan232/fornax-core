@@ -62,7 +62,7 @@ use std::path::{Path, PathBuf};
 use clap::Subcommand;
 use fornax_experiment_runner::{
     is_permitted, Cancellation, ExperimentExecutor, GlobalExperimentPolicy,
-    InterventionObservation, InterventionObserver,
+    InterventionObservation, InterventionObserver, StagedWorktree,
 };
 use fornax_types::causal::{causal_evidence_from_experiment_result, CausalExperimentEvidence};
 use fornax_types::experiment::{ExperimentResult, ExperimentSpec, SideEffectClass};
@@ -327,7 +327,7 @@ fn observation_evidence_id(experiment_id: Uuid, version: u32, path: &str) -> Uui
 pub struct RevertAppliedObserver;
 
 impl InterventionObserver for RevertAppliedObserver {
-    fn observe(&self, staged_root: &Path, spec: &ExperimentSpec) -> InterventionObservation {
+    fn observe(&self, staged: &StagedWorktree, spec: &ExperimentSpec) -> InterventionObservation {
         let no_relation = |summary: String| InterventionObservation {
             evidence_ids: vec![],
             relation: None,
@@ -357,7 +357,16 @@ impl InterventionObserver for RevertAppliedObserver {
             );
         };
 
-        match std::fs::read_to_string(staged_root.join(path)) {
+        let resolved = match staged.resolve_contained(path) {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                return no_relation(format!(
+                    "'{path}' does not resolve to a location inside the staged copy: {e}"
+                ))
+            }
+        };
+
+        match std::fs::read_to_string(resolved) {
             Ok(actual) if actual == expected_content => InterventionObservation {
                 evidence_ids: vec![observation_evidence_id(spec.id, spec.version, path)],
                 relation: Some(EvidenceRelation::Supports),
@@ -395,6 +404,13 @@ pub enum RunOutcome {
 /// Runs `spec` against `source_root`, staging under `staging_root`, after
 /// checking [`check_policy_gate`] first (AC3: a denied higher-risk class
 /// must block the run outright, never silently downgrade it).
+///
+/// Sweeps `staging_root` for orphaned directories a killed prior run left
+/// behind before provisioning a new one — `fornax_experiment_runner::orphan`'s
+/// own module docs document this as every executor caller's responsibility
+/// (FORNX-107 security review: this was previously never invoked from any
+/// production entry point, so a killed `fornax experiment run` left a full
+/// copy of the working tree on disk indefinitely).
 pub fn run_experiment(
     spec: &ExperimentSpec,
     source_root: &Path,
@@ -407,6 +423,13 @@ pub fn run_experiment(
             denied_classes: gate.denied_classes,
         };
     }
+
+    // Best-effort: an orphan sweep failing (e.g. a permission-denied entry)
+    // must never block a legitimate run.
+    let _ = fornax_experiment_runner::sweep_orphaned_staging_dirs(
+        staging_root,
+        fornax_experiment_runner::DEFAULT_ORPHAN_MAX_AGE,
+    );
 
     let observer = RevertAppliedObserver;
     let executor = ExperimentExecutor {
@@ -889,25 +912,50 @@ mod tests {
 
     #[test]
     fn revert_applied_observer_reports_no_relation_when_content_does_not_match() {
-        let staged = temp_dir("observer-mismatch");
-        std::fs::write(staged.join("claimed.txt"), b"something else\n").unwrap();
+        let source_root = temp_dir("observer-mismatch-source");
+        std::fs::write(source_root.join("claimed.txt"), b"something else\n").unwrap();
+        let staging_root_dir = temp_dir("observer-mismatch-staging-root");
+        let staged = StagedWorktree::provision(&staging_root_dir, &source_root).unwrap();
         let spec = low_risk_spec();
         let observation = RevertAppliedObserver.observe(&staged, &spec);
         assert_eq!(observation.relation, None);
         assert!(observation.evidence_ids.is_empty());
-        std::fs::remove_dir_all(&staged).ok();
+        std::fs::remove_dir_all(&source_root).ok();
     }
 
     #[test]
     fn revert_applied_observer_is_deterministic() {
-        let staged = temp_dir("observer-deterministic");
-        std::fs::write(staged.join("claimed.txt"), b"after\n").unwrap();
+        let source_root = temp_dir("observer-deterministic-source");
+        std::fs::write(source_root.join("claimed.txt"), b"after\n").unwrap();
+        let staging_root_dir = temp_dir("observer-deterministic-staging-root");
+        let staged = StagedWorktree::provision(&staging_root_dir, &source_root).unwrap();
         let spec = low_risk_spec();
         let a = RevertAppliedObserver.observe(&staged, &spec);
         let b = RevertAppliedObserver.observe(&staged, &spec);
         assert_eq!(a.evidence_ids, b.evidence_ids);
         assert_eq!(a.relation, b.relation);
-        std::fs::remove_dir_all(&staged).ok();
+        std::fs::remove_dir_all(&source_root).ok();
+    }
+
+    /// Regression test for the FORNX-107 security-review finding that
+    /// `InterventionObserver` previously took a bare `&Path`, giving
+    /// implementations no way to route through
+    /// `StagedWorktree::resolve_contained` — a path that escapes the staged
+    /// copy must be refused, not silently joined against the root.
+    #[test]
+    fn revert_applied_observer_refuses_a_traversal_path() {
+        let source_root = temp_dir("observer-traversal-source");
+        let staging_root_dir = temp_dir("observer-traversal-staging-root");
+        let staged = StagedWorktree::provision(&staging_root_dir, &source_root).unwrap();
+        let mut spec = low_risk_spec();
+        spec.intervention.params = serde_json::json!({
+            "path": "../../../../etc/passwd",
+            "content": "irrelevant"
+        });
+        let observation = RevertAppliedObserver.observe(&staged, &spec);
+        assert_eq!(observation.relation, None);
+        assert!(observation.evidence_ids.is_empty());
+        std::fs::remove_dir_all(&source_root).ok();
     }
 
     // --- Templates catalog (AC1) --------------------------------------------

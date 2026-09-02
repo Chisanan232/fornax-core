@@ -90,7 +90,7 @@ struct FixedObserver {
 }
 
 impl InterventionObserver for FixedObserver {
-    fn observe(&self, _staged_root: &Path, _spec: &ExperimentSpec) -> InterventionObservation {
+    fn observe(&self, _staged: &StagedWorktree, _spec: &ExperimentSpec) -> InterventionObservation {
         InterventionObservation {
             evidence_ids: self.evidence_ids.clone(),
             relation: self.relation,
