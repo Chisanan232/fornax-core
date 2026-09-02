@@ -838,6 +838,8 @@ mod tests {
                     &fornax_types::TrustClass::HostObserved,
                     &fornax_types::CollectionMethod::ProcessObservation,
                 ),
+                correlation_group: None,
+                derived_from: Vec::new(),
             }),
             extension: None,
         };
@@ -1257,6 +1259,77 @@ mod tests {
         assert_eq!(
             rewritten_source.tamper_boundary.description,
             "unknown (record predates tamper-boundary tracking)"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// FORNX-92: a row written before `correlation_group`/`derived_from`
+    /// existed (a FORNX-157/159-era `EvidenceSource` blob) must read those
+    /// two fields back as their honest empty defaults (`None`, `[]`), never
+    /// a fabricated correlation group or origin — mirrors
+    /// `pre_migration_evidence_source_reads_back_new_fields_as_honest_unknown`
+    /// above for the same reason: no new `fornax-store` column was added,
+    /// so the honesty guarantee lives entirely in `EvidenceSource`'s
+    /// `#[serde(default)]`s, proven here through a full store round trip.
+    #[tokio::test]
+    async fn pre_fornx_92_evidence_source_reads_back_correlation_fields_as_honest_empty() {
+        let path = tmp_db_path("evidence-source-pre-fornx-92");
+        let store = Store::open(&path).await.expect("open db");
+
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "s6c".into(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: Some("Bash".into()),
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        store.insert_event(&event).await.expect("insert event");
+
+        // The exact shape FORNX-157/159 persisted: no correlation_group,
+        // no derived_from key at all.
+        let legacy_source_json = serde_json::json!({
+            "sensor_name": "claude_bash_exit_code_sensor_v1",
+            "trust_class": "agent_adjacent",
+            "collected_at": "2026-01-01T00:00:01Z",
+            "provider": "claude_code",
+            "collection_method": "hook_callback",
+        })
+        .to_string();
+
+        sqlx::query(
+            "INSERT INTO evidence (id, session_id, source_event_id, kind, observed_at, payload, provenance, source)
+             VALUES (?1, 's6c', ?2, 'exit_code', '2026-01-01T00:00:01Z', '{\"exit_code\":0}', 'legacy', ?3)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(event.id.to_string())
+        .bind(&legacy_source_json)
+        .execute(&store.pool)
+        .await
+        .expect("hand-insert pre-FORNX-92 evidence row");
+
+        let fetched = store
+            .evidence_for_session("s6c")
+            .await
+            .expect("query evidence")
+            .evidence;
+        assert_eq!(fetched.len(), 1);
+        let source = fetched[0]
+            .source
+            .as_ref()
+            .expect("legacy source blob must still deserialize, not become None");
+
+        assert_eq!(
+            source.correlation_group, None,
+            "missing correlation_group must not be fabricated"
+        );
+        assert!(
+            source.derived_from.is_empty(),
+            "missing derived_from must not be fabricated"
         );
 
         std::fs::remove_file(&path).ok();

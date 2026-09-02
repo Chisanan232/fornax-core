@@ -29,7 +29,11 @@ pub use capabilities::{
 pub use extension::{
     ContentClass, ExtensionEnvelope, EXTENSION_SCHEMA_VERSION, SUPPORTED_EXTENSION_SCHEMA_VERSIONS,
 };
-pub use graph::{EvidenceGraph, EvidenceLink, EvidenceRelation, MissingEvidence};
+pub use graph::{
+    staleness_of, staleness_of_default, EvidenceConflict, EvidenceGraph, EvidenceLink,
+    EvidenceRelation, FreshnessWindow, MissingEvidence, StalenessAssessment,
+    DEFAULT_EXIT_CODE_FRESHNESS_SECONDS,
+};
 pub use sensor::{
     collect_with_disable_check, ClockSource, CollectionMethod, EvidenceSensor, EvidenceSource,
     Freshness, SensorOutcome, TamperBoundary, TrustClass,

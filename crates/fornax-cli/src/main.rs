@@ -829,6 +829,23 @@ fn render_evidence_graph(v: &serde_json::Value) -> String {
     if links.is_empty() {
         out.push_str("  no evidence linked to this claim\n");
     } else {
+        // FORNX-92 AC: "Conflicts remain inspectable in Evidence Explorer" —
+        // surface, but do not resolve, a claim carrying both a `supports`
+        // and a `contradicts` link.
+        let supports_count = links
+            .iter()
+            .filter(|l| l.get("relation").and_then(|r| r.as_str()) == Some("supports"))
+            .count();
+        let contradicts_count = links
+            .iter()
+            .filter(|l| l.get("relation").and_then(|r| r.as_str()) == Some("contradicts"))
+            .count();
+        if supports_count > 0 && contradicts_count > 0 {
+            out.push_str(&format!(
+                "  ⚠ conflict: {supports_count} supports vs {contradicts_count} contradicts (unresolved)\n"
+            ));
+        }
+
         let known_relations = ["supports", "contradicts", "neutral"];
         // Forward-compat: a link whose relation is not one of the three
         // known states must still be shown, not silently dropped — the AC
@@ -1072,6 +1089,37 @@ mod tests {
         let rendered = render_evidence_graph(&v);
         assert!(rendered.contains("evidence: e1"));
         assert!(rendered.contains("quantum_pending (1)"));
+    }
+
+    /// FORNX-92 AC: "Conflicts remain inspectable in Evidence Explorer" —
+    /// a claim with both a supports and a contradicts link must render a
+    /// distinct conflict banner, without resolving which side is right.
+    #[test]
+    fn render_evidence_graph_surfaces_a_conflict_banner_for_opposing_links() {
+        let v = serde_json::json!({
+            "claim": "c1", "session": "s1", "found": true,
+            "links": [
+                {"evidence_id": "e1", "relation": "supports", "linked_at": "2026-09-01T00:00:00Z"},
+                {"evidence_id": "e2", "relation": "contradicts", "linked_at": "2026-09-01T00:00:01Z"},
+            ],
+            "missing": [],
+        });
+        let rendered = render_evidence_graph(&v);
+        assert!(rendered.contains("⚠ conflict: 1 supports vs 1 contradicts (unresolved)"));
+    }
+
+    /// No conflict banner when links agree.
+    #[test]
+    fn render_evidence_graph_shows_no_conflict_banner_when_links_agree() {
+        let v = serde_json::json!({
+            "claim": "c1", "session": "s1", "found": true,
+            "links": [
+                {"evidence_id": "e1", "relation": "supports", "linked_at": "2026-09-01T00:00:00Z"},
+            ],
+            "missing": [],
+        });
+        let rendered = render_evidence_graph(&v);
+        assert!(!rendered.contains("conflict"));
     }
 
     /// FORNX-90 regression: a daemon-side error must render as its own
@@ -1880,6 +1928,8 @@ trust_level = \"trusted\"\n";
                         &fornax_types::TrustClass::AgentAdjacent,
                         &fornax_types::CollectionMethod::FilePoll,
                     ),
+                    correlation_group: None,
+                    derived_from: Vec::new(),
                 }),
                 extension: None,
             };
