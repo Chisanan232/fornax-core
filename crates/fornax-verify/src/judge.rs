@@ -130,7 +130,15 @@ pub enum JudgeError {
 /// Deliberately narrow and structured — never unrestricted repo/file access:
 /// a claim's text plus a bounded, already-collected evidence excerpt, not a
 /// filesystem or shell handle the model could use to go fetch more.
-#[derive(Debug, Clone)]
+///
+/// `Serialize`/`Deserialize` (FORNX-94 replay AC: "same *saved* input can be
+/// replayed against judge versions for comparison") -- every field is a
+/// plain `String`/`bool`, so a `JudgeInput` can be written to disk once and
+/// fed to two different [`SemanticJudgeProvider`]s (or the same provider
+/// under two [`SemanticJudgeConfig`]s) later, producing two [`JudgeOutput`]s
+/// whose `model`/`prompt_version`/`called_at` are directly comparable. See
+/// `judge_tests::a_saved_judge_input_can_be_replayed_against_two_different_judge_configs`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JudgeInput {
     /// The claim under evaluation.
     pub claim_text: String,
@@ -706,6 +714,24 @@ impl SemanticJudgeProvider for LocalSelfHostedJudgeProvider {
 /// input evidence carried) — see module docs: a judge output must never
 /// silently inherit a higher/independent trust class than `ModelInternal`,
 /// regardless of what it was derived from.
+///
+/// `kind` is [`EvidenceKind::ToolResult`] — a deliberate choice among
+/// today's five [`EvidenceKind`] variants, not the accidental default: a
+/// judge verdict is not `ExitCode` (no exit code), `FileDiff`/
+/// `ProcessObservation` (nothing was diffed or process-observed), or
+/// `TranscriptExcerpt` (it is a synthesized opinion, not a quoted
+/// transcript). `ToolResult` — an opaque structured payload from something
+/// that was invoked and returned a result — is the closest existing fit for
+/// "a bounded, structured response from an invoked tool-like thing", which
+/// is exactly what an HTTP call to the judge endpoint is. One real
+/// consequence follows from this choice, also deliberate:
+/// [`EvidenceKind::default_freshness_window`] maps `ToolResult` to
+/// [`fornax_types::FreshnessWindow::Durable`], so fusion's R4 staleness rule
+/// (`fornax_verify::fusion`) never demotes a judge-supporting vote purely
+/// for elapsed time — a recorded opinion about a claim does not go stale
+/// the way a live process exit code does. A future dedicated
+/// `EvidenceKind::ModelJudgment` variant would be a reasonable follow-up if
+/// judge evidence needs its own freshness policy later.
 pub fn judge_output_to_evidence(
     output: &JudgeOutput,
     session_id: &str,
@@ -1097,16 +1123,50 @@ mod judge_tests {
 
     #[test]
     fn judge_disabled_by_default_never_participates_unless_configured() {
-        let cfg = SemanticJudgeConfig::load_default();
-        // On a machine/CI with no $FORNAX_HOME/config.toml (or one without
-        // a [semantic_judge] table), the judge is off by default -- this is
-        // the guarantee that deterministic fusion/decision never implicitly
-        // depend on it.
-        if !std::path::Path::new(&fornax_types::sensor_config::default_fornax_home())
-            .join(fornax_types::sensor_config::SENSOR_CONFIG_FILE)
-            .exists()
-        {
-            assert!(!cfg.enabled);
-        }
+        // A fresh, never-touched $FORNAX_HOME directory (no config.toml at
+        // all) -- deterministic, unlike asserting against this test
+        // machine's real $FORNAX_HOME -- is off by default. This is the
+        // guarantee that deterministic fusion/decision never implicitly
+        // depend on the judge.
+        let dir = std::env::temp_dir().join(format!("fornax-judge-config-test-{}", Uuid::new_v4()));
+        let cfg = SemanticJudgeConfig::load(&dir).unwrap();
+        assert!(!cfg.enabled);
+    }
+
+    // --- Replay: same saved input against two different judge configs ----
+
+    #[test]
+    fn a_saved_judge_input_can_be_replayed_against_two_different_judge_configs() {
+        let c = claim();
+        let graph = EvidenceGraph::default();
+        let input = JudgeInput::from_claim_and_graph(&c, &graph, &[], false);
+
+        // Simulate "saved to disk, loaded back later" via a real JSON
+        // round-trip -- the FORNX-94 replay AC is specifically about a
+        // *saved* input, not merely an in-memory value reused twice.
+        let saved = serde_json::to_string(&input).unwrap();
+        let reloaded: JudgeInput = serde_json::from_str(&saved).unwrap();
+
+        let provider_a = LocalSelfHostedJudgeProvider::new(SemanticJudgeConfig {
+            enabled: true,
+            model: "llama3.1".into(),
+            ..Default::default()
+        });
+        let provider_b = LocalSelfHostedJudgeProvider::new(SemanticJudgeConfig {
+            enabled: true,
+            model: "mixtral".into(),
+            ..Default::default()
+        });
+
+        let output_a = provider_a.judge(&reloaded).unwrap();
+        let output_b = provider_b.judge(&reloaded).unwrap();
+
+        // Same saved input, two judge versions -- outputs are independently
+        // comparable via their own recorded model/prompt_version metadata.
+        assert_eq!(output_a.model, "llama3.1");
+        assert_eq!(output_b.model, "mixtral");
+        assert_ne!(output_a.model, output_b.model);
+        assert_eq!(output_a.prompt_version, JUDGE_PROMPT_VERSION);
+        assert_eq!(output_b.prompt_version, JUDGE_PROMPT_VERSION);
     }
 }
