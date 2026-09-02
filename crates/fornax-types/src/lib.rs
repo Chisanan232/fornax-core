@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 pub mod adapter;
 pub mod capabilities;
+pub mod experiment;
 pub mod extension;
 pub mod graph;
 pub mod privacy;
@@ -25,6 +26,12 @@ pub use adapter::{AgentAdapter, NormalizationOutcome};
 pub use capabilities::{
     CapabilityProbe, CapabilitySignal, LegacyCapabilitiesWire, RuntimeCapabilities,
     SignalAvailability, SignalClass, CAPABILITY_SCHEMA_VERSION,
+};
+pub use experiment::{
+    Baseline, CompletedExperiment, ExpectedObservation, ExperimentKind, ExperimentOutcome,
+    ExperimentProvenance, ExperimentResult, ExperimentSpec, Hypothesis, Intervention,
+    SideEffectAllowList, SideEffectClass, StopCondition, EXPERIMENT_SCHEMA_VERSION,
+    SUPPORTED_EXPERIMENT_SCHEMA_VERSIONS,
 };
 pub use extension::{
     ContentClass, ExtensionEnvelope, EXTENSION_SCHEMA_VERSION, SUPPORTED_EXTENSION_SCHEMA_VERSIONS,
