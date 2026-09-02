@@ -33,6 +33,20 @@ enum Commands {
         /// Session id to look up.
         session: String,
     },
+    /// Claim-centered evidence graph (FORNX-90, local half): every typed
+    /// claim-to-evidence link plus every explicit missing-evidence note for
+    /// one claim, grouped by relation. Reads `GET /api/evidence-graph` on
+    /// the daemon (`fornax-store::Store::evidence_graph_for_claim`,
+    /// FORNX-89). Never collapses the graph into a single count/score — a
+    /// claim with genuinely zero evidence renders differently from one with
+    /// evidence explicitly noted missing, which renders differently again
+    /// from a claim id the daemon has never seen.
+    EvidenceGraph {
+        /// Claim id to look up.
+        claim: String,
+        /// Session id the claim belongs to.
+        session: String,
+    },
     /// Export one session's events/claims/evidence/capabilities from the
     /// local store into a directory-based spool, as one wire-compatible
     /// envelope JSON file per message (FORNX-60, FORNX-62). Reads
@@ -116,6 +130,18 @@ async fn main() -> anyhow::Result<()> {
             let url = format!("{}/api/capabilities?session={}", base_url(), session);
             match fetch_json(&url).await {
                 Ok(v) => print!("{}", render_capabilities(&v)),
+                Err(_) => println!("fornax: daemon unreachable (is `fornax-daemon` running?)"),
+            }
+        }
+        Commands::EvidenceGraph { claim, session } => {
+            let url = format!(
+                "{}/api/evidence-graph?claim={}&session={}",
+                base_url(),
+                claim,
+                session
+            );
+            match fetch_json(&url).await {
+                Ok(v) => print!("{}", render_evidence_graph(&v)),
                 Err(_) => println!("fornax: daemon unreachable (is `fornax-daemon` running?)"),
             }
         }
@@ -733,6 +759,142 @@ fn render_capabilities(v: &serde_json::Value) -> String {
             }
         }
     }
+    out
+}
+
+/// Icon for an `EvidenceRelation`, mirroring `verdict_icon`/`availability_icon`'s
+/// distinct-per-state convention (FORNX-90). An unrecognized tag is shown
+/// verbatim rather than mapped onto an existing relation.
+fn relation_icon(relation: &str) -> &'static str {
+    match relation {
+        "supports" => "✚",
+        "contradicts" => "✕",
+        "neutral" => "•",
+        _ => "◌",
+    }
+}
+
+/// Renders `GET /api/evidence-graph`'s response (FORNX-90, local Evidence
+/// Explorer): every linked-evidence relation grouped by
+/// `EvidenceRelation`, plus every missing-evidence note, each item shown
+/// individually rather than collapsed into a count. Returns the rendered
+/// text (rather than printing directly) so it can be asserted on in tests,
+/// the same shape as `render_capabilities`.
+///
+/// Deliberately renders three distinguishable outcomes for the same "empty
+/// links" surface state, the core product invariant this ticket exists
+/// for: the claim id is unknown to the daemon at all; the claim exists but
+/// nobody has linked or noted anything ("nobody has looked"); and the claim
+/// exists with evidence explicitly noted missing even though no link exists
+/// ("looked, but it could not be collected").
+fn render_evidence_graph(v: &serde_json::Value) -> String {
+    let mut out = String::new();
+    let claim = v.get("claim").and_then(|s| s.as_str()).unwrap_or("?");
+    let session = v.get("session").and_then(|s| s.as_str()).unwrap_or("?");
+    out.push_str(&format!("claim: {claim}\nsession: {session}\n"));
+
+    // A daemon-side error (e.g. a store read failure) carries no `found`
+    // key at all — must be reported as its own distinct outcome, never
+    // defaulted into the "claim not found" case (that would conflate "we
+    // don't know" with "we looked and it's absent").
+    if let Some(error) = v.get("error").and_then(|s| s.as_str()) {
+        out.push_str(&format!("  error: {error}\n"));
+        return out;
+    }
+
+    let found = v.get("found").and_then(|b| b.as_bool()).unwrap_or(false);
+    if !found {
+        let reason = v
+            .get("reason")
+            .and_then(|s| s.as_str())
+            .unwrap_or("no claim with this id is on record for this session");
+        out.push_str(&format!("  no such claim on record ({reason})\n"));
+        return out;
+    }
+
+    let empty = vec![];
+    let links = v.get("links").and_then(|l| l.as_array()).unwrap_or(&empty);
+    let missing = v
+        .get("missing")
+        .and_then(|m| m.as_array())
+        .unwrap_or(&empty);
+
+    if links.is_empty() && missing.is_empty() {
+        out.push_str(
+            "  no evidence linked and no missing-evidence notes recorded for this claim\n",
+        );
+        return out;
+    }
+
+    if links.is_empty() {
+        out.push_str("  no evidence linked to this claim\n");
+    } else {
+        let known_relations = ["supports", "contradicts", "neutral"];
+        // Forward-compat: a link whose relation is not one of the three
+        // known states must still be shown, not silently dropped — the AC
+        // requires every item to appear, never a collapsed count.
+        let mut unrecognized_relations: Vec<&str> = links
+            .iter()
+            .filter_map(|l| l.get("relation").and_then(|r| r.as_str()))
+            .filter(|r| !known_relations.contains(r))
+            .collect();
+        unrecognized_relations.sort_unstable();
+        unrecognized_relations.dedup();
+
+        for relation in known_relations
+            .iter()
+            .copied()
+            .chain(unrecognized_relations.iter().copied())
+        {
+            let group: Vec<&serde_json::Value> = links
+                .iter()
+                .filter(|l| l.get("relation").and_then(|r| r.as_str()) == Some(relation))
+                .collect();
+            if group.is_empty() {
+                continue;
+            }
+            out.push_str(&format!(
+                "  {} {} ({})\n",
+                relation_icon(relation),
+                relation,
+                group.len()
+            ));
+            for link in group {
+                let evidence_id = link
+                    .get("evidence_id")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("?");
+                let linked_at = link
+                    .get("linked_at")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("?");
+                out.push_str(&format!(
+                    "    evidence: {evidence_id}  linked_at: {linked_at}\n"
+                ));
+            }
+        }
+    }
+
+    if !missing.is_empty() {
+        out.push_str(&format!("  ◌ missing ({})\n", missing.len()));
+        for note in missing {
+            let signal_class = note
+                .get("signal_class")
+                .and_then(|s| s.as_str())
+                .unwrap_or("?");
+            let availability = note
+                .get("availability")
+                .and_then(|s| s.as_str())
+                .unwrap_or("?");
+            match note.get("detail").and_then(|s| s.as_str()) {
+                Some(detail) => {
+                    out.push_str(&format!("    {signal_class}: {availability} ({detail})\n"))
+                }
+                None => out.push_str(&format!("    {signal_class}: {availability}\n")),
+            }
+        }
+    }
+
     out
 }
 
