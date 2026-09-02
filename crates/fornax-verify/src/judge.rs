@@ -246,17 +246,18 @@ fn evidence_payload_summary(evidence: &Evidence, allow_raw_evidence: bool) -> St
             .get("exit_code")
             .map(|v| format!("exit_code={v}"))
             .unwrap_or_else(|| "exit_code=<unknown>".to_string()),
-        _ => {
-            let s = evidence.payload.to_string();
-            let truncated: String = s.chars().take(200).collect();
-            truncated
-        }
+        _ => evidence.payload.to_string(),
     };
-    if allow_raw_evidence {
+    // Redact before truncating: a secret whose matchable span straddles the
+    // 200-char cut would otherwise have only a short prefix survive into an
+    // already-truncated redaction pass, since the detectors need the whole
+    // span to recognize it.
+    let redacted = if allow_raw_evidence {
         raw
     } else {
         redact_text(&raw)
-    }
+    };
+    redacted.chars().take(200).collect()
 }
 
 /// Structured verdict-shaped signal returned by one [`SemanticJudgeProvider::judge`]
@@ -585,10 +586,20 @@ fn parse_model_response(content: &str) -> (JudgeVerdict, String) {
     let mut lines = trimmed.splitn(2, '\n');
     let first = lines.next().unwrap_or("").trim().to_uppercase();
     let rest = lines.next().unwrap_or("").trim().to_string();
-    let verdict = if first.contains("SUPPORTED") {
-        JudgeVerdict::Supported
-    } else if first.contains("CONTRADICTED") {
+    // "CONTRADICTED" is checked first, and a negated "UNSUPPORTED"/"NOT
+    // SUPPORTED" reply is treated as unrecognized (falls to Inconclusive)
+    // rather than matched by `contains("SUPPORTED")` -- that substring
+    // check alone would silently invert a negated answer to `Supported`,
+    // the opposite of what the model said. The prompt asks for one of
+    // exactly three words; anything else is honestly reported as
+    // Inconclusive rather than guessed.
+    let verdict = if first.contains("CONTRADICTED") {
         JudgeVerdict::Contradicted
+    } else if first.contains("SUPPORTED")
+        && !first.contains("UNSUPPORTED")
+        && !first.contains("NOT SUPPORTED")
+    {
+        JudgeVerdict::Supported
     } else {
         JudgeVerdict::Inconclusive
     };
@@ -932,6 +943,33 @@ mod judge_tests {
         assert!(!input.allow_raw_evidence);
     }
 
+    /// Regression test for a security-review finding: redaction must run
+    /// before truncation, not after. A secret placed just past the 200-char
+    /// cut previously survived (only its short, truncated-away prefix was
+    /// exposed to redaction) because the payload was sliced to 200 chars
+    /// first; redacting the full payload before truncating catches it.
+    #[test]
+    fn evidence_payload_summary_redacts_a_secret_that_straddles_the_truncation_boundary() {
+        let padding = "x".repeat(190);
+        let secret = "ghp_aaaabbbbccccddddeeeeffffgggghhhhiiii"; // GitHub-token-shaped
+        let ev = Evidence {
+            id: Uuid::new_v4(),
+            session_id: "s1".into(),
+            source_event_id: Uuid::new_v4(),
+            kind: EvidenceKind::ProcessObservation,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            payload: serde_json::json!({"note": format!("{padding}{secret}")}),
+            provenance: "test".into(),
+            source: None,
+            extension: None,
+        };
+        let summary = evidence_payload_summary(&ev, false);
+        assert!(
+            !summary.contains(secret),
+            "secret must not survive redaction regardless of where it falls relative to the 200-char cut"
+        );
+    }
+
     #[test]
     fn from_claim_and_graph_summarizes_links_and_missing_notes() {
         let c = claim();
@@ -1060,6 +1098,20 @@ mod judge_tests {
         let (v, rationale) = parse_model_response("uh, I think maybe yes?");
         assert_eq!(v, JudgeVerdict::Inconclusive);
         assert!(!rationale.is_empty());
+    }
+
+    /// Regression test for a real verdict-inversion bug found in security
+    /// review: "UNSUPPORTED"/"NOT SUPPORTED" both contain the substring
+    /// "SUPPORTED", so a naive `contains("SUPPORTED")` check (checked before
+    /// "CONTRADICTED") flipped a negated reply to `Supported` -- the
+    /// opposite of what the model said, with no attacker-controlled HTTP
+    /// call needed, just word choice in the model's own reply.
+    #[test]
+    fn parse_model_response_does_not_invert_a_negated_supported_reply() {
+        let (v, _) = parse_model_response("UNSUPPORTED\nthe evidence does not back this up");
+        assert_eq!(v, JudgeVerdict::Inconclusive);
+        let (v, _) = parse_model_response("NOT SUPPORTED\nno backing evidence");
+        assert_eq!(v, JudgeVerdict::Inconclusive);
     }
 
     // --- Config loading ---
