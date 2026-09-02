@@ -236,7 +236,13 @@ pub enum StalenessAssessment {
     /// `observed_at`/`claimed_at` could not be parsed as RFC3339, or
     /// evidence was observed *after* the claim was made (a negative age) —
     /// both are "cannot vouch for freshness", never silently coerced to
-    /// `Fresh`.
+    /// `Fresh`. Note that a claim and its supporting evidence commonly land
+    /// within the same event (e.g. an `ExitCode` claim/evidence pair from one
+    /// `PostToolUse`), so sub-second clock ordering can be the difference
+    /// between `Fresh { age_seconds: 0 }` and this variant — that is this
+    /// function's deliberate, conservative choice, not a bug; FORNX-93 may
+    /// reasonably choose to treat "observed slightly after the claim" as
+    /// fresh for a specific claim kind rather than indeterminate.
     Indeterminate { reason: &'static str },
 }
 
