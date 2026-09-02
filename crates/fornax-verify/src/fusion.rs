@@ -813,3 +813,1024 @@ pub fn project_graph(claim: &Claim, findings: &[Finding]) -> EvidenceGraph {
     EvidenceGraph { links, missing }
 }
 
+#[cfg(test)]
+mod fusion_tests {
+    use super::*;
+    use fornax_types::{ClockSource, CollectionMethod, EvidenceKind, EvidenceSource, TrustClass};
+
+    fn claim() -> Claim {
+        Claim {
+            id: Uuid::new_v4(),
+            session_id: "s1".into(),
+            source_event_id: Uuid::new_v4(),
+            text: "the command exited successfully".into(),
+            subject: "command_succeeded".into(),
+            claimed_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    fn evidence(kind: EvidenceKind, observed_at: &str) -> Evidence {
+        Evidence {
+            id: Uuid::new_v4(),
+            session_id: "s1".into(),
+            source_event_id: Uuid::new_v4(),
+            kind,
+            observed_at: observed_at.into(),
+            payload: serde_json::json!({}),
+            provenance: "test".into(),
+            source: None,
+            extension: None,
+        }
+    }
+
+    fn link(claim_id: Uuid, evidence_id: Uuid, relation: EvidenceRelation) -> EvidenceLink {
+        EvidenceLink {
+            id: Uuid::new_v4(),
+            session_id: "s1".into(),
+            claim_id,
+            evidence_id,
+            relation,
+            linked_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    fn missing(claim_id: Uuid, availability: SignalAvailability) -> MissingEvidence {
+        MissingEvidence {
+            id: Uuid::new_v4(),
+            session_id: "s1".into(),
+            claim_id,
+            signal_class: SignalClass::ProcessResult,
+            availability,
+            detail: None,
+            noted_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    fn source_with_group(group: Uuid) -> EvidenceSource {
+        EvidenceSource {
+            sensor_name: "test_sensor".into(),
+            trust_class: TrustClass::AgentAdjacent,
+            collected_at: "2026-01-01T00:00:00Z".into(),
+            provider: None,
+            collection_method: CollectionMethod::HookCallback,
+            collector_version: None,
+            freshness: fornax_types::Freshness {
+                clock_source: ClockSource::HostClock,
+                caveat: None,
+            },
+            tamper_boundary: Default::default(),
+            correlation_group: Some(group),
+            derived_from: vec![],
+        }
+    }
+
+    // --- 1. Determinism / replay -----------------------------------------
+
+    #[test]
+    fn fuse_is_deterministic_across_shuffled_link_order() {
+        let c = claim();
+        let ev1 = evidence(EvidenceKind::ExitCode, "2026-01-01T00:00:00Z");
+        let ev2 = evidence(EvidenceKind::ExitCode, "2026-01-01T00:00:00Z");
+        let ev3 = evidence(EvidenceKind::ExitCode, "2026-01-01T00:00:00Z");
+        let l1 = link(c.id, ev1.id, EvidenceRelation::Supports);
+        let l2 = link(c.id, ev2.id, EvidenceRelation::Supports);
+        let l3 = link(c.id, ev3.id, EvidenceRelation::Contradicts);
+        let evidence_pool = vec![ev1, ev2, ev3];
+
+        let graph_a = EvidenceGraph {
+            links: vec![l1.clone(), l2.clone(), l3.clone()],
+            missing: vec![],
+        };
+        let graph_b = EvidenceGraph {
+            links: vec![l3, l1, l2],
+            missing: vec![],
+        };
+
+        let policy = BaselineFusionPolicy;
+        let input_a = FusionInput {
+            claim: &c,
+            graph: &graph_a,
+            evidence: &evidence_pool,
+        };
+        let input_b = FusionInput {
+            claim: &c,
+            graph: &graph_b,
+            evidence: &evidence_pool,
+        };
+        let out_a = policy.fuse(&input_a, "2026-01-02T00:00:00Z");
+        let out_b = policy.fuse(&input_b, "2026-01-02T00:00:00Z");
+        assert_eq!(out_a, out_b);
+
+        // Calling twice on the identical input is also byte-identical.
+        let out_a_again = policy.fuse(&input_a, "2026-01-02T00:00:00Z");
+        assert_eq!(out_a, out_a_again);
+    }
+
+    // --- 2/3. Missing-only vs empty graph ---------------------------------
+
+    #[test]
+    fn missing_only_graph_is_unavailable_never_contradicted() {
+        let c = claim();
+        let m = missing(c.id, SignalAvailability::Unavailable);
+        let graph = EvidenceGraph {
+            links: vec![],
+            missing: vec![m.clone()],
+        };
+        let policy = BaselineFusionPolicy;
+        let input = FusionInput {
+            claim: &c,
+            graph: &graph,
+            evidence: &[],
+        };
+        let out = policy.fuse(&input, "2026-01-02T00:00:00Z");
+        assert_eq!(out.verdict, Verdict::Unavailable);
+        assert_ne!(out.verdict, Verdict::Contradicted);
+        assert_eq!(out.missing_evidence_ids, vec![m.id]);
+        assert!(out
+            .rationale
+            .iter()
+            .any(|r| r.missing_evidence_ids.contains(&m.id)));
+    }
+
+    #[test]
+    fn empty_graph_differs_from_missing_only_graph() {
+        let c = claim();
+        let empty_graph = EvidenceGraph::default();
+        let missing_graph = EvidenceGraph {
+            links: vec![],
+            missing: vec![missing(c.id, SignalAvailability::Unavailable)],
+        };
+        let policy = BaselineFusionPolicy;
+
+        let empty_out = policy.fuse(
+            &FusionInput {
+                claim: &c,
+                graph: &empty_graph,
+                evidence: &[],
+            },
+            "2026-01-02T00:00:00Z",
+        );
+        let missing_out = policy.fuse(
+            &FusionInput {
+                claim: &c,
+                graph: &missing_graph,
+                evidence: &[],
+            },
+            "2026-01-02T00:00:00Z",
+        );
+
+        assert_eq!(empty_out.verdict, Verdict::Unverified);
+        assert_eq!(missing_out.verdict, Verdict::Unavailable);
+        assert_ne!(empty_out.verdict, missing_out.verdict);
+    }
+
+    // --- 4. Conflict agrees with EvidenceGraph::conflict -------------------
+
+    #[test]
+    fn supports_and_contradicts_produce_review_and_agree_with_graph_conflict() {
+        let c = claim();
+        let ev_s = evidence(EvidenceKind::ExitCode, "2026-01-01T00:00:00Z");
+        let ev_c = evidence(EvidenceKind::ExitCode, "2026-01-01T00:00:00Z");
+        let l_s = link(c.id, ev_s.id, EvidenceRelation::Supports);
+        let l_c = link(c.id, ev_c.id, EvidenceRelation::Contradicts);
+        let graph = EvidenceGraph {
+            links: vec![l_s, l_c],
+            missing: vec![],
+        };
+        assert!(graph.conflict().is_some());
+
+        let policy = BaselineFusionPolicy;
+        let input = FusionInput {
+            claim: &c,
+            graph: &graph,
+            evidence: &[ev_s, ev_c],
+        };
+        let out = policy.fuse(&input, "2026-01-02T00:00:00Z");
+        assert_eq!(out.verdict, Verdict::Review);
+        assert!(out.unresolved_conflict);
+        assert_eq!(out.uncertainty, UncertaintyBand::Conflicted);
+    }
+
+    // --- 5. Correlation collapse: 3-supports and 3-vs-1 conflict ----------
+
+    #[test]
+    fn three_correlated_supports_collapse_to_one_counted_vote() {
+        let c = claim();
+        let group = Uuid::new_v4();
+        let evs: Vec<Evidence> = (0..3)
+            .map(|_| {
+                let mut e = evidence(EvidenceKind::ExitCode, "2026-01-01T00:00:00Z");
+                e.source = Some(source_with_group(group));
+                e
+            })
+            .collect();
+        let links: Vec<EvidenceLink> = evs
+            .iter()
+            .map(|e| link(c.id, e.id, EvidenceRelation::Supports))
+            .collect();
+        let graph = EvidenceGraph {
+            links,
+            missing: vec![],
+        };
+        let policy = BaselineFusionPolicy;
+        let input = FusionInput {
+            claim: &c,
+            graph: &graph,
+            evidence: &evs,
+        };
+        let out = policy.fuse(&input, "2026-01-02T00:00:00Z");
+        assert_eq!(out.verdict, Verdict::Verified);
+        assert_eq!(out.counted_link_ids.len(), 1);
+        assert_eq!(out.discounted_link_ids.len(), 2);
+        assert!(out
+            .rationale
+            .iter()
+            .any(|r| r.rule == FusionRule::CorrelationCollapsed));
+    }
+
+    #[test]
+    fn three_supports_vs_one_contradict_in_one_group_still_resolves_to_review() {
+        let c = claim();
+        let group = Uuid::new_v4();
+        let support_evs: Vec<Evidence> = (0..3)
+            .map(|_| {
+                let mut e = evidence(EvidenceKind::ExitCode, "2026-01-01T00:00:00Z");
+                e.source = Some(source_with_group(group));
+                e
+            })
+            .collect();
+        let mut contradict_ev = evidence(EvidenceKind::ExitCode, "2026-01-01T00:00:00Z");
+        contradict_ev.source = Some(source_with_group(group));
+
+        let mut links: Vec<EvidenceLink> = support_evs
+            .iter()
+            .map(|e| link(c.id, e.id, EvidenceRelation::Supports))
+            .collect();
+        links.push(link(c.id, contradict_ev.id, EvidenceRelation::Contradicts));
+
+        let mut all_evs = support_evs;
+        all_evs.push(contradict_ev);
+
+        let graph = EvidenceGraph {
+            links,
+            missing: vec![],
+        };
+        let policy = BaselineFusionPolicy;
+        let input = FusionInput {
+            claim: &c,
+            graph: &graph,
+            evidence: &all_evs,
+        };
+        let out = policy.fuse(&input, "2026-01-02T00:00:00Z");
+        // NOT "supports wins 3-1" -- the group collapses to one vote per
+        // relation, leaving exactly one Supports vote vs one Contradicts
+        // vote, i.e. a genuine conflict.
+        assert_eq!(out.verdict, Verdict::Review);
+        assert!(out.unresolved_conflict);
+        assert_eq!(out.counted_link_ids.len(), 2);
+    }
+
+    // --- 6. Uncorrelated supports each count independently -----------------
+
+    #[test]
+    fn three_uncorrelated_supports_each_count_with_independence_unverified_caveat() {
+        let c = claim();
+        let evs: Vec<Evidence> = (0..3)
+            .map(|_| evidence(EvidenceKind::ExitCode, "2026-01-01T00:00:00Z"))
+            .collect();
+        let links: Vec<EvidenceLink> = evs
+            .iter()
+            .map(|e| link(c.id, e.id, EvidenceRelation::Supports))
+            .collect();
+        let graph = EvidenceGraph {
+            links,
+            missing: vec![],
+        };
+        let policy = BaselineFusionPolicy;
+        let input = FusionInput {
+            claim: &c,
+            graph: &graph,
+            evidence: &evs,
+        };
+        let out = policy.fuse(&input, "2026-01-02T00:00:00Z");
+        assert_eq!(out.verdict, Verdict::Verified);
+        assert_eq!(out.counted_link_ids.len(), 3);
+        assert!(out.discounted_link_ids.is_empty());
+        let independence_caveats = out
+            .rationale
+            .iter()
+            .filter(|r| r.rule == FusionRule::IndependenceUnverified)
+            .count();
+        assert_eq!(independence_caveats, 3);
+        assert_eq!(out.uncertainty, UncertaintyBand::Qualified);
+    }
+
+    /// [`UncertaintyBand::Corroborated`] requires every counted vote to
+    /// carry its *own* recorded correlation group -- distinct from every
+    /// other counted vote's group, never `None` (which fires
+    /// `IndependenceUnverified` -> `Qualified`, see the test above) and
+    /// never collapsed with a sibling (`CorrelationCollapsed` -> also
+    /// implies a non-empty `discounted_link_ids`, which alone forces
+    /// `Qualified`). No sensor stamps a correlation group today (FORNX-92),
+    /// so this band is unreachable on real traffic until one does --
+    /// documented on the type itself, pinned here against direct
+    /// `FusionInput` construction so a real future sensor path is exercised
+    /// the moment it exists.
+    #[test]
+    fn two_supports_in_distinct_correlation_groups_are_corroborated() {
+        let c = claim();
+        let mut ev_a = evidence(EvidenceKind::ExitCode, "2026-01-01T00:00:00Z");
+        ev_a.source = Some(source_with_group(Uuid::new_v4()));
+        let mut ev_b = evidence(EvidenceKind::ExitCode, "2026-01-01T00:00:00Z");
+        ev_b.source = Some(source_with_group(Uuid::new_v4()));
+        let links = vec![
+            link(c.id, ev_a.id, EvidenceRelation::Supports),
+            link(c.id, ev_b.id, EvidenceRelation::Supports),
+        ];
+        let evs = vec![ev_a, ev_b];
+        let graph = EvidenceGraph {
+            links,
+            missing: vec![],
+        };
+        let policy = BaselineFusionPolicy;
+        let out = policy.fuse(
+            &FusionInput {
+                claim: &c,
+                graph: &graph,
+                evidence: &evs,
+            },
+            "2026-01-02T00:00:00Z",
+        );
+        assert_eq!(out.verdict, Verdict::Verified);
+        assert_eq!(out.counted_link_ids.len(), 2);
+        assert!(out.discounted_link_ids.is_empty());
+        assert!(out.missing_evidence_ids.is_empty());
+        assert_eq!(out.uncertainty, UncertaintyBand::Corroborated);
+    }
+
+    // --- 7. Derived-from-counted-parent exclusion --------------------------
+
+    #[test]
+    fn evidence_derived_from_another_counted_links_evidence_is_discounted() {
+        let c = claim();
+        let parent_ev = evidence(EvidenceKind::ExitCode, "2026-01-01T00:00:00Z");
+        let mut derived_ev = evidence(EvidenceKind::ExitCode, "2026-01-01T00:00:00Z");
+        derived_ev.source = Some(EvidenceSource::derived(
+            "duration_sensor",
+            TrustClass::AgentAdjacent,
+            None,
+            None,
+            vec![parent_ev.id],
+        ));
+
+        let parent_link = link(c.id, parent_ev.id, EvidenceRelation::Supports);
+        let derived_link = link(c.id, derived_ev.id, EvidenceRelation::Supports);
+        let graph = EvidenceGraph {
+            links: vec![parent_link.clone(), derived_link.clone()],
+            missing: vec![],
+        };
+        let evs = vec![parent_ev, derived_ev];
+        let policy = BaselineFusionPolicy;
+        let input = FusionInput {
+            claim: &c,
+            graph: &graph,
+            evidence: &evs,
+        };
+        let out = policy.fuse(&input, "2026-01-02T00:00:00Z");
+        assert_eq!(out.counted_link_ids, vec![parent_link.id]);
+        assert_eq!(out.discounted_link_ids, vec![derived_link.id]);
+        assert!(out
+            .rationale
+            .iter()
+            .any(|r| r.rule == FusionRule::DerivedFromCountedParent
+                && r.link_ids == vec![derived_link.id]));
+    }
+
+    // --- 8. Staleness asymmetry ---------------------------------------------
+
+    #[test]
+    fn stale_support_does_not_count_but_stale_contradiction_does() {
+        let c = Claim {
+            claimed_at: "2026-01-01T02:00:00Z".into(), // 2h after evidence
+            ..claim()
+        };
+        let stale_ev = evidence(EvidenceKind::ExitCode, "2026-01-01T00:00:00Z");
+        let support_link = link(c.id, stale_ev.id, EvidenceRelation::Supports);
+        let graph = EvidenceGraph {
+            links: vec![support_link],
+            missing: vec![],
+        };
+        let policy = BaselineFusionPolicy;
+        let out = policy.fuse(
+            &FusionInput {
+                claim: &c,
+                graph: &graph,
+                evidence: std::slice::from_ref(&stale_ev),
+            },
+            "2026-01-02T00:00:00Z",
+        );
+        assert_eq!(out.verdict, Verdict::Unverified);
+        assert!(out.counted_link_ids.is_empty());
+        assert!(out
+            .rationale
+            .iter()
+            .any(|r| r.rule == FusionRule::StaleSupportDemoted));
+
+        let contradict_link = link(c.id, stale_ev.id, EvidenceRelation::Contradicts);
+        let graph2 = EvidenceGraph {
+            links: vec![contradict_link],
+            missing: vec![],
+        };
+        let out2 = policy.fuse(
+            &FusionInput {
+                claim: &c,
+                graph: &graph2,
+                evidence: &[stale_ev],
+            },
+            "2026-01-02T00:00:00Z",
+        );
+        assert_eq!(out2.verdict, Verdict::Contradicted);
+        assert_eq!(out2.counted_link_ids.len(), 1);
+        assert!(out2
+            .rationale
+            .iter()
+            .any(|r| r.rule == FusionRule::StaleContradictionRetained));
+    }
+
+    /// Pins the documented divergence between `fuse`'s `unresolved_conflict`
+    /// and [`fornax_types::EvidenceGraph::conflict`] (module docs, "Known
+    /// divergence" section): a raw `Supports` + `Contradicts` pair on the
+    /// same claim is a `conflict()` per FORNX-92, but once the `Supports`
+    /// side is demoted by R4 staleness, `fuse` sees only one surviving
+    /// vote and reports no conflict at all.
+    #[test]
+    fn stale_support_demotion_diverges_from_raw_graph_conflict() {
+        let c = Claim {
+            claimed_at: "2026-01-01T02:00:00Z".into(), // 2h after evidence
+            ..claim()
+        };
+        let stale_support_ev = evidence(EvidenceKind::ExitCode, "2026-01-01T00:00:00Z");
+        let fresh_contradict_ev = evidence(EvidenceKind::ExitCode, "2026-01-01T02:00:00Z");
+        let support_link = link(c.id, stale_support_ev.id, EvidenceRelation::Supports);
+        let contradict_link = link(c.id, fresh_contradict_ev.id, EvidenceRelation::Contradicts);
+        let graph = EvidenceGraph {
+            links: vec![support_link, contradict_link],
+            missing: vec![],
+        };
+        // The raw graph genuinely has both relations present.
+        assert!(graph.conflict().is_some());
+
+        let evs = vec![stale_support_ev, fresh_contradict_ev];
+        let policy = BaselineFusionPolicy;
+        let out = policy.fuse(
+            &FusionInput {
+                claim: &c,
+                graph: &graph,
+                evidence: &evs,
+            },
+            "2026-01-02T00:00:00Z",
+        );
+        // But fusion's stale-support demotion leaves only the contradiction
+        // counted -- no conflict from fuse's point of view.
+        assert_eq!(out.verdict, Verdict::Contradicted);
+        assert!(!out.unresolved_conflict);
+    }
+
+    // --- 9. Indeterminate freshness ------------------------------------------
+
+    #[test]
+    fn indeterminate_freshness_counts_with_caveat_never_silently_fresh() {
+        let c = claim();
+        let bad_ev = evidence(EvidenceKind::ExitCode, "not-a-timestamp");
+        let l = link(c.id, bad_ev.id, EvidenceRelation::Supports);
+        let graph = EvidenceGraph {
+            links: vec![l.clone()],
+            missing: vec![],
+        };
+        let policy = BaselineFusionPolicy;
+        let out = policy.fuse(
+            &FusionInput {
+                claim: &c,
+                graph: &graph,
+                evidence: &[bad_ev],
+            },
+            "2026-01-02T00:00:00Z",
+        );
+        assert_eq!(out.verdict, Verdict::Verified);
+        assert_eq!(out.counted_link_ids, vec![l.id]);
+        assert!(out
+            .rationale
+            .iter()
+            .any(|r| r.rule == FusionRule::FreshnessIndeterminate));
+        assert_eq!(out.uncertainty, UncertaintyBand::Qualified);
+    }
+
+    // --- 10. Rationale integrity ---------------------------------------------
+
+    #[test]
+    fn every_id_in_every_rationale_entry_exists_in_the_input() {
+        let c = claim();
+        let ev_s = evidence(EvidenceKind::ExitCode, "2026-01-01T00:00:00Z");
+        let ev_c = evidence(EvidenceKind::ExitCode, "2026-01-01T00:00:00Z");
+        let unresolved_id = Uuid::new_v4();
+        let l_s = link(c.id, ev_s.id, EvidenceRelation::Supports);
+        let l_c = link(c.id, ev_c.id, EvidenceRelation::Contradicts);
+        let l_bad = link(c.id, unresolved_id, EvidenceRelation::Supports);
+        let m = missing(c.id, SignalAvailability::Unavailable);
+        let graph = EvidenceGraph {
+            links: vec![l_s.clone(), l_c.clone(), l_bad.clone()],
+            missing: vec![m.clone()],
+        };
+        let evs = vec![ev_s.clone(), ev_c.clone()];
+        let policy = BaselineFusionPolicy;
+        let out = policy.fuse(
+            &FusionInput {
+                claim: &c,
+                graph: &graph,
+                evidence: &evs,
+            },
+            "2026-01-02T00:00:00Z",
+        );
+
+        let valid_link_ids: HashSet<Uuid> = [l_s.id, l_c.id, l_bad.id].into_iter().collect();
+        let valid_missing_ids: HashSet<Uuid> = [m.id].into_iter().collect();
+        let valid_evidence_ids: HashSet<Uuid> = [ev_s.id, ev_c.id].into_iter().collect();
+
+        for entry in &out.rationale {
+            for id in &entry.link_ids {
+                assert!(
+                    valid_link_ids.contains(id),
+                    "rationale referenced unknown link id {id}"
+                );
+            }
+            for id in &entry.missing_evidence_ids {
+                assert!(
+                    valid_missing_ids.contains(id),
+                    "rationale referenced unknown missing-evidence id {id}"
+                );
+            }
+            for id in &entry.evidence_ids {
+                assert!(
+                    valid_evidence_ids.contains(id),
+                    "rationale referenced unknown evidence id {id}"
+                );
+            }
+        }
+    }
+
+    // --- 12. No numeric confidence field -------------------------------------
+
+    #[test]
+    fn fused_finding_json_carries_no_numeric_confidence_field() {
+        let c = claim();
+        let graph = EvidenceGraph::default();
+        let policy = BaselineFusionPolicy;
+        let out = policy.fuse(
+            &FusionInput {
+                claim: &c,
+                graph: &graph,
+                evidence: &[],
+            },
+            "2026-01-02T00:00:00Z",
+        );
+        let json = serde_json::to_value(&out).unwrap();
+        fn assert_no_numeric_confidence(v: &serde_json::Value, path: String) {
+            match v {
+                serde_json::Value::Object(map) => {
+                    for (k, val) in map {
+                        let lower = k.to_lowercase();
+                        assert!(
+                            !(lower.contains("confidence") || lower.contains("score"))
+                                || !val.is_number(),
+                            "found a numeric confidence-shaped field at {path}.{k}"
+                        );
+                        assert_no_numeric_confidence(val, format!("{path}.{k}"));
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for (i, item) in items.iter().enumerate() {
+                        assert_no_numeric_confidence(item, format!("{path}[{i}]"));
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_no_numeric_confidence(&json, "$".to_string());
+    }
+
+    // --- project_graph ---------------------------------------------------
+
+    fn finding(
+        claim_id: Uuid,
+        verdict: Verdict,
+        evidence_ids: Vec<Uuid>,
+        verifier_name: &str,
+    ) -> Finding {
+        Finding {
+            id: Uuid::new_v4(),
+            claim_id,
+            verdict,
+            evidence_ids,
+            verifier_name: verifier_name.to_string(),
+            rationale: "test rationale".to_string(),
+            computed_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn project_graph_maps_verified_and_contradicted_to_supports_and_contradicts() {
+        let c = claim();
+        let ev = evidence(EvidenceKind::ExitCode, "2026-01-01T00:00:00Z");
+        let f_verified = finding(
+            c.id,
+            Verdict::Verified,
+            vec![ev.id],
+            "test_result_verifier_v1",
+        );
+        let graph = project_graph(&c, &[f_verified]);
+        assert_eq!(graph.links.len(), 1);
+        assert_eq!(graph.links[0].relation, EvidenceRelation::Supports);
+
+        let f_contradicted = finding(
+            c.id,
+            Verdict::Contradicted,
+            vec![ev.id],
+            "test_result_verifier_v1",
+        );
+        let graph2 = project_graph(&c, &[f_contradicted]);
+        assert_eq!(graph2.links[0].relation, EvidenceRelation::Contradicts);
+    }
+
+    #[test]
+    fn project_graph_maps_unavailable_to_missing_evidence_with_expected_signal_classes() {
+        let c = claim();
+        let f = finding(
+            c.id,
+            Verdict::Unavailable,
+            vec![],
+            "file_modified_verifier_v1",
+        );
+        let graph = project_graph(&c, &[f]);
+        assert!(!graph.missing.is_empty());
+        for m in &graph.missing {
+            assert_eq!(m.availability, SignalAvailability::Unavailable);
+            assert!(matches!(
+                m.signal_class,
+                SignalClass::ToolTrace | SignalClass::ToolResultPayload
+            ));
+        }
+    }
+
+    #[test]
+    fn project_graph_maps_unverified_to_nothing() {
+        let c = claim();
+        let f = finding(c.id, Verdict::Unverified, vec![], "test_result_verifier_v1");
+        let graph = project_graph(&c, &[f]);
+        assert!(graph.links.is_empty());
+        assert!(graph.missing.is_empty());
+    }
+
+    /// Pins `projected_id`'s doc claim: calling `project_graph` twice on
+    /// identical `findings` produces a byte-identical graph, not a fresh
+    /// random id per call.
+    #[test]
+    fn project_graph_is_deterministic_across_calls() {
+        let c = claim();
+        let ev = evidence(EvidenceKind::ExitCode, "2026-01-01T00:00:00Z");
+        let f = finding(
+            c.id,
+            Verdict::Verified,
+            vec![ev.id],
+            "test_result_verifier_v1",
+        );
+        let graph_a = project_graph(&c, std::slice::from_ref(&f));
+        let graph_b = project_graph(&c, &[f]);
+        assert_eq!(graph_a, graph_b);
+    }
+
+    /// Documented `Review -> Neutral` fidelity gap (module docs): a `Review`
+    /// finding projects to a `Neutral` link, which never votes, so
+    /// re-fusing it always reaches `Unverified` (via `AllSupportDiscounted`),
+    /// never re-promoted back to `Review`. This is intentional, not a bug.
+    #[test]
+    fn review_finding_projects_to_neutral_and_refuses_to_re_promote() {
+        let c = claim();
+        let ev = evidence(EvidenceKind::ExitCode, "2026-01-01T00:00:00Z");
+        let f = finding(
+            c.id,
+            Verdict::Review,
+            vec![ev.id],
+            "file_modified_verifier_v1",
+        );
+        let graph = project_graph(&c, &[f]);
+        assert_eq!(graph.links[0].relation, EvidenceRelation::Neutral);
+
+        let policy = BaselineFusionPolicy;
+        let out = policy.fuse(
+            &FusionInput {
+                claim: &c,
+                graph: &graph,
+                evidence: &[ev],
+            },
+            "2026-01-02T00:00:00Z",
+        );
+        assert_eq!(out.verdict, Verdict::Unverified);
+        assert!(out
+            .rationale
+            .iter()
+            .any(|r| r.rule == FusionRule::AllSupportDiscounted));
+    }
+
+    // --- 11. Baseline equivalence with real verifiers -----------------------
+
+    #[test]
+    fn baseline_equivalence_test_result_verifier_verified() {
+        use crate::{TestResultVerifier, Verifier};
+        let v = TestResultVerifier;
+        let c = crate::tests::claim_for("test_result", "All tests passed.");
+        let ev = Evidence {
+            id: Uuid::new_v4(),
+            session_id: "s1".into(),
+            source_event_id: Uuid::new_v4(),
+            kind: EvidenceKind::ExitCode,
+            observed_at: chrono::Utc::now().to_rfc3339(),
+            payload: serde_json::json!({"command": ["pytest"], "exit_code": 0}),
+            provenance: "codex:rollout:exec_command_end".into(),
+            source: None,
+            extension: None,
+        };
+        let caps = fornax_types::RuntimeCapabilities {
+            schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
+            provider: fornax_types::Provider::Codex,
+            signals: vec![fornax_types::CapabilitySignal {
+                class: SignalClass::ToolTrace,
+                state: SignalAvailability::Available,
+                detail: None,
+            }],
+            notes: Default::default(),
+        };
+        let original = v.verify(&c, std::slice::from_ref(&ev), &caps);
+        assert_eq!(original.verdict, Verdict::Verified);
+
+        let graph = project_graph(&c, std::slice::from_ref(&original));
+        let policy = BaselineFusionPolicy;
+        let fused = policy.fuse(
+            &FusionInput {
+                claim: &c,
+                graph: &graph,
+                evidence: &[ev],
+            },
+            "2026-01-02T00:00:00Z",
+        );
+        assert_eq!(fused.verdict, Verdict::Verified);
+    }
+
+    #[test]
+    fn baseline_equivalence_test_result_verifier_contradicted() {
+        use crate::{TestResultVerifier, Verifier};
+        let v = TestResultVerifier;
+        let c = crate::tests::claim_for("test_result", "All tests passed.");
+        let ev = Evidence {
+            id: Uuid::new_v4(),
+            session_id: "s1".into(),
+            source_event_id: Uuid::new_v4(),
+            kind: EvidenceKind::ExitCode,
+            observed_at: chrono::Utc::now().to_rfc3339(),
+            payload: serde_json::json!({"command": ["pytest"], "exit_code": 1}),
+            provenance: "codex:rollout:exec_command_end".into(),
+            source: None,
+            extension: None,
+        };
+        let caps = fornax_types::RuntimeCapabilities {
+            schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
+            provider: fornax_types::Provider::Codex,
+            signals: vec![fornax_types::CapabilitySignal {
+                class: SignalClass::ToolTrace,
+                state: SignalAvailability::Available,
+                detail: None,
+            }],
+            notes: Default::default(),
+        };
+        let original = v.verify(&c, std::slice::from_ref(&ev), &caps);
+        assert_eq!(original.verdict, Verdict::Contradicted);
+
+        let graph = project_graph(&c, std::slice::from_ref(&original));
+        let policy = BaselineFusionPolicy;
+        let fused = policy.fuse(
+            &FusionInput {
+                claim: &c,
+                graph: &graph,
+                evidence: &[ev],
+            },
+            "2026-01-02T00:00:00Z",
+        );
+        assert_eq!(fused.verdict, Verdict::Contradicted);
+    }
+
+    #[test]
+    fn baseline_equivalence_test_result_verifier_unavailable() {
+        use crate::{TestResultVerifier, Verifier};
+        let v = TestResultVerifier;
+        let c = crate::tests::claim_for("test_result", "All tests passed.");
+        let caps = fornax_types::RuntimeCapabilities {
+            schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
+            provider: fornax_types::Provider::Codex,
+            signals: vec![],
+            notes: Default::default(),
+        };
+        let original = v.verify(&c, &[], &caps);
+        assert_eq!(original.verdict, Verdict::Unavailable);
+
+        let graph = project_graph(&c, std::slice::from_ref(&original));
+        let policy = BaselineFusionPolicy;
+        let fused = policy.fuse(
+            &FusionInput {
+                claim: &c,
+                graph: &graph,
+                evidence: &[],
+            },
+            "2026-01-02T00:00:00Z",
+        );
+        assert_eq!(fused.verdict, Verdict::Unavailable);
+    }
+
+    #[test]
+    fn baseline_equivalence_git_operation_verifier_verified_and_contradicted() {
+        use crate::{GitOperationVerifier, Verifier};
+
+        fn vcs_evidence(observation: serde_json::Value) -> Evidence {
+            Evidence {
+                id: Uuid::new_v4(),
+                session_id: "s1".into(),
+                source_event_id: Uuid::new_v4(),
+                kind: EvidenceKind::ProcessObservation,
+                observed_at: chrono::Utc::now().to_rfc3339(),
+                payload: serde_json::json!({
+                    "description": "git observation",
+                    "observation": observation,
+                }),
+                provenance: "claude_code:1.2.3:PostToolUse:Bash#tool_response:git_commit".into(),
+                source: None,
+                extension: None,
+            }
+        }
+
+        let caps = fornax_types::RuntimeCapabilities {
+            schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
+            provider: fornax_types::Provider::ClaudeCode,
+            signals: vec![fornax_types::CapabilitySignal {
+                class: SignalClass::ToolTrace,
+                state: SignalAvailability::Available,
+                detail: None,
+            }],
+            notes: Default::default(),
+        };
+
+        // Verified: a commit was created, no SHA literal in the claim to
+        // mismatch against.
+        let v = GitOperationVerifier;
+        let c = crate::tests::claim_for("git_commit", "I committed the change.");
+        let ev = vcs_evidence(serde_json::json!({
+            "observation_kind": "vcs_operation",
+            "operation": "commit",
+            "outcome": "created",
+            "commit_sha": "0e2fbd4",
+            "branch": "main",
+        }));
+        let original = v.verify(&c, std::slice::from_ref(&ev), &caps);
+        assert_eq!(original.verdict, Verdict::Verified);
+        let graph = project_graph(&c, std::slice::from_ref(&original));
+        let policy = BaselineFusionPolicy;
+        let fused = policy.fuse(
+            &FusionInput {
+                claim: &c,
+                graph: &graph,
+                evidence: std::slice::from_ref(&ev),
+            },
+            "2026-01-02T00:00:00Z",
+        );
+        assert_eq!(fused.verdict, Verdict::Verified);
+
+        // Contradicted: git reported nothing to commit.
+        let c2 = crate::tests::claim_for("git_commit", "I committed the change.");
+        let ev2 = vcs_evidence(serde_json::json!({
+            "observation_kind": "vcs_operation",
+            "operation": "commit",
+            "outcome": "nothing_to_commit",
+            "commit_sha": null,
+            "branch": null,
+        }));
+        let original2 = v.verify(&c2, std::slice::from_ref(&ev2), &caps);
+        assert_eq!(original2.verdict, Verdict::Contradicted);
+        let graph2 = project_graph(&c2, std::slice::from_ref(&original2));
+        let fused2 = policy.fuse(
+            &FusionInput {
+                claim: &c2,
+                graph: &graph2,
+                evidence: std::slice::from_ref(&ev2),
+            },
+            "2026-01-02T00:00:00Z",
+        );
+        assert_eq!(fused2.verdict, Verdict::Contradicted);
+    }
+
+    /// Exercises `expected_signal_classes_for_verifier`'s
+    /// `ToolTrace`/`ToolResultPayload` branch against a real
+    /// `FileModifiedVerifier` finding, not a synthetic one.
+    #[test]
+    fn baseline_equivalence_file_modified_verifier_unavailable() {
+        use crate::{FileModifiedVerifier, Verifier};
+        let v = FileModifiedVerifier;
+        let c = crate::tests::claim_for("file_written", "I updated `src/lib.rs`.");
+        let no_caps = fornax_types::RuntimeCapabilities {
+            schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
+            provider: fornax_types::Provider::ClaudeCode,
+            signals: vec![],
+            notes: Default::default(),
+        };
+        let original = v.verify(&c, &[], &no_caps);
+        assert_eq!(original.verdict, Verdict::Unavailable);
+
+        let graph = project_graph(&c, std::slice::from_ref(&original));
+        assert!(graph.missing.iter().all(|m| matches!(
+            m.signal_class,
+            SignalClass::ToolTrace | SignalClass::ToolResultPayload
+        )));
+
+        let policy = BaselineFusionPolicy;
+        let fused = policy.fuse(
+            &FusionInput {
+                claim: &c,
+                graph: &graph,
+                evidence: &[],
+            },
+            "2026-01-02T00:00:00Z",
+        );
+        assert_eq!(fused.verdict, Verdict::Unavailable);
+    }
+
+    #[test]
+    fn baseline_equivalence_command_executed_verifier_verified() {
+        use crate::{CommandExecutedVerifier, Verifier};
+        let v = CommandExecutedVerifier;
+        let c = crate::tests::claim_for("command_executed", "I ran `npm install`.");
+        let ev = crate::tests::evidence_for_command(&["npm", "install"], 0);
+        let caps = fornax_types::RuntimeCapabilities {
+            schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
+            provider: fornax_types::Provider::Codex,
+            signals: vec![fornax_types::CapabilitySignal {
+                class: SignalClass::ToolTrace,
+                state: SignalAvailability::Available,
+                detail: None,
+            }],
+            notes: Default::default(),
+        };
+        let original = v.verify(&c, std::slice::from_ref(&ev), &caps);
+        assert_eq!(original.verdict, Verdict::Verified);
+
+        let graph = project_graph(&c, std::slice::from_ref(&original));
+        let policy = BaselineFusionPolicy;
+        let fused = policy.fuse(
+            &FusionInput {
+                claim: &c,
+                graph: &graph,
+                evidence: std::slice::from_ref(&ev),
+            },
+            "2026-01-02T00:00:00Z",
+        );
+        assert_eq!(fused.verdict, Verdict::Verified);
+    }
+
+    #[test]
+    fn baseline_equivalence_command_success_verifier_contradicted() {
+        use crate::{CommandSuccessVerifier, Verifier};
+        let v = CommandSuccessVerifier;
+        let c =
+            crate::tests::claim_for("command_succeeded", "The command `npm install` succeeded.");
+        let ev = crate::tests::evidence_for_command(&["npm", "install"], 1);
+        let caps = fornax_types::RuntimeCapabilities {
+            schema_version: fornax_types::CAPABILITY_SCHEMA_VERSION,
+            provider: fornax_types::Provider::Codex,
+            signals: vec![fornax_types::CapabilitySignal {
+                class: SignalClass::ToolTrace,
+                state: SignalAvailability::Available,
+                detail: None,
+            }],
+            notes: Default::default(),
+        };
+        let original = v.verify(&c, std::slice::from_ref(&ev), &caps);
+        assert_eq!(original.verdict, Verdict::Contradicted);
+
+        let graph = project_graph(&c, std::slice::from_ref(&original));
+        let policy = BaselineFusionPolicy;
+        let fused = policy.fuse(
+            &FusionInput {
+                claim: &c,
+                graph: &graph,
+                evidence: std::slice::from_ref(&ev),
+            },
+            "2026-01-02T00:00:00Z",
+        );
+        assert_eq!(fused.verdict, Verdict::Contradicted);
+    }
+}
