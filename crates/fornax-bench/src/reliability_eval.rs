@@ -45,14 +45,20 @@
 //! [`adjust_action_with_reliability`] is a simple, explicit, two-sided rule
 //! (a well-supported, reliable cohort can relax `Review` to `Proceed`; a
 //! well-supported, unreliable cohort can escalate `Proceed` to `Review`) —
-//! chosen to exercise both directions of "the signal changed a decision" in
-//! a mechanism test, not derived from any real calibration study. It never
-//! touches `Block` (this ticket does not revisit `DefaultRiskPolicy`'s
-//! `Block` safety floors), and a sparse/new context
+//! not derived from any real calibration study. It never touches `Block`
+//! (this ticket does not revisit `DefaultRiskPolicy`'s `Block` safety
+//! floors, pinned by `block_is_never_touched_by_either_direction`), and a
+//! sparse/new context
 //! ([`fornax_verify::reliability::ReliabilitySignal::reliability_estimate`]
 //! is `None`) never changes the action at all — see module docs on
 //! `fornax_verify::reliability` and FORNX-104 AC 2: sparse contexts must
 //! stay uncertain, not borrow unjustified certainty in either direction.
+//! Both directions are exercised directly
+//! (`relax_direction_fires_on_a_well_supported_reliable_cohort`/
+//! `escalate_direction_fires_on_a_well_supported_unreliable_cohort`); the
+//! end-to-end `run_reliability_eval` test fixture only naturally exercises
+//! the relax direction, since its baseline action is `Review`, never
+//! `Proceed`.
 
 use std::collections::HashMap;
 
@@ -68,6 +74,17 @@ use crate::metrics::{compute_metrics, MetricsReport};
 /// is treated as reliable enough to relax a `Review` down to `Proceed`. See
 /// module docs, "The adjustment rule itself is illustrative, not
 /// calibrated."
+///
+/// This threshold is deliberately far above what a cohort at exactly
+/// [`fornax_types::MINIMUM_COHORT_SAMPLE_SUPPORT`] can ever reach: even an
+/// all-`Reliable` cohort of 30 observations has a Wilson lower bound around
+/// 0.89, not 0.95 — the interval is still wide at minimum support. Relaxing
+/// a `Review` is the direction that *reduces* caution, so this rule
+/// requires substantially more than the bare minimum support before it can
+/// fire at all (empirically, an all-`Reliable` cohort needs roughly n>=100
+/// to clear 0.95) — unreachable at minimum support today, on the same
+/// "unreachable on real traffic today, by design" honesty
+/// `crate::fusion::UncertaintyBand::Corroborated` documents about itself.
 const RELAX_LOWER_BOUND_THRESHOLD: f64 = 0.95;
 
 /// The confidence-interval bound at or below which a well-supported cohort
@@ -296,6 +313,99 @@ mod tests {
                 outcome: ObservationOutcome::Reliable,
             })
             .collect()
+    }
+
+    fn n_reliable_of(
+        key: &ReliabilityContextKey,
+        reliable: usize,
+        total: usize,
+    ) -> Vec<ReliabilityObservation> {
+        let mut outcomes = vec![ObservationOutcome::Reliable; reliable];
+        outcomes.extend(vec![ObservationOutcome::Unreliable; total - reliable]);
+        outcomes
+            .into_iter()
+            .map(|outcome| ReliabilityObservation {
+                context_key: key.clone(),
+                outcome,
+            })
+            .collect()
+    }
+
+    // --- adjust_action_with_reliability: both directions, in isolation ----
+
+    #[test]
+    fn relax_direction_fires_on_a_well_supported_reliable_cohort() {
+        let key = context_key();
+        let observations = reliable_observations(&key, 150);
+        let signal = compute_reliability(&key, &observations, RELIABILITY_POLICY_VERSION);
+        assert_eq!(
+            adjust_action_with_reliability(RecommendationAction::Review, &signal),
+            RecommendationAction::Proceed
+        );
+    }
+
+    #[test]
+    fn escalate_direction_fires_on_a_well_supported_unreliable_cohort() {
+        let key = context_key();
+        // 5-of-60 Reliable: well above minimum support, Wilson upper bound
+        // comfortably under 0.5 -- the escalate branch's actual firing
+        // condition, exercised directly since no harness fixture in this
+        // module's dataset naturally produces a base `Proceed` action to
+        // escalate from.
+        let observations = n_reliable_of(&key, 5, 60);
+        let signal = compute_reliability(&key, &observations, RELIABILITY_POLICY_VERSION);
+        assert!(
+            signal
+                .reliability_estimate
+                .as_ref()
+                .unwrap()
+                .confidence_interval
+                .upper
+                <= ESCALATE_UPPER_BOUND_THRESHOLD,
+            "fixture must actually clear the escalate threshold, not just be low"
+        );
+        assert_eq!(
+            adjust_action_with_reliability(RecommendationAction::Proceed, &signal),
+            RecommendationAction::Review
+        );
+    }
+
+    #[test]
+    fn neither_direction_fires_on_a_mid_reliability_cohort() {
+        let key = context_key();
+        let observations = n_reliable_of(&key, 30, 60);
+        let signal = compute_reliability(&key, &observations, RELIABILITY_POLICY_VERSION);
+        assert_eq!(
+            adjust_action_with_reliability(RecommendationAction::Review, &signal),
+            RecommendationAction::Review
+        );
+        assert_eq!(
+            adjust_action_with_reliability(RecommendationAction::Proceed, &signal),
+            RecommendationAction::Proceed
+        );
+    }
+
+    #[test]
+    fn block_is_never_touched_by_either_direction() {
+        let key = context_key();
+        let strong = compute_reliability(
+            &key,
+            &reliable_observations(&key, 150),
+            RELIABILITY_POLICY_VERSION,
+        );
+        let weak = compute_reliability(
+            &key,
+            &n_reliable_of(&key, 5, 60),
+            RELIABILITY_POLICY_VERSION,
+        );
+        assert_eq!(
+            adjust_action_with_reliability(RecommendationAction::Block, &strong),
+            RecommendationAction::Block
+        );
+        assert_eq!(
+            adjust_action_with_reliability(RecommendationAction::Block, &weak),
+            RecommendationAction::Block
+        );
     }
 
     #[test]
