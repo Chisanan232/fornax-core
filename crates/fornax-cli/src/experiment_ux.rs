@@ -240,6 +240,23 @@ pub fn render_preview(spec: &ExperimentSpec, global: &GlobalExperimentPolicy) ->
         }
     }
 
+    // AC1: preview must not claim eligibility to auto-run a kind `run`
+    // itself would refuse. Only `RevertFileToBaseline` has a built-in
+    // `InterventionApplier` (see module docs) -- everything else reports
+    // `ExperimentOutcome::Unsupported` if actually run, so preview says so
+    // up front rather than showing a risk verdict that implies it would run.
+    if !matches!(
+        spec.intervention.kind,
+        fornax_types::experiment::ExperimentKind::RevertFileToBaseline
+    ) {
+        out.push_str(&format!(
+            "kind: {:?} -- NOT ELIGIBLE (no built-in executor support; running this would report unsupported)\n",
+            spec.intervention.kind
+        ));
+        out.push_str("(preview only -- nothing was executed)\n");
+        return out;
+    }
+
     let gate = check_policy_gate(spec, global);
     if gate.denied_classes.is_empty() {
         out.push_str("risk: low-risk -- eligible to auto-run\n");
@@ -646,6 +663,28 @@ mod tests {
         assert!(out.contains("higher-risk -- requires explicit policy approval"));
     }
 
+    /// AC1: preview must never claim "eligible to auto-run" for a kind
+    /// `run` would actually refuse (`Unsupported`) -- a spec whose kind has
+    /// no built-in `InterventionApplier` previews as not eligible, never as
+    /// a low-risk-auto-run candidate.
+    #[test]
+    fn render_preview_reports_unsupported_kind_as_not_eligible_never_as_low_risk() {
+        let spec = spec_with(
+            Intervention {
+                kind: ExperimentKind::SubstituteToolResult,
+                description: "substitute a tool result".into(),
+                params: serde_json::json!({}),
+                provider_extension: None,
+            },
+            SideEffectAllowList::new([SideEffectClass::EphemeralWorktreeMutation]),
+            vec![Uuid::new_v4()],
+        );
+        let global = GlobalExperimentPolicy::default();
+        let out = render_preview(&spec, &global);
+        assert!(out.contains("NOT ELIGIBLE"));
+        assert!(!out.contains("eligible to auto-run"));
+    }
+
     /// AC1's structural guarantee: [`render_preview`] never receives a
     /// staging root or executor, so it cannot provision a worktree or leave
     /// evidence behind -- this test proves that empirically by pointing an
@@ -771,60 +810,79 @@ mod tests {
         }
     }
 
+    /// Asserts the structural invariant AC5 actually requires: a
+    /// non-`Completed` outcome must never carry any of the `Completed`-only
+    /// rendering (the `COMPLETED` banner, the baseline/intervention
+    /// sections, or a "hypothesis relation" line), regardless of what
+    /// arbitrary text the outcome's own `reason` string happens to contain.
+    /// Deliberately does NOT assert on words like "verified"/"contradict"
+    /// appearing anywhere in the full output -- a `reason` string is
+    /// free-text a caller/observer controls and could legitimately contain
+    /// those words (e.g. "evidence did not contradict the baseline") without
+    /// that being a rendering bug; only `Completed`-shaped content escaping
+    /// onto a non-`Completed` outcome would be the real regression.
+    fn assert_never_renders_as_completed(out: &str, expected_label: &str) {
+        assert!(out.contains(expected_label), "missing label in: {out}");
+        assert!(
+            !out.contains("COMPLETED"),
+            "non-Completed outcome must never show the COMPLETED banner: {out}"
+        );
+        assert!(
+            !out.contains("--- baseline"),
+            "non-Completed outcome must never show a baseline section: {out}"
+        );
+        assert!(
+            !out.contains("--- intervention"),
+            "non-Completed outcome must never show an intervention section: {out}"
+        );
+        assert!(
+            !out.contains("hypothesis relation"),
+            "non-Completed outcome must never show a hypothesis relation: {out}"
+        );
+    }
+
     #[test]
-    fn inconclusive_outcome_renders_its_own_label_never_a_verdict() {
+    fn inconclusive_outcome_renders_its_own_label_never_a_completed_shape() {
         let out = render_experiment_result(
             &result_with(ExperimentOutcome::Inconclusive {
                 reason: "observer could not determine a relation".into(),
             }),
             "s1",
         );
-        assert!(out.contains("INCONCLUSIVE"));
-        assert!(!out.to_lowercase().contains("verified"));
-        assert!(!out.to_lowercase().contains("contradict"));
-        assert!(!out.contains("COMPLETED"));
+        assert_never_renders_as_completed(&out, "INCONCLUSIVE");
     }
 
     #[test]
-    fn blocked_outcome_renders_its_own_label_never_a_verdict() {
+    fn blocked_outcome_renders_its_own_label_never_a_completed_shape() {
         let out = render_experiment_result(
             &result_with(ExperimentOutcome::Blocked {
                 reason: "precondition failed".into(),
             }),
             "s1",
         );
-        assert!(out.contains("BLOCKED"));
-        assert!(!out.to_lowercase().contains("verified"));
-        assert!(!out.to_lowercase().contains("contradict"));
-        assert!(!out.contains("COMPLETED"));
+        assert_never_renders_as_completed(&out, "BLOCKED");
     }
 
     #[test]
-    fn unsupported_outcome_renders_its_own_label_never_a_verdict() {
+    fn unsupported_outcome_renders_its_own_label_never_a_completed_shape() {
         let out = render_experiment_result(
             &result_with(ExperimentOutcome::Unsupported {
                 reason: "no executor for this kind".into(),
             }),
             "s1",
         );
-        assert!(out.contains("UNSUPPORTED"));
-        assert!(!out.to_lowercase().contains("verified"));
-        assert!(!out.to_lowercase().contains("contradict"));
-        assert!(!out.contains("COMPLETED"));
+        assert_never_renders_as_completed(&out, "UNSUPPORTED");
     }
 
     #[test]
-    fn failed_outcome_renders_its_own_label_never_a_verdict() {
+    fn failed_outcome_renders_its_own_label_never_a_completed_shape() {
         let out = render_experiment_result(
             &result_with(ExperimentOutcome::Failed {
                 reason: "executor errored".into(),
             }),
             "s1",
         );
-        assert!(out.contains("FAILED"));
-        assert!(!out.to_lowercase().contains("verified"));
-        assert!(!out.to_lowercase().contains("contradict"));
-        assert!(!out.contains("COMPLETED"));
+        assert_never_renders_as_completed(&out, "FAILED");
     }
 
     // --- RevertAppliedObserver: honest, narrow scope ------------------------
