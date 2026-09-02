@@ -1208,7 +1208,25 @@ mod tests {
             .await
             .expect("handle claim");
 
+        // `claim_evidence_links.evidence_id` is a foreign key into `evidence`
+        // (0006_evidence_graph.sql) — a linked evidence id must reference a
+        // real, already-stored `Evidence` row.
         let evidence_id = Uuid::new_v4();
+        let evidence = fornax_types::Evidence {
+            id: evidence_id,
+            session_id: session_id.clone(),
+            source_event_id: event_id,
+            kind: fornax_types::EvidenceKind::ProcessObservation,
+            observed_at: "2026-09-01T00:00:00Z".to_string(),
+            payload: serde_json::json!({}),
+            provenance: "claude_code:1.2.3:PostToolUse:Bash#tool_response".to_string(),
+            source: None,
+            extension: None,
+        };
+        handle_message(&state, IngestMessage::Evidence(evidence), &mut hint)
+            .await
+            .expect("handle evidence");
+
         state
             .store
             .insert_evidence_link(&EvidenceLink {
@@ -1364,13 +1382,31 @@ mod tests {
             .await
             .expect("handle claim");
 
+        // `claim_evidence_links.evidence_id` is a foreign key into
+        // `evidence` (0006_evidence_graph.sql) — needs a real stored row.
+        let evidence_id = Uuid::new_v4();
+        let evidence = fornax_types::Evidence {
+            id: evidence_id,
+            session_id: owning_session.clone(),
+            source_event_id: event_id,
+            kind: fornax_types::EvidenceKind::ProcessObservation,
+            observed_at: "2026-09-01T00:00:00Z".to_string(),
+            payload: serde_json::json!({}),
+            provenance: "claude_code:1.2.3:PostToolUse:Bash#tool_response".to_string(),
+            source: None,
+            extension: None,
+        };
+        handle_message(&state, IngestMessage::Evidence(evidence), &mut hint)
+            .await
+            .expect("handle evidence");
+
         state
             .store
             .insert_evidence_link(&EvidenceLink {
                 id: Uuid::new_v4(),
                 session_id: owning_session.clone(),
                 claim_id: claim.id,
-                evidence_id: Uuid::new_v4(),
+                evidence_id,
                 relation: EvidenceRelation::Supports,
                 linked_at: "2026-09-01T00:00:01Z".to_string(),
             })
