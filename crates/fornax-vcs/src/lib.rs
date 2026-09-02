@@ -159,6 +159,124 @@ fn collect_dirty_paths(repo: &gix::Repository) -> Result<Vec<String>, VcsError> 
     Ok(paths)
 }
 
+/// Real, host-observed status of exactly one path within a git working
+/// tree, at the moment this was queried — independent of anything a coding
+/// agent claimed happened.
+///
+/// Unlike [`working_tree_status`], which walks the *entire* working tree,
+/// this restricts the underlying git status walk to `claimed_path` alone
+/// via a pathspec. That distinction is not cosmetic: a full-repository
+/// dirwalk (untracked-file scan included) run synchronously on every single
+/// Edit/Write/MultiEdit — which is exactly when
+/// `fornax-adapter-claude`'s `ClaudeGitWorkingTreeSensor` calls this — would
+/// be a real, avoidable cost in a working tree with a large `node_modules`/
+/// `target`/`.venv`, and that sensor only ever needs one path's answer. This
+/// is the entry point it actually calls.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PathStatus {
+    /// `false` when `claimed_path` (or any of its ancestors) is not inside a
+    /// git working tree at all.
+    pub is_repo: bool,
+    /// `HEAD`'s commit SHA, as a lowercase hex string. `None` for a real
+    /// repository with no commits yet (an "unborn" `HEAD`).
+    pub head_commit: Option<String>,
+    /// `true` when git's status walk, restricted to `claimed_path`, reports
+    /// it as uncommitted, unstaged, or untracked. Says nothing about
+    /// whether `claimed_path` exists on disk at all (that's
+    /// `ClaudeFileWriteConfirmedSensor`'s job) — a path that was never
+    /// written and a path that is committed and unmodified both report
+    /// `false` here, and so does a gitignored path (matching
+    /// `git status --ignored=no`'s own default): this field answers "does
+    /// git's status walk have anything pending for this path", not "is this
+    /// path clean" in every sense that word could mean.
+    pub is_dirty: bool,
+}
+
+impl PathStatus {
+    fn not_a_repo() -> Self {
+        Self {
+            is_repo: false,
+            head_commit: None,
+            is_dirty: false,
+        }
+    }
+}
+
+/// Query whether `claimed_path` is dirty in its git working tree, restricted
+/// to that one path (see [`PathStatus`] for why this is a separate, cheaper
+/// entry point from [`working_tree_status`]).
+///
+/// Synchronous and local-only: no network access, no subprocess spawn.
+/// Searches upward from `claimed_path`'s parent directory for a `.git`
+/// directory, matching `git status`'s own behavior when run from a
+/// subdirectory of a working tree.
+pub fn path_status(claimed_path: &Path) -> Result<PathStatus, VcsError> {
+    // `Path::parent()` returns `Some("")` for a bare relative filename
+    // (e.g. `"claimed.txt"`), not `None` — `gix::discover("")` would then
+    // resolve against an empty path rather than the current directory, so
+    // that case is folded into the `"."` fallback too, not just a missing
+    // parent.
+    let start_dir = claimed_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+
+    let repo = match gix::discover(start_dir) {
+        Ok(repo) => repo,
+        Err(gix::discover::Error::Discover(
+            gix::discover::upwards::Error::NoGitRepository { .. }
+            | gix::discover::upwards::Error::NoGitRepositoryWithinCeiling { .. }
+            | gix::discover::upwards::Error::NoGitRepositoryWithinFs { .. }
+            | gix::discover::upwards::Error::NoMatchingCeilingDir,
+        )) => return Ok(PathStatus::not_a_repo()),
+        Err(e) => return Err(VcsError::Open(e.to_string())),
+    };
+
+    let head_commit = repo.head_id().ok().map(|id| id.to_string());
+
+    let work_dir = repo.workdir().ok_or_else(|| {
+        VcsError::Status("repository has no working directory (bare repo)".to_string())
+    })?;
+    let rel = claimed_path.strip_prefix(work_dir).map_err(|_| {
+        VcsError::Status(format!(
+            "{} is not inside the discovered repo's working directory {}",
+            claimed_path.display(),
+            work_dir.display()
+        ))
+    })?;
+    let rel_str = rel
+        .to_str()
+        .ok_or_else(|| VcsError::Status(format!("{} is not valid UTF-8", claimed_path.display())))?
+        .replace(std::path::MAIN_SEPARATOR, "/");
+
+    let status = repo
+        .status(gix::progress::Discard)
+        .map_err(|e| VcsError::Status(e.to_string()))?;
+    // Restricting the iterator to this one pathspec is what keeps the
+    // underlying walk proportional to `claimed_path` rather than the whole
+    // working tree — see this function's doc.
+    let iter = status
+        .into_iter(vec![gix::bstr::BString::from(rel_str)])
+        .map_err(|e| VcsError::Status(e.to_string()))?;
+
+    // The pathspec already restricts results to `claimed_path`; any item at
+    // all (checking just the first is enough) means git considers it
+    // changed.
+    let is_dirty = match iter.into_iter().next() {
+        Some(item) => {
+            item.map_err(|e| VcsError::Status(e.to_string()))?;
+            true
+        }
+        None => false,
+    };
+
+    Ok(PathStatus {
+        is_repo: true,
+        head_commit,
+        is_dirty,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,29 +335,35 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reports_head_commit_after_a_real_commit() {
-        let dir = temp_dir();
-        // SAFETY-relevant only in the sense that this mutates process-wide
-        // environment state; acceptable in a test binary and scoped to
-        // values `gix::Repository::commit`'s author/committer lookup reads
-        // (`GIT_AUTHOR_*`/`GIT_COMMITTER_*`), matching real git's own
-        // fallback order (repo config, then these env vars, then
-        // `user.name`/`user.email`).
+    /// Sets the process-wide `GIT_AUTHOR_*`/`GIT_COMMITTER_*` env vars
+    /// `gix::Repository::commit`'s author/committer lookup reads (matching
+    /// real git's own fallback order: repo config, then these env vars,
+    /// then `user.name`/`user.email`). SAFETY-relevant only in the sense
+    /// that it mutates process-wide state; acceptable in a test binary.
+    fn set_test_git_identity() {
         std::env::set_var("GIT_AUTHOR_NAME", "Fornax Test");
         std::env::set_var("GIT_AUTHOR_EMAIL", "fornax-test@example.invalid");
         std::env::set_var("GIT_COMMITTER_NAME", "Fornax Test");
         std::env::set_var("GIT_COMMITTER_EMAIL", "fornax-test@example.invalid");
+    }
 
-        let repo = gix::init(&dir).expect("gix::init");
-        let blob_id = repo
-            .write_blob(b"hello\n".as_slice())
-            .expect("write blob")
-            .detach();
+    /// Writes `content` as a single-file commit named `filename` at the
+    /// root of `repo` — object database only, via `gix`'s own write/commit
+    /// APIs (no `git` CLI, matching FORNX-238's zero-subprocess invariant).
+    /// Returns the tree and commit IDs so callers can build a matching
+    /// index (see `commit_and_index_single_file` for the fully-synced
+    /// variant).
+    fn commit_single_file(
+        repo: &gix::Repository,
+        filename: &str,
+        content: &[u8],
+    ) -> (gix::ObjectId, gix::ObjectId) {
+        set_test_git_identity();
+        let blob_id = repo.write_blob(content).expect("write blob").detach();
         let tree = gix::objs::Tree {
             entries: vec![gix::objs::tree::Entry {
                 mode: gix::objs::tree::EntryKind::Blob.into(),
-                filename: "claimed.txt".into(),
+                filename: filename.into(),
                 oid: blob_id,
             }],
         };
@@ -251,7 +375,42 @@ mod tests {
                 tree_id,
                 std::iter::empty::<gix::ObjectId>(),
             )
-            .expect("commit");
+            .expect("commit")
+            .detach();
+        (tree_id, commit_id)
+    }
+
+    /// Like `commit_single_file`, but also writes the working-tree file and
+    /// persists a real `.git/index` built from the committed tree, so the
+    /// resulting repository is genuinely clean end-to-end: `HEAD`'s tree,
+    /// the index, and the working tree all agree — the real "committed and
+    /// unmodified" case, distinct from an empty/unborn repo (which is
+    /// trivially "clean" only because there is nothing to compare).
+    fn commit_and_index_single_file(
+        repo: &gix::Repository,
+        repo_dir: &Path,
+        filename: &str,
+        content: &[u8],
+    ) -> gix::ObjectId {
+        std::fs::write(repo_dir.join(filename), content).expect("write working-tree file");
+        let (tree_id, commit_id) = commit_single_file(repo, filename, content);
+
+        let index_state = gix::index::State::from_tree(&tree_id, &repo.objects, Default::default())
+            .expect("build index state from tree");
+        let mut index_file =
+            gix::index::File::from_state(index_state, repo.git_dir().join("index"));
+        index_file
+            .write(gix::index::write::Options::default())
+            .expect("persist index");
+
+        commit_id
+    }
+
+    #[test]
+    fn reports_head_commit_after_a_real_commit() {
+        let dir = temp_dir();
+        let repo = gix::init(&dir).expect("gix::init");
+        let (_tree_id, commit_id) = commit_single_file(&repo, "claimed.txt", b"hello\n");
 
         let status = working_tree_status(&dir).expect("query should not error");
         std::fs::remove_dir_all(&dir).ok();
@@ -278,5 +437,95 @@ mod tests {
         let result = working_tree_status(&bogus);
 
         assert!(matches!(result, Err(VcsError::Open(_))), "{result:?}");
+    }
+
+    // --- path_status ---------------------------------------------------
+
+    #[test]
+    fn path_status_reports_not_a_repo_outside_any_git_repo() {
+        let dir = temp_dir();
+        let file = dir.join("claimed.txt");
+        std::fs::write(&file, "hello\n").expect("write file");
+
+        let status = path_status(&file).expect("query should not error");
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(!status.is_repo);
+        assert!(!status.is_dirty);
+    }
+
+    #[test]
+    fn path_status_reports_an_untracked_claimed_file_as_dirty() {
+        let dir = temp_dir();
+        gix::init(&dir).expect("gix::init");
+        let file = dir.join("claimed.txt");
+        std::fs::write(&file, "hello\n").expect("write file");
+
+        let status = path_status(&file).expect("query should not error");
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(status.is_repo);
+        assert!(status.is_dirty);
+    }
+
+    /// The real "clean" case per the task brief: the claimed file is
+    /// committed, its index entry matches, and the working-tree copy is
+    /// byte-identical — not merely "a repo with nothing in it yet".
+    #[test]
+    fn path_status_reports_a_committed_unmodified_file_as_clean() {
+        let dir = temp_dir();
+        let repo = gix::init(&dir).expect("gix::init");
+        commit_and_index_single_file(&repo, &dir, "claimed.txt", b"hello\n");
+        let file = dir.join("claimed.txt");
+
+        let status = path_status(&file).expect("query should not error");
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(status.is_repo);
+        assert!(status.head_commit.is_some());
+        assert!(
+            !status.is_dirty,
+            "a committed file whose working-tree copy is unmodified must not read as dirty"
+        );
+    }
+
+    /// A genuinely just-modified tracked file (committed once, then
+    /// overwritten on disk without a new commit) must read as dirty — the
+    /// positive counterpart to the clean case above, both built from the
+    /// same committed-and-indexed starting point.
+    #[test]
+    fn path_status_reports_a_modified_tracked_file_as_dirty() {
+        let dir = temp_dir();
+        let repo = gix::init(&dir).expect("gix::init");
+        commit_and_index_single_file(&repo, &dir, "claimed.txt", b"hello\n");
+        let file = dir.join("claimed.txt");
+        std::fs::write(&file, "changed\n").expect("modify working-tree file");
+
+        let status = path_status(&file).expect("query should not error");
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(status.is_dirty);
+    }
+
+    /// Documents an honest boundary of `is_dirty`, rather than leaving it
+    /// implicit: a gitignored path that was genuinely just written reports
+    /// `false` here too, the same as a real clean file — `git
+    /// status --ignored=no`'s own default behavior, which this sensor
+    /// inherits rather than overrides. Callers must not read `is_dirty:
+    /// false` as "this path is clean" in every sense; see `PathStatus::
+    /// is_dirty`'s doc.
+    #[test]
+    fn path_status_does_not_flag_a_gitignored_file_as_dirty() {
+        let dir = temp_dir();
+        gix::init(&dir).expect("gix::init");
+        std::fs::write(dir.join(".gitignore"), "ignored.txt\n").expect("write .gitignore");
+        let file = dir.join("ignored.txt");
+        std::fs::write(&file, "hello\n").expect("write ignored file");
+
+        let status = path_status(&file).expect("query should not error");
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(status.is_repo);
+        assert!(!status.is_dirty);
     }
 }
