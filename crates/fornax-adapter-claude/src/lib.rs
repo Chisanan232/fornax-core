@@ -716,10 +716,18 @@ impl EvidenceSensor for ClaudeFileWriteConfirmedSensor {
                 // symmetrically rather than assuming which clock is ahead.
                 delta <= self.tolerance && delta >= -self.tolerance
             }
-            // Can't check timing without a parseable observed_at — fall
-            // back to the existence check alone rather than fabricating a
-            // timing verdict.
-            Err(_) => true,
+            Err(e) => {
+                // `translate()` always stamps a parseable RFC3339
+                // `observed_at`, so this is unreachable in production —
+                // still handled honestly rather than fabricating a timing
+                // verdict, matching the sibling `meta.modified()` failure
+                // branch above: a check that couldn't run is a collection
+                // failure, not a silent pass.
+                return SensorOutcome::not_collected(
+                    SignalAvailability::CollectionFailed,
+                    Some(format!("event.observed_at is not valid RFC3339: {e}")),
+                );
+            }
         };
 
         SensorOutcome::collected(vec![self.build_evidence(
@@ -1726,6 +1734,26 @@ mod tests {
         assert_eq!(ev.payload["observation"]["exists"], false);
         assert_eq!(ev.payload["observation"]["consistent_with_claim"], false);
         assert!(ev.payload["observation"]["modified_at"].is_null());
+    }
+
+    /// A stat error that is *not* "path doesn't exist" (e.g. treating a
+    /// plain file as if it were a directory, which yields `ENOTDIR`, not
+    /// `NotFound`) must be reported as `CollectionFailed`, distinct from
+    /// the honest `exists: false` negative above — a failed attempt is not
+    /// the same claim as a confirmed absence.
+    #[test]
+    fn file_write_confirmed_sensor_reports_collection_failed_on_a_non_not_found_stat_error() {
+        let file = temp_file("not a directory\n");
+        let bogus_child = file.join("child");
+        let observed_at = chrono::Utc::now().to_rfc3339();
+        let event = file_write_event("Write", bogus_child.to_str().unwrap(), &observed_at);
+        let sensor = ClaudeFileWriteConfirmedSensor::with_default_tolerance(ADAPTER_VERSION);
+        let outcome = sensor.collect(&event, &ClaudeAdapter.probe());
+
+        std::fs::remove_file(&file).ok();
+
+        assert!(!outcome.has_evidence());
+        assert_eq!(outcome.state, SignalAvailability::CollectionFailed);
     }
 
     /// The file exists but was last modified far outside the tolerance
