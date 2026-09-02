@@ -85,10 +85,116 @@
 //!   (FORNX-106) — [`fornax_types::DatasetLineageTag`] already exists for a
 //!   future enforcement mechanism to attach to; this module does not
 //!   persist anything itself.
+//!
+//! # Privacy gate (FORNX-105 AC 5)
+//!
+//! Historical reliability aggregation is a purely local computation over
+//! local observations — it is not a network egress concern, so gating it on
+//! [`fornax_types::privacy::cloud_sync_allowed`] would be the wrong fit
+//! (that flag controls whether data leaves the machine at all, and
+//! inverting it here would mean "enable cloud sync to get local stats",
+//! contradicting the local-first stance, ADR-0001 D2). Instead
+//! [`ReliabilityAggregationConfig`] is a small additive `[reliability]`
+//! table in `$FORNAX_HOME/config.toml`, modeled beat-for-beat on
+//! [`crate::judge::SemanticJudgeConfig`] (same config file, same
+//! load/from_toml_str/load_default contract, same "absent means default"
+//! rule) — `historical_aggregation_enabled` defaults to `false`, so a user
+//! who has never touched this config gets no historical aggregation at all
+//! until they explicitly opt in.
 
 use serde::{Deserialize, Serialize};
 
 use fornax_types::{evaluate_sample_support, ReliabilityContextKey, SampleSupport};
+
+/// `[reliability]` config table read from `$FORNAX_HOME/config.toml`
+/// (FORNX-105 AC 5), mirroring [`crate::judge::SemanticJudgeConfig`]'s own
+/// load pattern.
+///
+/// ```toml
+/// [reliability]
+/// historical_aggregation_enabled = true
+/// ```
+///
+/// Absence of the file, absence of the `[reliability]` table, or absence of
+/// the key all fall back to [`Self::default`] — `historical_aggregation_enabled:
+/// false`. A user who has never touched this config gets historical
+/// reliability aggregation off by default, matching this ADR's D2
+/// local-first, opt-in stance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ReliabilityAggregationConfig {
+    pub historical_aggregation_enabled: bool,
+}
+
+/// Failure modes reading/parsing the `[reliability]` table. Mirrors
+/// [`crate::judge::SemanticJudgeConfigError`]'s shape.
+#[derive(Debug, thiserror::Error)]
+pub enum ReliabilityConfigError {
+    #[error("failed to read {path}: {source}")]
+    Io {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to parse {path} as TOML: {source}")]
+    Parse {
+        path: std::path::PathBuf,
+        #[source]
+        source: toml_edit::TomlError,
+    },
+}
+
+impl ReliabilityAggregationConfig {
+    fn from_toml_str_with_path(
+        contents: &str,
+        path: &std::path::Path,
+    ) -> Result<Self, ReliabilityConfigError> {
+        let doc: toml_edit::DocumentMut =
+            contents
+                .parse()
+                .map_err(|source| ReliabilityConfigError::Parse {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+        let default = Self::default();
+        let Some(table) = doc.get("reliability") else {
+            return Ok(default);
+        };
+        let historical_aggregation_enabled = table
+            .get("historical_aggregation_enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default.historical_aggregation_enabled);
+        Ok(Self {
+            historical_aggregation_enabled,
+        })
+    }
+
+    /// Parse an in-memory `config.toml` document (e.g. from a test).
+    pub fn from_toml_str(contents: &str) -> Result<Self, ReliabilityConfigError> {
+        Self::from_toml_str_with_path(contents, std::path::Path::new("<in-memory config.toml>"))
+    }
+
+    /// Read `<fornax_home>/config.toml`'s `[reliability]` table. A
+    /// nonexistent file yields [`Self::default`] (disabled), not an error —
+    /// same contract as [`crate::judge::SemanticJudgeConfig::load`].
+    pub fn load(fornax_home: &std::path::Path) -> Result<Self, ReliabilityConfigError> {
+        let path = fornax_home.join(fornax_types::sensor_config::SENSOR_CONFIG_FILE);
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(source) => return Err(ReliabilityConfigError::Io { path, source }),
+        };
+        Self::from_toml_str_with_path(&contents, &path)
+    }
+
+    /// [`Self::load`] against
+    /// [`fornax_types::sensor_config::default_fornax_home`], collapsing any
+    /// error to [`Self::default`] (disabled) — same "never fail a read over
+    /// a config-file problem" contract as
+    /// [`crate::judge::SemanticJudgeConfig::load_default`].
+    pub fn load_default() -> Self {
+        Self::load(&fornax_types::sensor_config::default_fornax_home()).unwrap_or_default()
+    }
+}
 
 /// Version of this module's computation policy — bumped whenever the
 /// estimator, the confidence level, or the drift-comparison rule changes in
@@ -779,5 +885,71 @@ mod tests {
         let baseline_key = key_with("claude-sonnet-4");
         let comparison_key = key_with("claude-sonnet-5");
         assert!(differing_non_version_dimensions(&baseline_key, &comparison_key).is_empty());
+    }
+
+    // --- AC 5: privacy/opt-in gate for historical aggregation --------------
+
+    #[test]
+    fn reliability_aggregation_defaults_disabled_when_config_absent() {
+        assert_eq!(
+            ReliabilityAggregationConfig::default(),
+            ReliabilityAggregationConfig {
+                historical_aggregation_enabled: false,
+            }
+        );
+        // No file at all, and no [reliability] table, and no key -- all
+        // three "absence" shapes must yield the same disabled default.
+        assert!(
+            !ReliabilityAggregationConfig::from_toml_str("")
+                .unwrap()
+                .historical_aggregation_enabled
+        );
+        assert!(
+            !ReliabilityAggregationConfig::from_toml_str("[other_table]\nx = 1\n")
+                .unwrap()
+                .historical_aggregation_enabled
+        );
+        assert!(
+            !ReliabilityAggregationConfig::from_toml_str("[reliability]\n")
+                .unwrap()
+                .historical_aggregation_enabled
+        );
+    }
+
+    #[test]
+    fn reliability_aggregation_can_be_explicitly_enabled() {
+        let cfg = ReliabilityAggregationConfig::from_toml_str(
+            "[reliability]\nhistorical_aggregation_enabled = true\n",
+        )
+        .unwrap();
+        assert!(cfg.historical_aggregation_enabled);
+    }
+
+    #[test]
+    fn reliability_aggregation_load_nonexistent_home_yields_disabled_default_not_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "fornax-reliability-config-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        // Deliberately do not create `dir` -- config.toml under it does not exist.
+        let cfg = ReliabilityAggregationConfig::load(&dir).unwrap();
+        assert!(!cfg.historical_aggregation_enabled);
+    }
+
+    #[test]
+    fn reliability_aggregation_load_reads_an_explicit_config_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "fornax-reliability-config-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(fornax_types::sensor_config::SENSOR_CONFIG_FILE),
+            "[reliability]\nhistorical_aggregation_enabled = true\n",
+        )
+        .unwrap();
+        let cfg = ReliabilityAggregationConfig::load(&dir).unwrap();
+        assert!(cfg.historical_aggregation_enabled);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
