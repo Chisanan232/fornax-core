@@ -160,6 +160,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/status", get(api_status))
         .route("/api/findings/recent", get(api_findings_recent))
         .route("/api/capabilities", get(api_capabilities))
+        .route("/api/evidence-graph", get(api_evidence_graph))
         .route("/dashboard", get(dashboard))
         .with_state(state);
 
@@ -445,6 +446,77 @@ async fn api_capabilities(
             "capabilities": caps,
         })),
         Err(e) => Json(serde_json::json!({ "session": q.session, "error": e.to_string() })),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct EvidenceGraphQuery {
+    claim: String,
+    session: String,
+}
+
+/// FORNX-90: exposes `Store::evidence_graph_for_claim` (FORNX-89) as the
+/// daemon-side half of the local Evidence Explorer — `fornax evidence-graph
+/// <claim> <session>` reads this. This endpoint surfaces only `EvidenceLink`/
+/// `MissingEvidence` rows — evidence ids and relation/availability metadata,
+/// no evidence payload content at all (`EvidenceLink` doesn't carry one) —
+/// so no redaction step applies on this path. A redaction-safe payload
+/// drill-down (this ticket's AC also asks for one) is not built here; were
+/// it added, it would need to read the already-redacted `Evidence` rows
+/// (`handle_message` runs every `Evidence`/`Claim` through
+/// `redact_json`/`redact_text` on ingest, see the `*_redacted_before_storage`
+/// regression tests above), which would already satisfy that boundary
+/// without any further redaction step of its own.
+///
+/// Distinguishes three cases, matching this ticket's core invariant that
+/// "no evidence found" must never be silently conflated with "the claim
+/// itself doesn't exist" or "evidence was expected but is missing":
+/// - the claim id is not on record for this session at all -> `found: false`
+/// - the claim exists but has zero links and zero missing-evidence notes
+///   ("nobody has looked") -> `found: true`, empty `links`/`missing`
+/// - the claim exists with links and/or missing notes -> `found: true`,
+///   populated `links`/`missing`
+///
+/// Scoped by `(claim, session)` together, mirroring
+/// `evidence_graph_for_claim`'s own authorization-boundary scoping — a
+/// caller cannot probe another session's claim ids.
+async fn api_evidence_graph(
+    State(state): State<AppState>,
+    Query(q): Query<EvidenceGraphQuery>,
+) -> Json<serde_json::Value> {
+    let claims = match state.store.claims_for_session(&q.session).await {
+        Ok(claims) => claims,
+        Err(e) => {
+            return Json(
+                serde_json::json!({ "claim": q.claim, "session": q.session, "error": e.to_string() }),
+            )
+        }
+    };
+    let claim_exists = claims.iter().any(|c| c.id.to_string() == q.claim);
+    if !claim_exists {
+        return Json(serde_json::json!({
+            "claim": q.claim,
+            "session": q.session,
+            "found": false,
+            "reason": "no claim with this id is on record for this session",
+        }));
+    }
+
+    match state
+        .store
+        .evidence_graph_for_claim(&q.claim, &q.session)
+        .await
+    {
+        Ok(graph) => Json(serde_json::json!({
+            "claim": q.claim,
+            "session": q.session,
+            "found": true,
+            "links": graph.links,
+            "missing": graph.missing,
+        })),
+        Err(e) => Json(
+            serde_json::json!({ "claim": q.claim, "session": q.session, "error": e.to_string() }),
+        ),
     }
 }
 
