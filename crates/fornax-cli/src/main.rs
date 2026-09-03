@@ -681,6 +681,26 @@ fn render_policy_status(v: &serde_json::Value) -> String {
                 .unwrap_or(""),
         ));
     }
+    // FORNX-311: rendered as its own line, one of 8 outcomes -- never
+    // collapsed into a boolean.
+    match v.get("last_poll") {
+        Some(poll) if !poll.is_null() => {
+            out.push_str(&format!(
+                "last_poll: [{}] {} (bundles_received={} consecutive_failures={} \
+                 attempted_at={} next_attempt_at={})\n",
+                poll.get("outcome").unwrap_or(&serde_json::Value::Null),
+                poll.get("detail").and_then(|m| m.as_str()).unwrap_or(""),
+                poll.get("bundles_received")
+                    .unwrap_or(&serde_json::Value::Null),
+                poll.get("consecutive_failures")
+                    .unwrap_or(&serde_json::Value::Null),
+                poll.get("attempted_at").unwrap_or(&serde_json::Value::Null),
+                poll.get("next_attempt_at")
+                    .unwrap_or(&serde_json::Value::Null),
+            ));
+        }
+        _ => out.push_str("last_poll: none (no poll cycle has completed yet)\n"),
+    }
     out
 }
 

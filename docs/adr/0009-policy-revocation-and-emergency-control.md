@@ -380,11 +380,14 @@ oversights of this specific ticket.
 ## Out of scope (prerequisite follow-up tickets, not built here)
 
 - **Cloud→device policy distribution channel** — the biggest named gap
-  (honest limit #1).
+  (honest limit #1). **Closed by ADR-0010 (FORNX-311)** on the device
+  (fornax-core) side; the fornax-cloud fetch-endpoint half lands as a
+  separate PR in that repo.
 - **A `SignedPolicyBundle` producer in `fornax-cloud`** — a separate
   ticket. `fornax-cloud`'s FORNX-123 half builds revocation artifacts
   only, not policy bundle artifacts; no bundle producer exists anywhere
-  in either repo yet.
+  in either repo yet. **Closed by fornax-cloud's own FORNX-311 PR** (out
+  of this repo) — ADR-0010 references but does not build or review it.
 - **Enforcement wiring that consumes `PolicyPosture`/`EffectivePolicy`'s
   outcome to actually change what gets blocked** — a future
   enforcement-wiring ticket.
