@@ -436,14 +436,40 @@ impl Store {
         cursor: Option<&str>,
         batch_size: i64,
     ) -> Result<SweepReport> {
-        let mut tx = self.pool.begin().await?;
+        // BEGIN IMMEDIATE (never the plain deferred BEGIN `Pool::begin()`
+        // issues): this transaction races a concurrent live insert on a
+        // different pool connection with neither side holding
+        // `AppState::processing` (see this method's module-level "does not
+        // block a concurrent insert" doc). A deferred transaction that
+        // later tries to write after another writer has committed gets an
+        // immediate `SQLITE_BUSY_SNAPSHOT` — not a bounded wait — because
+        // its read snapshot is now stale; acquiring the write lock
+        // immediately avoids that class of error entirely, leaving only an
+        // ordinary, `busy_timeout`-bounded lock wait.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
 
+        // Keyset pagination on (recorded_at, record_table, record_id) —
+        // NOT `recorded_at` alone. Many tags can legitimately share the
+        // exact same `recorded_at` (multiple records written in the same
+        // instant, or a synthetic backlog for testing); a cursor on
+        // `recorded_at` alone would silently strand every row tied with
+        // the last-examined one on the far side of `>`, since none of them
+        // compares strictly greater. `(record_table, record_id)` is
+        // already this table's natural identity for one lineage tag (see
+        // the DELETE below), so it is a correct, always-available
+        // tie-breaker with no schema change needed.
+        let (cursor_recorded_at, cursor_table, cursor_id) = parse_sweep_cursor(cursor);
         let rows = sqlx::query_as::<_, LineageTagRow>(
             "SELECT record_table, record_id, schema_version, retention_class, tenant_ref,
                     source_record_ids, recorded_at, deletion_requested_at
-             FROM dataset_lineage_tags WHERE recorded_at > ?1 ORDER BY recorded_at ASC LIMIT ?2",
+             FROM dataset_lineage_tags
+             WHERE (recorded_at, record_table, record_id) > (?1, ?2, ?3)
+             ORDER BY recorded_at ASC, record_table ASC, record_id ASC
+             LIMIT ?4",
         )
-        .bind(cursor.unwrap_or(""))
+        .bind(&cursor_recorded_at)
+        .bind(&cursor_table)
+        .bind(&cursor_id)
         .bind(batch_size)
         .fetch_all(&mut *tx)
         .await?;
@@ -453,12 +479,16 @@ impl Store {
             examined,
             ..Default::default()
         };
-        let mut last_recorded_at: Option<String> = None;
+        let mut last_key: Option<(String, String, String)> = None;
 
         for row in rows {
             let recorded_at = row.recorded_at.clone();
-            last_recorded_at = Some(recorded_at.clone());
             let record: LineageTagRecord = row.try_into()?;
+            last_key = Some((
+                recorded_at.clone(),
+                record.record_table.clone(),
+                record.record_id.clone(),
+            ));
 
             if !is_expired(&recorded_at, &record.tag.retention_class, now) {
                 continue;
@@ -508,11 +538,34 @@ impl Store {
 
         report.more_remaining = examined == batch_size as usize;
         report.next_cursor = if report.more_remaining {
-            last_recorded_at
+            last_key.map(|(recorded_at, table, id)| sweep_cursor_token(&recorded_at, &table, &id))
         } else {
             None
         };
         Ok(report)
+    }
+}
+
+/// Unit-separator-joined opaque cursor token for
+/// [`Store::sweep_expired_records`]'s keyset pagination — never meant to be
+/// parsed by a caller, only round-tripped back as the next call's `cursor`.
+fn sweep_cursor_token(recorded_at: &str, record_table: &str, record_id: &str) -> String {
+    format!("{recorded_at}\u{1}{record_table}\u{1}{record_id}")
+}
+
+/// Inverse of [`sweep_cursor_token`]. `None`, or a token that doesn't split
+/// into exactly three parts (should never happen for a token this module
+/// itself produced), starts from the very beginning of the table — every
+/// real `recorded_at`/`record_table`/`record_id` sorts strictly greater
+/// than three empty strings.
+fn parse_sweep_cursor(cursor: Option<&str>) -> (String, String, String) {
+    let Some(cursor) = cursor else {
+        return (String::new(), String::new(), String::new());
+    };
+    let mut parts = cursor.splitn(3, '\u{1}');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(a), Some(b), Some(c)) => (a.to_string(), b.to_string(), c.to_string()),
+        _ => (String::new(), String::new(), String::new()),
     }
 }
 
@@ -587,7 +640,9 @@ pub struct SweepReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fornax_types::{AgentEvent, EventKind, Provider};
+    use fornax_types::{
+        AgentEvent, Claim, EventKind, Evidence, EvidenceKind, Finding, Provider, Verdict,
+    };
     use uuid::Uuid;
 
     fn tmp_db_path(name: &str) -> std::path::PathBuf {
@@ -887,6 +942,423 @@ mod tests {
             .await
             .expect("delete for a tenant with no records");
         assert_eq!(report.total_processed(), 0);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    // --- FORNX-319 AC1: every insert path records a lineage tag ------------
+
+    async fn seed_full_record_set(store: &Store) -> (AgentEvent, Claim, Evidence, Finding) {
+        let event = AgentEvent {
+            id: Uuid::new_v4(),
+            session_id: "fornx-319-session".to_string(),
+            provider: Provider::ClaudeCode,
+            kind: EventKind::PostToolUse,
+            observed_at: "2026-01-01T00:00:00Z".into(),
+            tool_name: Some("Bash".into()),
+            tool_input: None,
+            tool_response: None,
+            raw: serde_json::json!({}),
+        };
+        store.insert_event(&event).await.expect("insert event");
+
+        let claim = Claim {
+            id: Uuid::new_v4(),
+            session_id: event.session_id.clone(),
+            source_event_id: event.id,
+            text: "all tests passed".into(),
+            subject: "test_result".into(),
+            claimed_at: "2026-01-01T00:00:01Z".into(),
+        };
+        store.insert_claim(&claim).await.expect("insert claim");
+
+        let evidence = Evidence {
+            id: Uuid::new_v4(),
+            session_id: event.session_id.clone(),
+            source_event_id: event.id,
+            kind: EvidenceKind::ExitCode,
+            observed_at: "2026-01-01T00:00:01Z".into(),
+            payload: serde_json::json!({"command": ["pytest"], "exit_code": 0}),
+            provenance: "test".into(),
+            source: None,
+            extension: None,
+            evidence_purged: false,
+        };
+        store
+            .insert_evidence(&evidence)
+            .await
+            .expect("insert evidence");
+
+        let finding = Finding {
+            id: Uuid::new_v4(),
+            claim_id: claim.id,
+            verdict: Verdict::Verified,
+            evidence_ids: vec![evidence.id],
+            verifier_name: "test_result_verifier_v1".into(),
+            rationale: "exit_code=0".into(),
+            computed_at: "2026-01-01T00:00:02Z".into(),
+        };
+        store
+            .insert_finding(&finding)
+            .await
+            .expect("insert finding");
+
+        (event, claim, evidence, finding)
+    }
+
+    #[tokio::test]
+    async fn every_row_written_through_the_four_insert_paths_gets_a_lineage_tag() {
+        let path = tmp_db_path("ac1-lineage-tagging");
+        let store = Store::open(&path).await.expect("open db");
+
+        let (event, claim, evidence, finding) = seed_full_record_set(&store).await;
+
+        for (table, id, expected_class) in [
+            (
+                "agent_events",
+                event.id.to_string(),
+                RetentionClass::RawLocal,
+            ),
+            ("claims", claim.id.to_string(), RetentionClass::RawLocal),
+            (
+                "evidence",
+                evidence.id.to_string(),
+                RetentionClass::RawLocal,
+            ),
+            (
+                "findings",
+                finding.id.to_string(),
+                RetentionClass::DerivedFinding,
+            ),
+        ] {
+            let row: (String,) = sqlx::query_as(
+                "SELECT retention_class FROM dataset_lineage_tags WHERE record_table = ?1 AND record_id = ?2",
+            )
+            .bind(table)
+            .bind(&id)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap_or_else(|e| panic!("{table} row {id} must have exactly one lineage tag: {e}"));
+            let actual_class: RetentionClass =
+                serde_json::from_value(serde_json::Value::String(row.0)).unwrap();
+            assert_eq!(
+                actual_class, expected_class,
+                "{table} row must be tagged with the AC1-documented retention class"
+            );
+        }
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    // --- FORNX-319 AC2/AC3: evidence/metadata separation --------------------
+
+    #[tokio::test]
+    async fn purge_evidence_payload_overwrites_only_the_payload_with_an_honest_marker() {
+        let path = tmp_db_path("ac2-purge-payload");
+        let store = Store::open(&path).await.expect("open db");
+        let (_event, _claim, evidence, _finding) = seed_full_record_set(&store).await;
+
+        let purged = store
+            .purge_evidence_payload(&evidence.id.to_string())
+            .await
+            .expect("purge evidence payload");
+        assert!(purged, "a real row existed and must report as purged");
+
+        let fetched = store
+            .evidence_for_session("fornx-319-session")
+            .await
+            .expect("query evidence")
+            .evidence;
+        let ev = fetched
+            .iter()
+            .find(|e| e.id == evidence.id)
+            .expect("evidence row must still exist — purge is a soft update, not a delete");
+        assert!(ev.evidence_purged);
+        assert_eq!(ev.payload, evidence_expired_payload_marker());
+        assert_ne!(
+            ev.payload,
+            serde_json::json!({}),
+            "an empty object reads as 'empty evidence was collected' — AC3 forbids exactly this"
+        );
+        assert_eq!(
+            ev.payload["evidence_expired"],
+            serde_json::json!(true),
+            "the payload must explicitly say evidence expired, not render as UNAVAILABLE or absent"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn sweep_purges_expired_evidence_leaving_finding_verdict_and_rationale_byte_for_byte_intact(
+    ) {
+        let path = tmp_db_path("ac2-ac3-sweep-purge");
+        let store = Store::open(&path).await.expect("open db");
+        let (_event, _claim, evidence, finding) = seed_full_record_set(&store).await;
+
+        // Backdate ONLY the evidence lineage tag past RAW_LOCAL_RETENTION —
+        // simulates real elapsed time without waiting 30 real days.
+        let backdated = (Utc::now()
+            - chrono::Duration::from_std(RAW_LOCAL_RETENTION).unwrap()
+            - chrono::Duration::days(1))
+        .to_rfc3339();
+        sqlx::query(
+            "UPDATE dataset_lineage_tags SET recorded_at = ?1 WHERE record_table = 'evidence' AND record_id = ?2",
+        )
+        .bind(&backdated)
+        .bind(evidence.id.to_string())
+        .execute(&store.pool)
+        .await
+        .expect("backdate evidence lineage tag");
+
+        let before = store
+            .finding_by_id(&finding.id.to_string())
+            .await
+            .expect("query finding before sweep")
+            .expect("finding exists before sweep");
+
+        let report = store
+            .sweep_expired_records(Utc::now(), None, 100)
+            .await
+            .expect("sweep");
+        assert_eq!(report.purged_evidence, 1);
+        assert_eq!(
+            report.deleted_records, 0,
+            "the event/claim/finding lineage tags are not yet expired"
+        );
+
+        let after = store
+            .finding_by_id(&finding.id.to_string())
+            .await
+            .expect("query finding after sweep")
+            .expect("finding must survive a purge of its own evidence (ADR-0001 D4)");
+        assert_eq!(before.verdict, after.verdict, "verdict must never change");
+        assert_eq!(before.rationale, after.rationale);
+        assert_eq!(before.evidence_ids, after.evidence_ids);
+        assert_eq!(before.verifier_name, after.verifier_name);
+        assert_eq!(before.computed_at, after.computed_at);
+
+        let evidence_after = store
+            .evidence_for_session("fornx-319-session")
+            .await
+            .expect("query evidence after sweep")
+            .evidence;
+        let ev = evidence_after
+            .iter()
+            .find(|e| e.id == evidence.id)
+            .expect("evidence row still exists — soft purge, not delete");
+        assert!(ev.evidence_purged);
+        assert_eq!(ev.payload, evidence_expired_payload_marker());
+
+        let remaining_tag_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM dataset_lineage_tags WHERE record_table = 'evidence' AND record_id = ?1",
+        )
+        .bind(evidence.id.to_string())
+        .fetch_one(&store.pool)
+        .await
+        .expect("count remaining lineage tags");
+        assert_eq!(
+            remaining_tag_count, 0,
+            "a processed (expired) tag must be removed"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    // --- FORNX-319 AC5/AC6: sweep expiry check reuses retention_duration_for,
+    // including for Unrecognized ---------------------------------------------
+
+    #[test]
+    fn is_expired_uses_retention_duration_for_the_exact_threshold_and_the_unrecognized_safe_default(
+    ) {
+        let now = Utc::now();
+        let raw_local = chrono::Duration::from_std(RAW_LOCAL_RETENTION).unwrap();
+        let just_under = (now - raw_local + chrono::Duration::seconds(5)).to_rfc3339();
+        let just_over = (now - raw_local - chrono::Duration::seconds(5)).to_rfc3339();
+
+        assert!(!is_expired(&just_under, &RetentionClass::RawLocal, now));
+        assert!(is_expired(&just_over, &RetentionClass::RawLocal, now));
+
+        // AC6 regression: an Unrecognized class is swept at the same
+        // (shortest, safest) duration as RawLocal, per
+        // retention_duration_for's own safe default.
+        let unrecognized = RetentionClass::Unrecognized("quarantined_pending_review".to_string());
+        assert!(!is_expired(&just_under, &unrecognized, now));
+        assert!(is_expired(&just_over, &unrecognized, now));
+
+        // A malformed timestamp must never be guessed as expired.
+        assert!(!is_expired(
+            "not-a-timestamp",
+            &RetentionClass::RawLocal,
+            now
+        ));
+    }
+
+    // --- FORNX-319 AC4: bounded, incremental sweep --------------------------
+
+    async fn insert_synthetic_backlog(store: &Store, count: usize, recorded_at: &str) {
+        let mut tx = store.pool.begin().await.expect("begin backlog tx");
+        for i in 0..count {
+            sqlx::query(
+                "INSERT INTO dataset_lineage_tags
+                    (id, record_table, record_id, schema_version, retention_class, tenant_ref,
+                     source_record_ids, recorded_at, deletion_requested_at)
+                 VALUES (?1, 'ac4_synthetic_backlog_table', ?2, 1, 'raw_local', 'ac4-tenant', '[]', ?3, NULL)",
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(format!("synthetic-row-{i}"))
+            .bind(recorded_at)
+            .execute(&mut *tx)
+            .await
+            .expect("hand-insert synthetic backlog row");
+        }
+        tx.commit().await.expect("commit backlog");
+    }
+
+    #[tokio::test]
+    async fn sweep_processes_a_large_backlog_in_bounded_batches_across_multiple_calls() {
+        let path = tmp_db_path("ac4-bounded-batches");
+        let store = Store::open(&path).await.expect("open db");
+
+        let expired_at = (Utc::now() - chrono::Duration::days(400)).to_rfc3339();
+        insert_synthetic_backlog(&store, 2500, &expired_at).await;
+
+        let batch_size = 400i64;
+        let mut cursor: Option<String> = None;
+        let mut total_examined = 0usize;
+        let mut total_unknown_skipped = 0usize;
+        let mut calls = 0usize;
+
+        loop {
+            let report = store
+                .sweep_expired_records(Utc::now(), cursor.as_deref(), batch_size)
+                .await
+                .expect("sweep batch");
+            calls += 1;
+            assert!(
+                report.examined <= batch_size as usize,
+                "one call must never examine more than one bounded batch"
+            );
+            total_examined += report.examined;
+            total_unknown_skipped += report.unknown_table_skipped;
+            if report.examined == 0 {
+                break;
+            }
+            cursor = report.next_cursor.clone();
+            if cursor.is_none() {
+                break;
+            }
+        }
+
+        assert!(
+            calls > 1,
+            "a 2500-row backlog with a 400-row batch must take multiple calls, never one pass"
+        );
+        assert_eq!(total_examined, 2500);
+        assert_eq!(
+            total_unknown_skipped, 2500,
+            "the synthetic backlog's table is unrecognized, so every expired row is skipped \
+             (not deleted) but its lineage tag is still removed"
+        );
+
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM dataset_lineage_tags WHERE record_table = 'ac4_synthetic_backlog_table'",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "every processed (expired) tag must be removed"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Scoped to the store layer directly (not the full daemon-binary
+    /// harness `concurrent_hook_submission.rs` uses) — the sweep logic
+    /// under test lives entirely in `Store`, with no daemon-process
+    /// involvement, so a real subprocess adds cost without adding
+    /// evidence. Mirrors that test's actual concern: a background task
+    /// (there, another hook submission; here, a sweep batch) must not
+    /// measurably delay ordinary live work sharing the same store.
+    #[tokio::test]
+    async fn sweeping_a_large_backlog_does_not_block_a_concurrent_insert_beyond_one_bounded_batch()
+    {
+        let path = tmp_db_path("ac4-concurrency");
+        let store = Store::open(&path).await.expect("open db");
+
+        let expired_at = (Utc::now() - chrono::Duration::days(400)).to_rfc3339();
+        insert_synthetic_backlog(&store, 5000, &expired_at).await;
+
+        let sweep_store = store.clone();
+        let sweep_task = tokio::spawn(async move {
+            // One bounded batch, deliberately far smaller than the 5000-row
+            // backlog — the property under test.
+            sweep_store
+                .sweep_expired_records(Utc::now(), None, 200)
+                .await
+        });
+
+        let insert_store = store.clone();
+        let insert_task = tokio::spawn(async move {
+            let event = AgentEvent {
+                id: Uuid::new_v4(),
+                session_id: "ac4-concurrent-insert".to_string(),
+                provider: Provider::ClaudeCode,
+                kind: EventKind::PostToolUse,
+                observed_at: "2026-01-01T00:00:00Z".into(),
+                tool_name: Some("Bash".into()),
+                tool_input: None,
+                tool_response: None,
+                raw: serde_json::json!({}),
+            };
+            insert_store.insert_event(&event).await
+        });
+
+        let (sweep_result, insert_result) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::join!(sweep_task, insert_task)
+            })
+            .await
+            .expect(
+                "neither task should take anywhere near 10s if the sweep is genuinely bounded to \
+             one small batch rather than the whole 5000-row backlog",
+            );
+
+        let report = sweep_result
+            .expect("sweep task panicked")
+            .expect("sweep failed");
+        assert_eq!(
+            report.examined, 200,
+            "one call processes one bounded batch, not the whole backlog"
+        );
+        insert_result
+            .expect("insert task panicked")
+            .expect("a concurrent insert must succeed while a bounded sweep batch runs");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    // --- FORNX-319 AC8: no tenant_id column on any local table --------------
+
+    #[tokio::test]
+    async fn no_tenant_id_column_exists_on_any_known_record_table() {
+        let path = tmp_db_path("ac8-no-tenant-id-column");
+        let store = Store::open(&path).await.expect("open db");
+
+        for table in KNOWN_RECORD_TABLES {
+            let columns: Vec<(String,)> =
+                sqlx::query_as(&format!("SELECT name FROM pragma_table_info('{table}')"))
+                    .fetch_all(&store.pool)
+                    .await
+                    .unwrap_or_else(|e| panic!("read table_info for {table}: {e}"));
+            assert!(
+                !columns.iter().any(|(name,)| name == "tenant_id"),
+                "{table} must not have a tenant_id column — TenantRef stays schema-only \
+                 locally (FORNX-103/106 constraint)"
+            );
+        }
 
         std::fs::remove_file(&path).ok();
     }
