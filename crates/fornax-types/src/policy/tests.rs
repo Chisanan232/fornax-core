@@ -1,8 +1,13 @@
 //! FORNX-116 acceptance-test scenarios (T1-T27, see
-//! `docs/adr/0006-policy-as-data.md`).
+//! `docs/adr/0006-policy-as-data.md`) and FORNX-118 signed-bundle scenarios
+//! (T28+, see `docs/adr/0007-signed-policy-bundles.md`).
 
 use std::collections::BTreeSet;
 
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
+use chrono::{DateTime, Utc};
+use ed25519_dalek::{Signer, SigningKey};
 use uuid::Uuid;
 
 use super::*;
@@ -961,4 +966,174 @@ fn provider_selector_restricts_matching() {
     assert!(diagnostics
         .iter()
         .any(|d| d.code == DiagnosticCode::NoApplicablePolicy));
+}
+// ============================================================================
+// FORNX-118 -- signed policy bundle scenarios (T28+, see
+// `docs/adr/0007-signed-policy-bundles.md`)
+// ============================================================================
+
+// Test-only Ed25519 seeds. **Never** real key material -- hardcoded purely so
+// the frozen fixture and every test below are reproducible without a
+// keystore or RNG. `SigningKey`/`Signer` are imported only in this
+// `#[cfg(test)]` module; `bundle.rs`'s non-test code never constructs a
+// signing key or signs anything.
+const TEST_ONLY_NOT_A_SECRET_SEED_PRIMARY: [u8; 32] = [
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+    0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
+];
+
+fn primary_signing_key() -> SigningKey {
+    SigningKey::from_bytes(&TEST_ONLY_NOT_A_SECRET_SEED_PRIMARY)
+}
+
+fn trusted_key_for(
+    key_id: &str,
+    signing_key: &SigningKey,
+    not_before: Option<&str>,
+    not_after: Option<&str>,
+) -> TrustedKey {
+    TrustedKey {
+        key_id: KeyId(key_id.to_string()),
+        algorithm: SignatureAlgorithm::Ed25519,
+        public_key_b64: STANDARD.encode(signing_key.verifying_key().to_bytes()),
+        not_before: not_before.map(str::to_string),
+        not_after: not_after.map(str::to_string),
+        comment: None,
+    }
+}
+
+fn trust_store(keys: Vec<TrustedKey>) -> TrustedVerificationKeys {
+    TrustedVerificationKeys {
+        schema_version: 1,
+        keys,
+    }
+}
+
+fn bundle_payload_with(
+    revision: PublishedPolicyRevision,
+    bindings: Vec<PolicyBinding>,
+    sequence: u64,
+    not_before: &str,
+    expires_at: &str,
+) -> BundlePayload {
+    BundlePayload {
+        bundle_schema_version: BUNDLE_SCHEMA_VERSION,
+        bundle_id: Uuid::from_u128(0xB0DD_1E00_0000_0000_0000_0000_0000_0001),
+        sequence,
+        issued_at: "2026-01-01T00:00:00Z".to_string(),
+        not_before: not_before.to_string(),
+        expires_at: expires_at.to_string(),
+        provenance: BundleProvenance {
+            issuer: "fornax-cloud-test".to_string(),
+            audit_ref: None,
+            authorized_by: None,
+        },
+        revision,
+        bindings,
+    }
+}
+
+fn sign_domain(payload_bytes: &[u8], signing_key: &SigningKey) -> String {
+    let mut msg = Vec::with_capacity(BUNDLE_SIGNING_DOMAIN.len() + payload_bytes.len());
+    msg.extend_from_slice(BUNDLE_SIGNING_DOMAIN);
+    msg.extend_from_slice(payload_bytes);
+    let sig = signing_key.sign(&msg);
+    STANDARD.encode(sig.to_bytes())
+}
+
+fn valid_signature_entry(
+    key_id: &str,
+    payload_bytes: &[u8],
+    signing_key: &SigningKey,
+) -> BundleSignature {
+    BundleSignature {
+        key_id: KeyId(key_id.to_string()),
+        algorithm: SignatureAlgorithm::Ed25519,
+        signature_b64: sign_domain(payload_bytes, signing_key),
+    }
+}
+
+fn build_envelope_bytes(payload_bytes: &[u8], signatures: Vec<BundleSignature>) -> Vec<u8> {
+    let envelope = SignedPolicyBundle {
+        bundle_schema_version: BUNDLE_SCHEMA_VERSION,
+        payload_b64: STANDARD.encode(payload_bytes),
+        signatures,
+    };
+    serde_json::to_vec(&envelope).unwrap()
+}
+
+fn deterministic_org_binding(
+    org_id: &str,
+    revision: &PublishedPolicyRevision,
+    binding_id: Uuid,
+) -> PolicyBinding {
+    PolicyBinding {
+        binding_id,
+        scope: TargetScope::Org {
+            org_id: org_id.to_string(),
+        },
+        selector: TargetSelector::default(),
+        revision_ref: revision.reference(),
+    }
+}
+
+fn frozen_fixture_revision() -> PublishedPolicyRevision {
+    let mut content = empty_content();
+    content.egress.cloud_sync_allowed = Some(true);
+    let mut d = draft(content);
+    d.policy_id = PolicyId(Uuid::from_u128(0x2222_3333_4444_5555_6666_7777_8888_9999));
+    d.revision = 1;
+    d.display_name = "frozen signed-bundle fixture policy".to_string();
+    d.publish("2026-01-01T00:00:00Z".to_string()).unwrap()
+}
+
+fn frozen_fixture_envelope_bytes() -> Vec<u8> {
+    let revision = frozen_fixture_revision();
+    let binding = deterministic_org_binding(
+        "org-fixture",
+        &revision,
+        Uuid::from_u128(0xAAAA_BBBB_CCCC_DDDD_EEEE_FFFF_0000_0001),
+    );
+    let payload = bundle_payload_with(
+        revision,
+        vec![binding],
+        1,
+        "2026-01-01T00:00:00Z",
+        "2027-01-01T00:00:00Z",
+    );
+    let payload_bytes = serde_json::to_vec(&payload).unwrap();
+    let sk = primary_signing_key();
+    let sig = valid_signature_entry("fixture-key-1", &payload_bytes, &sk);
+    build_envelope_bytes(&payload_bytes, vec![sig])
+}
+
+#[test]
+#[ignore = "run manually with --ignored --nocapture to regenerate the frozen fixture"]
+fn generate_signed_bundle_fixture_v1() {
+    let bytes = frozen_fixture_envelope_bytes();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    println!("{}", serde_json::to_string_pretty(&value).unwrap());
+}
+
+#[test]
+fn t49_frozen_fixture_verifies_and_regenerator_reproduces_it_byte_for_byte() {
+    let fixture = include_str!("../../tests/fixtures/signed_policy_bundle_v1.json");
+    let trust = trust_store(vec![trusted_key_for(
+        "fixture-key-1",
+        &primary_signing_key(),
+        None,
+        None,
+    )]);
+    let now: DateTime<Utc> = "2026-06-01T00:00:00Z".parse().unwrap();
+    let verified =
+        verify_bundle(fixture.as_bytes(), &trust, now).expect("frozen fixture must verify");
+    assert_eq!(verified.verified_by(), &KeyId("fixture-key-1".to_string()));
+
+    let regenerated_bytes = frozen_fixture_envelope_bytes();
+    let regenerated: serde_json::Value = serde_json::from_slice(&regenerated_bytes).unwrap();
+    let expected: serde_json::Value = serde_json::from_str(fixture).unwrap();
+    assert_eq!(
+        regenerated, expected,
+        "regenerator must reproduce the frozen fixture exactly"
+    );
 }
