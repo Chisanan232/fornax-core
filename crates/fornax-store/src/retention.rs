@@ -284,6 +284,37 @@ impl Store {
         rows.into_iter().map(TryInto::try_into).collect()
     }
 
+    /// How many [`dataset_lineage_tags`] rows currently in this store carry
+    /// `class`, and the oldest (`MIN`) `recorded_at` among them (FORNX-322:
+    /// `fornax audit report`'s retention section). `None` when `class` has
+    /// zero records currently tagged — never fabricated as a timestamp, so a
+    /// caller can render "no records observed for this class" honestly
+    /// instead of inventing an oldest-record time that does not exist.
+    /// `record_table` is deliberately not filtered to
+    /// [`KNOWN_RECORD_TABLES`] — a tag for an as-yet-unknown table (see
+    /// [`Store::delete_records_for_tenant`]'s handling of that case) still
+    /// counts toward this class's real observed coverage.
+    pub async fn retention_class_observation(
+        &self,
+        class: &RetentionClass,
+    ) -> Result<(u64, Option<String>)> {
+        // Same wire-tag serialization `insert_lineage_tag_row` uses to
+        // populate the `retention_class` column, so this query matches
+        // exactly the string form actually stored — never re-derived by a
+        // different path that could silently drift from it.
+        let class_tag = match serde_json::to_value(class)? {
+            serde_json::Value::String(s) => s,
+            other => other.to_string(),
+        };
+        let row: (i64, Option<String>) = sqlx::query_as(
+            "SELECT COUNT(*), MIN(recorded_at) FROM dataset_lineage_tags WHERE retention_class = ?1",
+        )
+        .bind(&class_tag)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok((row.0 as u64, row.1))
+    }
+
     /// Delete every real record tagged as belonging to `tenant`, and the
     /// lineage tags themselves (FORNX-106 AC3). For each tag: if
     /// `record_table` is one of [`KNOWN_RECORD_TABLES`], the matching row is
@@ -1038,6 +1069,82 @@ mod tests {
             .await
             .expect("delete for a tenant with no records");
         assert_eq!(report.total_processed(), 0);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    // --- FORNX-322: retention_class_observation ----------------------------
+
+    #[tokio::test]
+    async fn retention_class_observation_reports_none_for_a_class_with_zero_records() {
+        let path = tmp_db_path("retention-observation-empty");
+        let store = Store::open(&path).await.expect("open db");
+
+        let (count, oldest) = store
+            .retention_class_observation(&RetentionClass::DerivedFinding)
+            .await
+            .expect("query retention class observation");
+        assert_eq!(count, 0);
+        assert_eq!(
+            oldest, None,
+            "a class with zero records must never fabricate an oldest-record timestamp"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn retention_class_observation_reports_the_real_count_and_oldest_recorded_at() {
+        let path = tmp_db_path("retention-observation-populated");
+        let store = Store::open(&path).await.expect("open db");
+        let tenant = TenantRef("tenant-obs".to_string());
+
+        store
+            .record_lineage_tag(
+                "agent_events",
+                "row-older",
+                &DatasetLineageTag {
+                    schema_version: 1,
+                    retention_class: RetentionClass::RawLocal,
+                    tenant_ref: tenant.clone(),
+                    source_record_ids: vec![],
+                    recorded_at: "2026-01-01T00:00:00Z".to_string(),
+                    deletion_requested_at: None,
+                },
+            )
+            .await
+            .expect("record older tag");
+        store
+            .record_lineage_tag(
+                "agent_events",
+                "row-newer",
+                &DatasetLineageTag {
+                    schema_version: 1,
+                    retention_class: RetentionClass::RawLocal,
+                    tenant_ref: tenant.clone(),
+                    source_record_ids: vec![],
+                    recorded_at: "2026-06-01T00:00:00Z".to_string(),
+                    deletion_requested_at: None,
+                },
+            )
+            .await
+            .expect("record newer tag");
+        // A different class must not be counted toward RawLocal's observation.
+        store
+            .record_lineage_tag(
+                "findings",
+                "row-derived",
+                &DatasetLineageTag::new(RetentionClass::DerivedFinding, tenant),
+            )
+            .await
+            .expect("record a differently-classed tag");
+
+        let (count, oldest) = store
+            .retention_class_observation(&RetentionClass::RawLocal)
+            .await
+            .expect("query retention class observation");
+        assert_eq!(count, 2);
+        assert_eq!(oldest.as_deref(), Some("2026-01-01T00:00:00Z"));
 
         std::fs::remove_file(&path).ok();
     }

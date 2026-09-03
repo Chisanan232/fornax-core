@@ -252,6 +252,15 @@ enum AuditAction {
     Verify,
     /// Lists every appended audit event, oldest first.
     List,
+    /// Generates a reproducible, evidence-backed local compliance report
+    /// (FORNX-322): ledger integrity, checkpoint anchoring, and retention
+    /// coverage, each traced to a real query against this store -- never a
+    /// hardcoded pass/fail verdict, and never a claim for a capability not
+    /// actually evidenced in this deployment (see
+    /// `crates/fornax-store/src/compliance_report.rs`'s module doc comment).
+    /// Prints the digest-stamped report as JSON and appends a
+    /// `ComplianceReportGenerated` audit event to the local ledger.
+    Report,
 }
 
 /// `fornax policy <action>` (FORNX-119).
@@ -497,6 +506,13 @@ async fn handle_audit_action(action: AuditAction) -> anyhow::Result<()> {
         AuditAction::List => {
             let events = store.audit_events().await?;
             print!("{}", render_audit_list(&events));
+        }
+        AuditAction::Report => {
+            let report = store.generate_compliance_report(chrono::Utc::now()).await?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).expect("ComplianceReport always serializes")
+            );
         }
     }
     Ok(())
