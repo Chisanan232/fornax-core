@@ -73,6 +73,16 @@ pub enum DiagnosticCode {
     /// A submitted revocation list was rejected (e.g. sequence did not
     /// advance) -- mirrors `PolicyRollbackRejected`'s severity choice.
     PolicyRevocationRejected,
+    // -- FORNX-311 background policy poll transport -- additive only, same
+    // closed-enum caveat as the two blocks above.
+    /// The background policy poll task (`fornax-daemon::policy_poll`) has
+    /// failed 3 or more consecutive cycles -- a silently-dead poller would
+    /// otherwise only be visible in the in-memory `last_poll` field, which
+    /// nothing surfaces proactively. Warning severity: the cache itself may
+    /// still be perfectly usable via its existing staleness floors: this is
+    /// an early warning that refresh has stalled, not a claim that
+    /// enforcement is currently degraded.
+    PolicyRefreshUnavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
