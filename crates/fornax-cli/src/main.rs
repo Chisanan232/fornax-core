@@ -5,6 +5,7 @@
 use clap::{Parser, Subcommand};
 
 mod experiment_ux;
+mod timeline;
 
 #[derive(Parser)]
 #[command(
@@ -222,6 +223,22 @@ enum Commands {
         #[command(subcommand)]
         action: AuditAction,
     },
+    /// Incident timeline (FORNX-321): reconstructs one finding's -- or one
+    /// session's -- full local provenance (evidence with per-item trust
+    /// class, the fused five-state verdict, the verifier name, current
+    /// local policy state, and the local audit ledger). Reads
+    /// `$FORNAX_HOME/fornax.db` directly, matching `audit`'s direct-store
+    /// access -- works fully offline, no daemon required. See
+    /// `timeline.rs`'s module doc comment for this command's honest scope
+    /// boundary. Exactly one of `--finding`/`--session` must be given.
+    Timeline {
+        /// Look up one finding by id.
+        #[arg(long)]
+        finding: Option<String>,
+        /// Look up every finding for one session by id.
+        #[arg(long)]
+        session: Option<String>,
+    },
 }
 
 /// `fornax audit <action>` (FORNX-315).
@@ -431,6 +448,36 @@ async fn main() -> anyhow::Result<()> {
         Commands::Experiment { action } => experiment_ux::handle(action, &fornax_home())?,
         Commands::Policy { action } => handle_policy_action(action).await?,
         Commands::Audit { action } => handle_audit_action(action).await?,
+        Commands::Timeline { finding, session } => handle_timeline_action(finding, session).await?,
+    }
+    Ok(())
+}
+
+async fn handle_timeline_action(
+    finding: Option<String>,
+    session: Option<String>,
+) -> anyhow::Result<()> {
+    let db_path = fornax_home().join("fornax.db");
+    let store = fornax_store::Store::open(&db_path).await?;
+    match (finding, session) {
+        (Some(finding_id), None) => {
+            print!(
+                "{}",
+                timeline::render_finding_timeline(&store, &finding_id).await?
+            );
+        }
+        (None, Some(session_id)) => {
+            print!(
+                "{}",
+                timeline::render_session_timeline(&store, &session_id).await?
+            );
+        }
+        (Some(_), Some(_)) => {
+            anyhow::bail!("fornax timeline: pass exactly one of --finding or --session, not both");
+        }
+        (None, None) => {
+            anyhow::bail!("fornax timeline: pass one of --finding <id> or --session <id>");
+        }
     }
     Ok(())
 }
