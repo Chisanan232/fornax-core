@@ -27,3 +27,4 @@ reqwest = { workspace = true, features = ["json", "rustls-tls"] }
 [dev-dependencies]
 base64.workspace = true
 ed25519-dalek.workspace = true
+sqlx.workspace = true
