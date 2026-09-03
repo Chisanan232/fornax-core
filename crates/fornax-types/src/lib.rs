@@ -469,6 +469,14 @@ pub enum IngestMessage {
     PolicyBundle {
         envelope: String,
     },
+    /// A signed policy revocation list envelope (FORNX-123), imported via
+    /// `fornax policy import <path>` (which dispatches on the artifact's own
+    /// top-level shape -- see that command's doc). `envelope` is the raw
+    /// envelope JSON text (`policy::SignedRevocationList`) exactly as read
+    /// from the file. Same fire-and-forget UDS path as `PolicyBundle`.
+    PolicyRevocation {
+        envelope: String,
+    },
     /// Adapter announces what its runtime can observe, once per connection.
     Capabilities(RuntimeCapabilities),
 }

@@ -443,11 +443,48 @@ fn compute_payload_digest_hint(envelope_bytes: &[u8]) -> Option<String> {
     Some(format!("sha256:{hex}"))
 }
 
+/// FORNX-123: which artifact kind an imported file names, by its own
+/// top-level shape -- an emergency responder must not have to pick the
+/// right subcommand. Unknown/ambiguous shape refuses with a clear message
+/// rather than guessing.
+enum PolicyArtifactKind {
+    Bundle,
+    Revocation,
+}
+
+fn detect_artifact_kind(envelope_bytes: &[u8]) -> anyhow::Result<PolicyArtifactKind> {
+    let envelope: serde_json::Value = serde_json::from_slice(envelope_bytes)
+        .map_err(|e| anyhow::anyhow!("not valid JSON: {e}"))?;
+    let has_bundle_key = envelope.get("bundle_schema_version").is_some();
+    let has_revocation_key = envelope.get("revocation_schema_version").is_some();
+    match (has_bundle_key, has_revocation_key) {
+        (true, false) => Ok(PolicyArtifactKind::Bundle),
+        (false, true) => Ok(PolicyArtifactKind::Revocation),
+        (true, true) => Err(anyhow::anyhow!(
+            "ambiguous artifact: carries both bundle_schema_version and \
+             revocation_schema_version -- refusing to guess which kind this is"
+        )),
+        (false, false) => Err(anyhow::anyhow!(
+            "unrecognized artifact: carries neither bundle_schema_version nor \
+             revocation_schema_version at the top level"
+        )),
+    }
+}
+
 async fn policy_import(path: &std::path::Path) -> anyhow::Result<()> {
     let envelope_bytes = std::fs::read(path)
         .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
     let envelope_text = String::from_utf8(envelope_bytes.clone())
         .map_err(|e| anyhow::anyhow!("{} is not valid UTF-8: {e}", path.display()))?;
+
+    let kind = match detect_artifact_kind(&envelope_bytes) {
+        Ok(k) => k,
+        Err(e) => {
+            println!("fornax: refusing to import {}: {e}", path.display());
+            return Ok(());
+        }
+    };
+
     let expected_digest = compute_payload_digest_hint(&envelope_bytes);
 
     let sock_path = fornax_home().join("fornax.sock");
@@ -461,8 +498,13 @@ async fn policy_import(path: &std::path::Path) -> anyhow::Result<()> {
             return Ok(());
         }
     };
-    let msg = fornax_types::IngestMessage::PolicyBundle {
-        envelope: envelope_text,
+    let msg = match kind {
+        PolicyArtifactKind::Bundle => fornax_types::IngestMessage::PolicyBundle {
+            envelope: envelope_text,
+        },
+        PolicyArtifactKind::Revocation => fornax_types::IngestMessage::PolicyRevocation {
+            envelope: envelope_text,
+        },
     };
     let mut line = serde_json::to_string(&msg)?;
     line.push('\n');
@@ -483,41 +525,74 @@ async fn policy_import(path: &std::path::Path) -> anyhow::Result<()> {
         }
     };
 
-    let active_digests: Vec<String> = status["active"]["members"]
-        .as_array()
-        .map(|members| {
-            members
-                .iter()
-                .filter_map(|m| m["payload_digest"].as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
+    match kind {
+        PolicyArtifactKind::Bundle => {
+            let active_digests: Vec<String> = status["active"]["members"]
+                .as_array()
+                .map(|members| {
+                    members
+                        .iter()
+                        .filter_map(|m| m["payload_digest"].as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
 
-    match &expected_digest {
-        Some(digest) if active_digests.iter().any(|d| d == digest) => {
-            println!("fornax: policy bundle imported and is now an active member ({digest})");
+            match &expected_digest {
+                Some(digest) if active_digests.iter().any(|d| d == digest) => {
+                    println!(
+                        "fornax: policy bundle imported and is now an active member ({digest})"
+                    );
+                }
+                _ => {
+                    if let Some(rejection) = status["last_rejection"].as_object() {
+                        println!(
+                            "fornax: policy bundle was NOT activated -- {} ({})\n  remediation: {}",
+                            rejection
+                                .get("message")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown reason"),
+                            rejection
+                                .get("code")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown_code"),
+                            rejection
+                                .get("remediation")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("none")
+                        );
+                    } else {
+                        println!(
+                            "fornax: submitted, but could not confirm activation yet -- \
+                             run `fornax policy status` to check current state"
+                        );
+                    }
+                }
+            }
         }
-        _ => {
-            if let Some(rejection) = status["last_rejection"].as_object() {
+        PolicyArtifactKind::Revocation => {
+            // A revocation never becomes an "active member" -- there is no
+            // digest-in-active-generation check to make here. The issuer
+            // lives inside the signed payload, not the plaintext envelope,
+            // so there is nothing authenticated client-side to compare
+            // against `revocations.max_sequence_by_issuer` -- report the
+            // current state instead of a specific "your list took effect"
+            // confirmation.
+            println!(
+                "fornax: revocation list submitted -- run `fornax policy status` to confirm \
+                 the issuer's max_sequence advanced and see the current revocation count"
+            );
+            if let Some(revocations) = status.get("revocations") {
                 println!(
-                    "fornax: policy bundle was NOT activated -- {} ({})\n  remediation: {}",
-                    rejection
-                        .get("message")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown reason"),
-                    rejection
-                        .get("code")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown_code"),
-                    rejection
-                        .get("remediation")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("none")
-                );
-            } else {
-                println!(
-                    "fornax: submitted, but could not confirm activation yet -- \
-                     run `fornax policy status` to check current state"
+                    "  revocations: entry_count={} unrecognized_entry_count={} max_sequence_by_issuer={}",
+                    revocations
+                        .get("entry_count")
+                        .unwrap_or(&serde_json::Value::Null),
+                    revocations
+                        .get("unrecognized_entry_count")
+                        .unwrap_or(&serde_json::Value::Null),
+                    revocations
+                        .get("max_sequence_by_issuer")
+                        .unwrap_or(&serde_json::Value::Null),
                 );
             }
         }
@@ -535,6 +610,26 @@ fn render_policy_status(v: &serde_json::Value) -> String {
             .and_then(|s| s.as_str())
             .unwrap_or("none")
     ));
+    // FORNX-123: posture is rendered as its own line, never collapsed into
+    // the pre-existing `degraded` boolean above -- `degraded` and `posture`
+    // answer different questions (see `compute_posture`'s doc comment).
+    if let Some(posture) = v.get("posture") {
+        out.push_str(&format!("posture: {posture}\n"));
+    }
+    if let Some(revocations) = v.get("revocations") {
+        out.push_str(&format!(
+            "revocations: entry_count={} unrecognized_entry_count={} max_sequence_by_issuer={}\n",
+            revocations
+                .get("entry_count")
+                .unwrap_or(&serde_json::Value::Null),
+            revocations
+                .get("unrecognized_entry_count")
+                .unwrap_or(&serde_json::Value::Null),
+            revocations
+                .get("max_sequence_by_issuer")
+                .unwrap_or(&serde_json::Value::Null),
+        ));
+    }
     if let Some(tiers) = v.get("freshness").and_then(|f| f.get("tier_by_risk")) {
         out.push_str(&format!(
             "freshness (baseline): low={} elevated={} high={} critical={}\n",

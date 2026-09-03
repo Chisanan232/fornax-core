@@ -7,11 +7,12 @@ use axum::extract::{Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
+use fornax_store::policy_cache::RevocationIngestOutcome;
 use fornax_types::redact::{redact_json, redact_text};
 use fornax_types::{
-    verify_bundle, ActivationOutcome, ActivationRejection, BoundRevision, CacheSlotKind, Finding,
-    IngestMessage, PolicyCacheState, PolicyContent, PolicyDiagnostic, RuntimeCapabilities,
-    TrustedVerificationKeys,
+    compute_posture, verify_bundle, verify_revocation_list, ActivationOutcome, ActivationRejection,
+    BoundRevision, CacheSlotKind, Finding, IngestMessage, PolicyCacheState, PolicyContent,
+    PolicyDiagnostic, RuntimeCapabilities, TrustedVerificationKeys,
 };
 use fornax_verify::fusion::{project_graph, BaselineFusionPolicy, FusionInput, FusionPolicy};
 use fornax_verify::{
@@ -454,6 +455,9 @@ async fn handle_message(
         IngestMessage::PolicyBundle { envelope } => {
             handle_policy_bundle_ingest(state, envelope.into_bytes()).await;
         }
+        IngestMessage::PolicyRevocation { envelope } => {
+            handle_policy_revocation_ingest(state, envelope.into_bytes()).await;
+        }
         IngestMessage::Claim(mut claim) => {
             *session_hint = Some(claim.session_id.clone());
             // FORNX-280: claim text is derived from agent/user transcript
@@ -598,6 +602,79 @@ async fn handle_policy_bundle_ingest(state: &AppState, envelope_bytes: Vec<u8>) 
     }
 }
 
+/// FORNX-123: submits a policy revocation list envelope to the store and
+/// refreshes `state.policy` accordingly. Mirrors
+/// `handle_policy_bundle_ingest`'s best-effort posture exactly -- never
+/// propagates an error up to `handle_message`'s caller, and refreshes the
+/// in-memory snapshot after every successful apply/confirm so revocation
+/// takes effect immediately in a running daemon rather than at next
+/// restart.
+async fn handle_policy_revocation_ingest(state: &AppState, envelope_bytes: Vec<u8>) {
+    let Some(trusted) = state.trust.as_ref() else {
+        tracing::warn!(
+            "dropping policy revocation ingest message: no trust store configured \
+             (set FORNAX_POLICY_TRUST_STORE or create <home>/policy-trust.json)"
+        );
+        return;
+    };
+
+    let now = Utc::now();
+    let outcome = match state
+        .store
+        .submit_policy_revocation(&envelope_bytes, trusted, now)
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            tracing::error!(error = %e, "policy revocation submission failed");
+            return;
+        }
+    };
+
+    match outcome {
+        RevocationIngestOutcome::Applied {
+            issuer,
+            sequence,
+            new_entry_count,
+            ..
+        } => {
+            match state.store.load_policy_cache(Some(trusted), now).await {
+                Ok(load) => {
+                    let mut policy = state.policy.write().await;
+                    policy.state = load.state;
+                    policy.usable = load.usable;
+                    policy.loaded_slot = load.loaded_slot;
+                    policy.diagnostics = load.diagnostics;
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to reload policy cache after revocation");
+                }
+            }
+            tracing::info!(
+                issuer,
+                sequence,
+                new_entry_count,
+                "policy revocation list applied"
+            );
+        }
+        RevocationIngestOutcome::AlreadyCurrent { issuer, sequence } => {
+            tracing::info!(issuer, sequence, "policy revocation list already current");
+        }
+        RevocationIngestOutcome::Rejected { rejection } => {
+            // Best-effort re-derivation of the candidate's payload_digest,
+            // mirroring `handle_policy_bundle_ingest`'s own precedent --
+            // `verify_revocation_list` has no side effects.
+            let payload_digest = verify_revocation_list(&envelope_bytes, trusted, now)
+                .ok()
+                .map(|v| v.payload_digest().to_string());
+            tracing::warn!(
+                payload_digest,
+                "policy revocation list rejected: {rejection}"
+            );
+        }
+    }
+}
+
 /// `GET /api/policy` (FORNX-119): the local policy cache's status. Never
 /// surfaces `PolicyRevisionBody`/`PolicyContent`, a display name, a binding
 /// `TargetScope` identifier, or envelope bytes -- only identifiers,
@@ -634,6 +711,17 @@ async fn api_policy(State(state): State<AppState>) -> Json<serde_json::Value> {
         })
     });
 
+    // FORNX-123: `posture` is separate from the pre-existing `degraded`
+    // bool above -- `degraded` fires on ANY diagnostic (even a Warning) or
+    // a mere LKG fallback; `posture` only degrades when `usable` is
+    // actually empty, with an explicit precedence over which cause is
+    // reported (see `compute_posture`'s own doc comment).
+    let posture = compute_posture(
+        snapshot.state.ever_configured,
+        snapshot.usable.is_empty(),
+        &snapshot.diagnostics,
+    );
+
     Json(serde_json::json!({
         "schema_version": fornax_types::POLICY_CACHE_SCHEMA_VERSION,
         "configured": snapshot.state.ever_configured,
@@ -647,6 +735,13 @@ async fn api_policy(State(state): State<AppState>) -> Json<serde_json::Value> {
             "tier_by_risk": pf.tier_by_risk,
             "members": pf.members,
         },
+        "revocations": {
+            "entry_count": snapshot.state.revocations.revision_digests.len()
+                + snapshot.state.revocations.payload_digests.len(),
+            "unrecognized_entry_count": snapshot.state.revocations.unrecognized_entry_count,
+            "max_sequence_by_issuer": snapshot.state.revocations.max_sequence_by_issuer,
+        },
+        "posture": posture,
         "degraded": degraded,
         "diagnostics": snapshot.diagnostics,
         "last_rejection": last_rejection,
@@ -3265,6 +3360,8 @@ mod tests {
                 "pending",
                 "last_known_good",
                 "freshness",
+                "revocations",
+                "posture",
                 "degraded",
                 "diagnostics",
                 "last_rejection",
