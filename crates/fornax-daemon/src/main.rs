@@ -157,6 +157,7 @@ impl PolicyCacheSnapshot {
                 last_known_good: None,
                 high_water: std::collections::BTreeMap::new(),
                 ever_configured: false,
+                revocations: fornax_types::RevocationSet::default(),
             },
             usable: Vec::new(),
             loaded_slot: None,
@@ -185,6 +186,7 @@ fn activation_rejection_code(r: &ActivationRejection) -> &'static str {
         ActivationRejection::IssuerMismatchForLineage { .. } => "issuer_mismatch_for_lineage",
         ActivationRejection::BindingsUnusable(_) => "bindings_unusable",
         ActivationRejection::Persistence { .. } => "persistence",
+        ActivationRejection::Revoked { .. } => "revoked",
     }
 }
 
@@ -207,6 +209,9 @@ fn remediation_for_rejection(r: &ActivationRejection) -> &'static str {
         }
         ActivationRejection::Persistence { .. } => {
             "retry the import; if it persists, check disk space"
+        }
+        ActivationRejection::Revoked { .. } => {
+            "this artifact must never be re-trusted; publish a fresh, unrevoked bundle instead"
         }
     }
 }

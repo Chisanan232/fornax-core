@@ -17,10 +17,12 @@
 
 use chrono::{DateTime, Utc};
 use fornax_types::{
-    verify_bundle, ActivationDecision, ActivationOutcome, ActivationRejection, BoundRevision,
-    BundleRejection, CacheGeneration, CacheSlotKind, CachedBundleRef, KeyId, PayloadDigest,
-    PolicyCacheState, PolicyDiagnostic, PolicyId, RevisionDigest, SequenceHighWater,
-    TrustedVerificationKeys, POLICY_CACHE_SCHEMA_VERSION,
+    verify_bundle, verify_revocation_list, ActivationDecision, ActivationOutcome,
+    ActivationRejection, BoundRevision, BundleRejection, CacheGeneration, CacheSlotKind,
+    CachedBundleRef, KeyId, PayloadDigest, PolicyCacheState, PolicyDiagnostic, PolicyId,
+    RevisionDigest, RevocationEntry, RevocationIngestDecision, RevocationIngestRejection,
+    RevocationSet, RevocationTarget, SequenceHighWater, TrustedVerificationKeys,
+    POLICY_CACHE_SCHEMA_VERSION,
 };
 use fornax_types::{DiagnosticCode, DiagnosticSeverity};
 use sqlx::sqlite::SqliteConnection;
@@ -45,6 +47,20 @@ fn unavailable_diagnostic(detail: impl Into<String>) -> PolicyDiagnostic {
         detail.into(),
         "import a policy bundle via `fornax policy import <path>`, or configure a trust store \
          so a previously-imported bundle can be re-verified",
+    )
+}
+
+fn revoked_diagnostic(bundle_id: Uuid, hit: &fornax_types::RevocationHit) -> PolicyDiagnostic {
+    PolicyDiagnostic::new(
+        DiagnosticCode::PolicyCacheRevoked,
+        DiagnosticSeverity::Error,
+        format!(
+            "cached bundle {bundle_id} is revoked ({target:?}): {reason} (revoked_at={revoked_at})",
+            target = hit.target,
+            reason = hit.reason,
+            revoked_at = hit.revoked_at,
+        ),
+        "this artifact must never be re-trusted; publish a fresh, unrevoked bundle instead",
     )
 }
 
@@ -250,6 +266,66 @@ async fn load_generation(conn: &mut SqliteConnection, generation: i64) -> Result
     })
 }
 
+#[derive(sqlx::FromRow)]
+struct RevocationStateRow {
+    issuer: String,
+    max_sequence: i64,
+    unrecognized_entry_count: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct RevocationEntryRow {
+    target_kind: String,
+    target_digest: String,
+    reason: String,
+    revoked_at: String,
+}
+
+async fn load_revocations(conn: &mut SqliteConnection) -> Result<RevocationSet> {
+    let mut revocations = RevocationSet::default();
+
+    let state_rows = sqlx::query_as::<_, RevocationStateRow>(
+        "SELECT issuer, max_sequence, unrecognized_entry_count FROM policy_revocation_state",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    for row in state_rows {
+        revocations
+            .max_sequence_by_issuer
+            .insert(row.issuer, row.max_sequence as u64);
+        revocations.unrecognized_entry_count += row.unrecognized_entry_count as u64;
+    }
+
+    let entry_rows = sqlx::query_as::<_, RevocationEntryRow>(
+        "SELECT target_kind, target_digest, reason, revoked_at FROM policy_revocations",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    for row in entry_rows {
+        let meta = fornax_types::RevocationHitMeta {
+            reason: row.reason,
+            revoked_at: row.revoked_at,
+        };
+        match row.target_kind.as_str() {
+            "revision_digest" => {
+                revocations
+                    .revision_digests
+                    .insert(from_tag::<RevisionDigest>(&row.target_digest)?, meta);
+            }
+            "payload_digest" => {
+                revocations
+                    .payload_digests
+                    .insert(from_tag::<PayloadDigest>(&row.target_digest)?, meta);
+            }
+            _ => {
+                revocations.unrecognized_entry_count += 1;
+            }
+        }
+    }
+
+    Ok(revocations)
+}
+
 async fn load_state_from_conn(conn: &mut SqliteConnection) -> Result<PolicyCacheState> {
     let slots = sqlx::query_as::<_, SlotsRow>(
         "SELECT schema_version, active_generation, pending_generation,
@@ -271,6 +347,8 @@ async fn load_state_from_conn(conn: &mut SqliteConnection) -> Result<PolicyCache
         high_water.insert(key, value);
     }
 
+    let revocations = load_revocations(conn).await?;
+
     let Some(slots) = slots else {
         return Ok(PolicyCacheState {
             schema_version: POLICY_CACHE_SCHEMA_VERSION,
@@ -279,6 +357,7 @@ async fn load_state_from_conn(conn: &mut SqliteConnection) -> Result<PolicyCache
             last_known_good: None,
             high_water,
             ever_configured: false,
+            revocations,
         });
     };
 
@@ -300,6 +379,7 @@ async fn load_state_from_conn(conn: &mut SqliteConnection) -> Result<PolicyCache
         last_known_good,
         high_water,
         ever_configured: slots.ever_configured != 0,
+        revocations,
     })
 }
 
@@ -312,11 +392,23 @@ async fn try_generation_usable(
     conn: &mut SqliteConnection,
     generation: &CacheGeneration,
     trusted: &TrustedVerificationKeys,
+    revocations: &RevocationSet,
     now: DateTime<Utc>,
     diagnostics: &mut Vec<PolicyDiagnostic>,
 ) -> Result<Option<Vec<BoundRevision>>> {
     let mut usable = Vec::new();
     for member in &generation.members {
+        // FORNX-123: revoked-member refusal is FIRST in the per-member
+        // loop, BEFORE the envelope bytes are even read -- this is the
+        // load-bearing part of the ticket. A revoked bundle's signature is
+        // still perfectly valid; no signature-layer check
+        // (`verify_bundle`) can ever catch it, so it must be caught here,
+        // at the cache layer, before re-verification even runs.
+        if let Some(hit) = revocations.hit(&member.revision_digest, &member.payload_digest) {
+            diagnostics.push(revoked_diagnostic(member.bundle_id, &hit));
+            return Ok(None);
+        }
+
         let envelope: Option<Vec<u8>> = sqlx::query_scalar(
             "SELECT envelope FROM policy_cache_bundles WHERE bundle_id = ?1 AND payload_digest = ?2",
         )
@@ -423,8 +515,15 @@ impl Store {
         };
 
         if let Some(active) = &state.active {
-            if let Some(usable) =
-                try_generation_usable(&mut conn, active, trusted, now, &mut diagnostics).await?
+            if let Some(usable) = try_generation_usable(
+                &mut conn,
+                active,
+                trusted,
+                &state.revocations,
+                now,
+                &mut diagnostics,
+            )
+            .await?
             {
                 return Ok(PolicyCacheLoad {
                     state,
@@ -436,8 +535,15 @@ impl Store {
         }
 
         if let Some(lkg) = &state.last_known_good {
-            if let Some(usable) =
-                try_generation_usable(&mut conn, lkg, trusted, now, &mut diagnostics).await?
+            if let Some(usable) = try_generation_usable(
+                &mut conn,
+                lkg,
+                trusted,
+                &state.revocations,
+                now,
+                &mut diagnostics,
+            )
+            .await?
             {
                 return Ok(PolicyCacheLoad {
                     state,
@@ -591,6 +697,197 @@ impl Store {
         let state = load_state_from_conn(&mut conn).await?;
         Ok(state.active.map(|g| g.generation))
     }
+
+    /// FORNX-123: submits a signed revocation list. IDENTICAL shape/
+    /// normative order to [`Store::submit_policy_bundle`]: verify OUTSIDE
+    /// any transaction (an invalid list never opens one) -> `BEGIN
+    /// IMMEDIATE` -> `load_state_from_conn` -> `evaluate_revocation_ingest`
+    /// -> persist -> `COMMIT`. Same crash-safety argument as FORNX-119,
+    /// unchanged. Sticky rule: once persisted, a revocation entry is never
+    /// re-verified or re-evaluated -- this method's only job is getting new
+    /// entries into `policy_revocations` durably.
+    pub async fn submit_policy_revocation(
+        &self,
+        envelope_bytes: &[u8],
+        trusted: &TrustedVerificationKeys,
+        now: DateTime<Utc>,
+    ) -> Result<RevocationIngestOutcome> {
+        let candidate = match verify_revocation_list(envelope_bytes, trusted, now) {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(RevocationIngestOutcome::Rejected {
+                    rejection: RevocationSubmissionRejection::NotVerified(e),
+                });
+            }
+        };
+
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+
+        let state = match load_state_from_conn(&mut conn).await {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                return Err(e);
+            }
+        };
+
+        let decision = match fornax_types::evaluate_revocation_ingest(&candidate, &state, now) {
+            Ok(d) => d,
+            Err(rejection) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                return Ok(RevocationIngestOutcome::Rejected {
+                    rejection: RevocationSubmissionRejection::Ingest(rejection),
+                });
+            }
+        };
+
+        match decision {
+            RevocationIngestDecision::Apply {
+                issuer,
+                sequence,
+                new_entries,
+                superseded_sequence,
+            } => {
+                let new_entry_count = new_entries.len();
+                let persisted = persist_revocation_apply(
+                    &mut conn,
+                    envelope_bytes,
+                    &candidate,
+                    &issuer,
+                    sequence,
+                    &new_entries,
+                    now,
+                )
+                .await;
+                if let Err(e) = persisted {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                    return Err(e);
+                }
+                match sqlx::query("COMMIT").execute(&mut *conn).await {
+                    Ok(_) => Ok(RevocationIngestOutcome::Applied {
+                        issuer,
+                        sequence,
+                        new_entry_count,
+                        superseded_sequence,
+                    }),
+                    Err(e) => Err(StoreError::Db(e)),
+                }
+            }
+            RevocationIngestDecision::AlreadyCurrent { issuer, sequence } => {
+                // Idempotent re-import: nothing to persist, no rows change.
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Ok(RevocationIngestOutcome::AlreadyCurrent { issuer, sequence })
+            }
+        }
+    }
+}
+
+/// Result of [`Store::submit_policy_revocation`] -- mirrors
+/// [`ActivationOutcome`]'s three-way shape.
+#[derive(Debug, Clone)]
+pub enum RevocationIngestOutcome {
+    Applied {
+        issuer: String,
+        sequence: u64,
+        new_entry_count: usize,
+        superseded_sequence: Option<u64>,
+    },
+    AlreadyCurrent {
+        issuer: String,
+        sequence: u64,
+    },
+    Rejected {
+        rejection: RevocationSubmissionRejection,
+    },
+}
+
+/// Exhaustive, no panics.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum RevocationSubmissionRejection {
+    #[error("candidate revocation list failed verification: {0}")]
+    NotVerified(#[source] fornax_types::RevocationRejection),
+    #[error(transparent)]
+    Ingest(#[from] RevocationIngestRejection),
+}
+
+/// Persists an `Apply` decision inside the caller's already-open
+/// transaction: idempotent artifact insert, the latest-pointer upsert (never
+/// lowered -- `evaluate_revocation_ingest` already guarantees
+/// `sequence > high_water` on this path), and one `INSERT OR IGNORE` row
+/// per new entry -- union-only, sticky: an already-recorded digest is never
+/// touched again.
+async fn persist_revocation_apply(
+    conn: &mut SqliteConnection,
+    envelope_bytes: &[u8],
+    candidate: &fornax_types::VerifiedRevocationList,
+    issuer: &str,
+    sequence: u64,
+    new_entries: &[RevocationEntry],
+    now: DateTime<Utc>,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT OR IGNORE INTO policy_revocation_artifacts (issuer, sequence, envelope, received_at)
+         VALUES (?1, ?2, ?3, ?4)",
+    )
+    .bind(issuer)
+    .bind(sequence as i64)
+    .bind(envelope_bytes)
+    .bind(now.to_rfc3339())
+    .execute(&mut *conn)
+    .await?;
+
+    let new_unrecognized = new_entries
+        .iter()
+        .filter(|e| matches!(e.target, RevocationTarget::Unrecognized))
+        .count() as i64;
+
+    sqlx::query(
+        "INSERT INTO policy_revocation_state
+            (issuer, max_sequence, last_payload_digest, last_seen_at, unrecognized_entry_count)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(issuer) DO UPDATE SET
+            max_sequence = excluded.max_sequence,
+            last_payload_digest = excluded.last_payload_digest,
+            last_seen_at = excluded.last_seen_at,
+            unrecognized_entry_count = policy_revocation_state.unrecognized_entry_count + ?5",
+    )
+    .bind(issuer)
+    .bind(sequence as i64)
+    .bind(tag(candidate.payload_digest())?)
+    .bind(now.to_rfc3339())
+    .bind(new_unrecognized)
+    .execute(&mut *conn)
+    .await?;
+
+    for entry in new_entries {
+        let (target_kind, target_digest) = match &entry.target {
+            RevocationTarget::RevisionDigest { digest } => ("revision_digest", tag(digest)?),
+            RevocationTarget::PayloadDigest { digest } => ("payload_digest", tag(digest)?),
+            // No digest to key an actionable row on -- see the migration's
+            // comment on `policy_revocations`. Counted above instead.
+            RevocationTarget::Unrecognized => continue,
+        };
+        sqlx::query(
+            "INSERT OR IGNORE INTO policy_revocations
+                (issuer, target_kind, target_digest, reason, revoked_at, audit_ref,
+                 superseded_by, first_seen_sequence, first_seen_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        )
+        .bind(issuer)
+        .bind(target_kind)
+        .bind(&target_digest)
+        .bind(&entry.reason)
+        .bind(&entry.revoked_at)
+        .bind(&entry.audit_ref)
+        .bind(entry.superseded_by.as_ref().map(tag).transpose()?)
+        .bind(sequence as i64)
+        .bind(now.to_rfc3339())
+        .execute(&mut *conn)
+        .await?;
+    }
+
+    Ok(())
 }
 
 /// Persists an `Activate` decision inside the caller's already-open
