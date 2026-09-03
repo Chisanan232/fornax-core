@@ -26,6 +26,7 @@
 //! - **Diagnostics** ([`diagnostics::PolicyDiagnostic`]) are actionable:
 //!   every one carries a non-empty `message` and `remediation`.
 
+mod action_classification;
 mod bundle;
 mod content;
 mod diagnostics;
@@ -34,6 +35,7 @@ mod resolve;
 mod revision;
 mod target;
 
+pub use action_classification::classify_action_class;
 pub use bundle::{
     verify_bundle, BundlePayload, BundleProvenance, BundleRejection, BundleSignature, KeyId,
     PayloadDigest, SignatureAlgorithm, SignedPolicyBundle, TrustStoreError, TrustedKey,
