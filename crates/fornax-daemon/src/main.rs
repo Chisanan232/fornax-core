@@ -26,6 +26,8 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, RwLock};
 
+mod policy_poll;
+
 fn fornax_home() -> PathBuf {
     std::env::var("FORNAX_HOME")
         .map(PathBuf::from)
@@ -134,6 +136,22 @@ struct AppState {
     policy: Arc<RwLock<PolicyCacheSnapshot>>,
 }
 
+/// FORNX-311: the background policy poll task's most recent attempt.
+/// In-memory only -- no persistence, no migration -- mirroring
+/// `LastPolicyRejection`'s own precedent exactly.
+#[derive(Clone)]
+struct LastPolicyPoll {
+    attempted_at: DateTime<Utc>,
+    /// One of: "ok" | "disabled" | "unreachable" | "auth_failed" |
+    /// "http_error" | "too_large" | "malformed" | "panicked".
+    outcome: &'static str,
+    /// Never contains the credential value or any URL query string.
+    detail: String,
+    bundles_received: usize,
+    consecutive_failures: u32,
+    next_attempt_at: DateTime<Utc>,
+}
+
 /// In-memory snapshot `GET /api/policy` reads. See
 /// `docs/adr/0008-local-policy-cache-and-activation.md`.
 #[derive(Clone)]
@@ -146,6 +164,8 @@ struct PolicyCacheSnapshot {
     diagnostics: Vec<PolicyDiagnostic>,
     /// In-memory only -- no persistence, no migration needed for it.
     last_rejection: Option<LastPolicyRejection>,
+    /// FORNX-311: in-memory only -- no persistence, no migration needed.
+    last_poll: Option<LastPolicyPoll>,
 }
 
 impl PolicyCacheSnapshot {
@@ -164,6 +184,7 @@ impl PolicyCacheSnapshot {
             loaded_slot: None,
             diagnostics: Vec::new(),
             last_rejection: None,
+            last_poll: None,
         }
     }
 }
@@ -261,6 +282,7 @@ async fn main() -> anyhow::Result<()> {
                 loaded_slot: load.loaded_slot,
                 diagnostics: load.diagnostics,
                 last_rejection: None,
+                last_poll: None,
             }
         }
         Err(e) => {
@@ -284,6 +306,11 @@ async fn main() -> anyhow::Result<()> {
             tracing::error!(error = %e, "UDS server exited");
         }
     });
+
+    // FORNX-311: background policy bundle poll transport, alongside the UDS
+    // ingest task. Disabled by default (no FORNAX_POLICY_POLL_URL) -- see
+    // `policy_poll::resolve_poll_config`.
+    let poll_task = policy_poll::spawn(state.clone(), home.clone());
 
     let app = Router::new()
         .route("/api/status", get(api_status))
@@ -313,6 +340,7 @@ async fn main() -> anyhow::Result<()> {
     // doesn't have to distinguish "stale from a clean stop" from "stale from
     // a crash" — there's nothing left to distinguish.
     uds_task.abort();
+    poll_task.abort();
     let _ = std::fs::remove_file(&sock_path);
     let _ = std::fs::remove_file(&pid_path);
     tracing::info!("fornaxd stopped");
@@ -722,6 +750,19 @@ async fn api_policy(State(state): State<AppState>) -> Json<serde_json::Value> {
         &snapshot.diagnostics,
     );
 
+    // FORNX-311: `null` before the first poll cycle completes (or forever,
+    // for an install with polling disabled/not configured).
+    let last_poll = snapshot.last_poll.as_ref().map(|p| {
+        serde_json::json!({
+            "attempted_at": p.attempted_at,
+            "outcome": p.outcome,
+            "detail": p.detail,
+            "bundles_received": p.bundles_received,
+            "consecutive_failures": p.consecutive_failures,
+            "next_attempt_at": p.next_attempt_at,
+        })
+    });
+
     Json(serde_json::json!({
         "schema_version": fornax_types::POLICY_CACHE_SCHEMA_VERSION,
         "configured": snapshot.state.ever_configured,
@@ -745,6 +786,7 @@ async fn api_policy(State(state): State<AppState>) -> Json<serde_json::Value> {
         "degraded": degraded,
         "diagnostics": snapshot.diagnostics,
         "last_rejection": last_rejection,
+        "last_poll": last_poll,
     }))
 }
 
@@ -3365,6 +3407,7 @@ mod tests {
                 "degraded",
                 "diagnostics",
                 "last_rejection",
+                "last_poll",
             ],
             "top level",
         );
