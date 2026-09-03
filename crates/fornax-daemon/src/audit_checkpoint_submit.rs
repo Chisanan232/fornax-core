@@ -231,7 +231,7 @@ async fn submit_one_cycle(
     let request = AuditCheckpointRequest {
         checkpoint_schema_version: fornax_types::AUDIT_CHECKPOINT_SCHEMA_VERSION,
         checkpoint_seq: next_checkpoint_seq,
-        observed_at: Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        observed_at: rfc3339_z(Utc::now()),
         head: LedgerHead {
             ledger_seq: tail.seq,
             entry_hash: tail.entry_hash.clone(),
@@ -358,6 +358,13 @@ fn divergence_kind_wire_str(kind: fornax_store::DivergenceKind) -> &'static str 
     }
 }
 
+/// ADR-0012 §4.2: "seconds precision, no fractional part, literal trailing
+/// `Z`, never `+00:00`" -- `chrono`'s `to_rfc3339()` emits `+00:00`, which
+/// is why this uses an explicit `strftime`-style format string instead.
+fn rfc3339_z(dt: chrono::DateTime<Utc>) -> String {
+    dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
 fn classify_transport_error(e: &reqwest::Error) -> String {
     if e.is_timeout() {
         "request timed out".to_string()
@@ -457,5 +464,68 @@ mod tests {
             divergence_kind_wire_str(fornax_store::DivergenceKind::RelinkedPrevHash),
             "relinked_prev_hash"
         );
+    }
+
+    /// ADR-0012 §4.2: seconds precision, no fractional part, literal
+    /// trailing `Z`, never `+00:00`. `to_rfc3339()` would emit `+00:00`;
+    /// this pins the actual emitted shape against a fixed instant.
+    #[test]
+    fn t03_rfc3339_z_emits_the_exact_adr_0012_shape() {
+        let dt: chrono::DateTime<Utc> = "2026-09-03T12:00:00.123456Z".parse().unwrap();
+        assert_eq!(rfc3339_z(dt), "2026-09-03T12:00:00Z");
+        assert!(!rfc3339_z(dt).contains('+'));
+        assert!(!rfc3339_z(dt).contains('.'));
+    }
+
+    /// ADR-0012 §2.2: the request body's key order is normative. Confirms
+    /// `AuditCheckpointRequest`'s `Serialize` impl (derived from its field
+    /// declaration order) emits the exact key sequence the contract
+    /// specifies, with every `Option` present as explicit `null` rather
+    /// than omitted -- the request-emission half of the same discipline
+    /// `fornax-types`' golden-vector test proves for the response payload.
+    #[test]
+    fn t04_request_serializes_keys_in_the_adr_0012_normative_order() {
+        let request = AuditCheckpointRequest {
+            checkpoint_schema_version: 1,
+            checkpoint_seq: 1,
+            observed_at: "2026-09-03T12:00:00Z".to_string(),
+            head: LedgerHead {
+                ledger_seq: 5,
+                entry_hash:
+                    "sha256:e967d0e31e6afd2a3a0f5bd805e39f85eb0eeb4e176e88e0e65d3c26a1cba464"
+                        .to_string(),
+            },
+            device_reported_chain_status: DeviceReportedChainStatus {
+                status: "valid".to_string(),
+                first_bad_ledger_seq: None,
+                divergence_kind: None,
+            },
+        };
+        // `serde_json::Value`'s map is a `BTreeMap` (alphabetically
+        // sorted) without the `preserve_order` feature, so key ORDER must
+        // be checked against the serialized STRING, not a re-parsed
+        // `Value` -- `to_value` would silently re-sort the keys and make
+        // this assertion pass regardless of the struct's actual field
+        // order.
+        let json = serde_json::to_string(&request).unwrap();
+        let positions: Vec<usize> = [
+            "\"checkpoint_schema_version\"",
+            "\"checkpoint_seq\"",
+            "\"observed_at\"",
+            "\"head\"",
+            "\"device_reported_chain_status\"",
+        ]
+        .iter()
+        .map(|key| {
+            json.find(key)
+                .unwrap_or_else(|| panic!("{key} missing from {json}"))
+        })
+        .collect();
+        assert!(
+            positions.windows(2).all(|w| w[0] < w[1]),
+            "keys are not in ADR-0012 §2.2's normative order: {json}"
+        );
+        assert!(json.contains("\"first_bad_ledger_seq\":null"));
+        assert!(json.contains("\"divergence_kind\":null"));
     }
 }
