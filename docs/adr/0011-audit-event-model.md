@@ -106,6 +106,7 @@ this ADR:
 | `policy_bundle_activated` | A signed policy bundle was verified and activated locally (ADR-0007/0008). |
 | `policy_revocation_ingested` | A signed revocation list was verified and its entries ingested (ADR-0009). |
 | `role_assignment_changed` | A `RoleAssignment` was created, modified, or removed. |
+| `evidence_purged` | FORNX-319: a `RetentionClass::RawLocal` evidence row's payload was purged by the local retention sweep (`fornax-store::retention`) once its retention window elapsed. |
 | _(any other string)_ | Forward-compatibility catch-all. |
 
 This set is deliberately small and will grow additively as new

@@ -107,6 +107,11 @@ pub enum AuditAction {
     PolicyBundleActivated,
     PolicyRevocationIngested,
     RoleAssignmentChanged,
+    /// FORNX-319: a `RetentionClass::RawLocal` evidence row's payload was
+    /// purged by the local retention sweep (`fornax_store::retention`) once
+    /// its retention window elapsed. See
+    /// `docs/adr/0011-audit-event-model.md` §2's table.
+    EvidencePurged,
     /// Forward-compatibility catch-all. Preserves and round-trips the
     /// original wire string verbatim — see the module docs' "Two enum
     /// shapes" section.
@@ -470,6 +475,7 @@ mod tests {
                 "\"role_assignment_changed\"",
                 AuditAction::RoleAssignmentChanged,
             ),
+            ("\"evidence_purged\"", AuditAction::EvidencePurged),
         ];
         for (json, expected) in cases {
             let v: AuditAction = serde_json::from_str(json).unwrap();
