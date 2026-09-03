@@ -300,7 +300,13 @@ impl Store {
     /// `tenant` (and its lineage tags) is removed, or — on any error — none
     /// of it is, so a caller never observes a partially-applied deletion.
     pub async fn delete_records_for_tenant(&self, tenant: &TenantRef) -> Result<DeletionReport> {
-        let mut tx = self.pool.begin().await?;
+        // FORNX-319: use BEGIN IMMEDIATE, matching the four insert paths and
+        // the sweep. Before this ticket nothing wrote to the store without
+        // holding `AppState::processing`; the sweep now does, which makes a
+        // deferred BEGIN here newly reachable for the same
+        // SQLITE_BUSY_SNAPSHOT race that busy_timeout + BEGIN IMMEDIATE
+        // already fixed on the insert paths (see this file's module doc).
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
 
         let rows = sqlx::query_as::<_, LineageTagRow>(
             "SELECT record_table, record_id, schema_version, retention_class, tenant_ref,
