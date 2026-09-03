@@ -1659,4 +1659,610 @@ mod tests {
 
         std::fs::remove_file(&path).ok();
     }
+
+    // ------------------------------------------------------------------
+    // FORNX-123 revocation: T79-81, T84, T85, T89, T91. Continues the
+    // numbering from T78 (fornax-types's pure decision-function tests) --
+    // these need a real SQLite-backed Store, hence living here rather than
+    // alongside T78 in `fornax_types::policy::revocation_tests`.
+    // ------------------------------------------------------------------
+
+    fn build_revocation_envelope(
+        issuer: &str,
+        sequence: u64,
+        entries: Vec<serde_json::Value>,
+        key_id: &str,
+        sk: &ed25519_dalek::SigningKey,
+    ) -> Vec<u8> {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+        use ed25519_dalek::Signer;
+
+        let payload = serde_json::json!({
+            "revocation_schema_version": fornax_types::REVOCATION_SCHEMA_VERSION,
+            "issuer": issuer,
+            "sequence": sequence,
+            "issued_at": "2026-01-01T00:00:00Z",
+            "entries": entries,
+        });
+        let payload_bytes = serde_json::to_vec(&payload).unwrap();
+        let mut msg = Vec::new();
+        msg.extend_from_slice(fornax_types::REVOCATION_SIGNING_DOMAIN);
+        msg.extend_from_slice(&payload_bytes);
+        let sig = sk.sign(&msg);
+        let envelope = serde_json::json!({
+            "revocation_schema_version": fornax_types::REVOCATION_SCHEMA_VERSION,
+            "payload_b64": STANDARD.encode(&payload_bytes),
+            "signatures": [{
+                "key_id": key_id,
+                "algorithm": "ed25519",
+                "signature_b64": STANDARD.encode(sig.to_bytes()),
+            }],
+        });
+        serde_json::to_vec(&envelope).unwrap()
+    }
+
+    /// A `CacheGeneration` may contain members from multiple independent
+    /// `policy_id` lineages at once (see `cache.rs`'s module doc: "at most
+    /// one member per policy_id lineage", not "at most one member").
+    /// `members[0]` is only safe to index directly for a single-lineage
+    /// generation; every multi-lineage test below must look a member up by
+    /// its own `policy_id` instead.
+    fn digest_for_policy(gen: &fornax_types::CacheGeneration, policy_id: Uuid) -> String {
+        gen.members
+            .iter()
+            .find(|m| m.policy_id.0 == policy_id)
+            .unwrap_or_else(|| panic!("no member for policy_id {policy_id}"))
+            .revision_digest
+            .to_string()
+    }
+
+    fn revision_digest_entry(digest: &str, reason: &str) -> serde_json::Value {
+        serde_json::json!({
+            "target": { "target_kind": "revision_digest", "digest": digest },
+            "revoked_at": "2026-01-01T00:00:00Z",
+            "reason": reason,
+            "audit_ref": null,
+            "superseded_by": null,
+        })
+    }
+
+    #[tokio::test]
+    async fn t79_cached_then_revoked_yields_no_usable_generation_with_revoked_diagnostic() {
+        let path = tmp_db_path("cached-then-revoked");
+        let sk = signing_key();
+        let trust = trust_store("k1", &sk);
+        let policy_id = Uuid::new_v4();
+
+        let store = Store::open(&path).await.expect("open db");
+        let env = build_envelope(
+            "issuer-a",
+            1,
+            policy_id,
+            "k1",
+            &sk,
+            "2026-01-01T00:00:00Z",
+            "2027-01-01T00:00:00Z",
+        );
+        store
+            .submit_policy_bundle(&env, &trust, now())
+            .await
+            .expect("activate");
+
+        let loaded = store
+            .load_policy_cache(Some(&trust), now())
+            .await
+            .expect("load before revocation");
+        let revision_digest = loaded.state.active.as_ref().unwrap().members[0]
+            .revision_digest
+            .to_string();
+
+        // Ingest a revocation naming that revision_digest -- NO new bundle
+        // is ever submitted.
+        let revocation_env = build_revocation_envelope(
+            "issuer-b",
+            1,
+            vec![revision_digest_entry(&revision_digest, "compromised")],
+            "k1",
+            &sk,
+        );
+        let outcome = store
+            .submit_policy_revocation(&revocation_env, &trust, now())
+            .await
+            .expect("submit revocation");
+        assert!(matches!(outcome, RevocationIngestOutcome::Applied { .. }));
+
+        let load = store
+            .load_policy_cache(Some(&trust), now())
+            .await
+            .expect("load after revocation");
+        assert_eq!(load.loaded_slot, None);
+        assert!(load.usable.is_empty());
+        assert!(load
+            .diagnostics
+            .iter()
+            .any(|d| d.code == DiagnosticCode::PolicyCacheRevoked
+                && d.severity == DiagnosticSeverity::Error));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn t80_revoked_active_member_falls_back_to_clean_last_known_good() {
+        let path = tmp_db_path("revoked-active-falls-back");
+        let sk = signing_key();
+        let trust = trust_store("k1", &sk);
+        let p1 = Uuid::new_v4();
+        let p2 = Uuid::new_v4();
+
+        let store = Store::open(&path).await.expect("open db");
+        // Generation 1 (becomes LKG): p1.
+        let env1 = build_envelope(
+            "issuer-a",
+            1,
+            p1,
+            "k1",
+            &sk,
+            "2026-01-01T00:00:00Z",
+            "2027-01-01T00:00:00Z",
+        );
+        store
+            .submit_policy_bundle(&env1, &trust, now())
+            .await
+            .expect("activate p1");
+        let lkg_digest = digest_for_policy(
+            &store
+                .load_policy_cache(Some(&trust), now())
+                .await
+                .unwrap()
+                .state
+                .active
+                .unwrap(),
+            p1,
+        );
+
+        // Generation 2 (active): p2 activated alongside p1 (a generation
+        // holds one member per lineage, not one member total).
+        let env2 = build_envelope(
+            "issuer-a",
+            1,
+            p2,
+            "k1",
+            &sk,
+            "2026-01-01T00:00:00Z",
+            "2027-01-01T00:00:00Z",
+        );
+        store
+            .submit_policy_bundle(&env2, &trust, now())
+            .await
+            .expect("activate p2");
+        let active_digest = digest_for_policy(
+            &store
+                .load_policy_cache(Some(&trust), now())
+                .await
+                .unwrap()
+                .state
+                .active
+                .unwrap(),
+            p2,
+        );
+        assert_ne!(lkg_digest, active_digest);
+
+        // Revoke only the ACTIVE generation's member.
+        let revocation_env = build_revocation_envelope(
+            "issuer-b",
+            1,
+            vec![revision_digest_entry(&active_digest, "compromised")],
+            "k1",
+            &sk,
+        );
+        store
+            .submit_policy_revocation(&revocation_env, &trust, now())
+            .await
+            .expect("submit revocation");
+
+        let load = store
+            .load_policy_cache(Some(&trust), now())
+            .await
+            .expect("load after revocation");
+        assert_eq!(load.loaded_slot, Some(CacheSlotKind::LastKnownGood));
+        assert_eq!(load.usable.len(), 1);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn t81_revoked_in_both_active_and_lkg_yields_empty_usable_and_degraded_posture() {
+        let path = tmp_db_path("revoked-both");
+        let sk = signing_key();
+        let trust = trust_store("k1", &sk);
+        let p1 = Uuid::new_v4();
+        let p2 = Uuid::new_v4();
+
+        let store = Store::open(&path).await.expect("open db");
+        let env1 = build_envelope(
+            "issuer-a",
+            1,
+            p1,
+            "k1",
+            &sk,
+            "2026-01-01T00:00:00Z",
+            "2027-01-01T00:00:00Z",
+        );
+        store
+            .submit_policy_bundle(&env1, &trust, now())
+            .await
+            .expect("activate p1");
+        let digest1 = digest_for_policy(
+            &store
+                .load_policy_cache(Some(&trust), now())
+                .await
+                .unwrap()
+                .state
+                .active
+                .unwrap(),
+            p1,
+        );
+
+        let env2 = build_envelope(
+            "issuer-a",
+            1,
+            p2,
+            "k1",
+            &sk,
+            "2026-01-01T00:00:00Z",
+            "2027-01-01T00:00:00Z",
+        );
+        store
+            .submit_policy_bundle(&env2, &trust, now())
+            .await
+            .expect("activate p2");
+        let digest2 = digest_for_policy(
+            &store
+                .load_policy_cache(Some(&trust), now())
+                .await
+                .unwrap()
+                .state
+                .active
+                .unwrap(),
+            p2,
+        );
+
+        let revocation_env = build_revocation_envelope(
+            "issuer-b",
+            1,
+            vec![
+                revision_digest_entry(&digest1, "compromised-1"),
+                revision_digest_entry(&digest2, "compromised-2"),
+            ],
+            "k1",
+            &sk,
+        );
+        store
+            .submit_policy_revocation(&revocation_env, &trust, now())
+            .await
+            .expect("submit revocation");
+
+        let load = store
+            .load_policy_cache(Some(&trust), now())
+            .await
+            .expect("load after revocation");
+        assert_eq!(load.loaded_slot, None);
+        assert!(load.usable.is_empty());
+
+        let posture = fornax_types::compute_posture(
+            load.state.ever_configured,
+            load.usable.is_empty(),
+            &load.diagnostics,
+        );
+        assert!(matches!(
+            posture,
+            fornax_types::PolicyPosture::Degraded {
+                reason: fornax_types::PolicyDegradationReason::Revoked
+            }
+        ));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn t84_revocation_stickiness_survives_signing_key_removal() {
+        let path = tmp_db_path("revocation-stickiness");
+        let sk = signing_key();
+        let trust = trust_store("k1", &sk);
+        let policy_id = Uuid::new_v4();
+
+        let store = Store::open(&path).await.expect("open db");
+        let env = build_envelope(
+            "issuer-a",
+            1,
+            policy_id,
+            "k1",
+            &sk,
+            "2026-01-01T00:00:00Z",
+            "2027-01-01T00:00:00Z",
+        );
+        store
+            .submit_policy_bundle(&env, &trust, now())
+            .await
+            .expect("activate");
+        let revision_digest = store
+            .load_policy_cache(Some(&trust), now())
+            .await
+            .unwrap()
+            .state
+            .active
+            .unwrap()
+            .members[0]
+            .revision_digest
+            .to_string();
+
+        let revocation_env = build_revocation_envelope(
+            "issuer-b",
+            1,
+            vec![revision_digest_entry(&revision_digest, "compromised")],
+            "k1",
+            &sk,
+        );
+        store
+            .submit_policy_revocation(&revocation_env, &trust, now())
+            .await
+            .expect("submit revocation");
+
+        // Remove `k1` from the trust store entirely and reload -- the
+        // revoked digest must remain revoked. Nothing "resurrects" it via
+        // key removal: revocation is sticky regardless of trust-store
+        // edits.
+        let sk2 = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]);
+        let trust_without_k1 = trust_store("k2", &sk2);
+        let load = store
+            .load_policy_cache(Some(&trust_without_k1), now())
+            .await
+            .expect("load with k1 removed");
+        assert_eq!(load.loaded_slot, None);
+        assert!(load.usable.is_empty());
+        // Even re-trusting k1 must not resurrect the revoked digest.
+        let load2 = store
+            .load_policy_cache(Some(&trust), now())
+            .await
+            .expect("load with k1 restored");
+        assert_eq!(load2.loaded_slot, None);
+        assert!(load2.usable.is_empty());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn t85_idempotent_reimport_of_same_revocation_list_yields_already_current() {
+        let path = tmp_db_path("revocation-idempotent");
+        let sk = signing_key();
+        let trust = trust_store("k1", &sk);
+
+        let store = Store::open(&path).await.expect("open db");
+        let revocation_env = build_revocation_envelope(
+            "issuer-a",
+            1,
+            vec![revision_digest_entry(
+                "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                "r",
+            )],
+            "k1",
+            &sk,
+        );
+        let outcome1 = store
+            .submit_policy_revocation(&revocation_env, &trust, now())
+            .await
+            .expect("first submit");
+        assert!(matches!(
+            outcome1,
+            RevocationIngestOutcome::Applied {
+                new_entry_count: 1,
+                ..
+            }
+        ));
+
+        let outcome2 = store
+            .submit_policy_revocation(&revocation_env, &trust, now())
+            .await
+            .expect("second submit, same envelope");
+        assert!(matches!(
+            outcome2,
+            RevocationIngestOutcome::AlreadyCurrent { .. }
+        ));
+
+        // No duplicate rows: exactly one row in policy_revocations.
+        let mut conn = store.pool.acquire().await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM policy_revocations")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn t87_unrecognized_entry_is_not_persisted_as_actionable_but_is_counted() {
+        let path = tmp_db_path("revocation-unrecognized");
+        let sk = signing_key();
+        let trust = trust_store("k1", &sk);
+
+        let store = Store::open(&path).await.expect("open db");
+        let known = revision_digest_entry(
+            "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "known-bad",
+        );
+        let unknown = serde_json::json!({
+            "target": { "target_kind": "future_kind", "opaque": "field" },
+            "revoked_at": "2026-01-01T00:00:00Z",
+            "reason": "future",
+            "audit_ref": null,
+            "superseded_by": null,
+        });
+        let revocation_env =
+            build_revocation_envelope("issuer-a", 1, vec![known, unknown], "k1", &sk);
+        store
+            .submit_policy_revocation(&revocation_env, &trust, now())
+            .await
+            .expect("submit revocation with one unrecognized entry");
+
+        let load = store
+            .load_policy_cache(Some(&trust), now())
+            .await
+            .expect("load");
+        assert_eq!(
+            load.state.revocations.revision_digests.len(),
+            1,
+            "only the known entry becomes an actionable row"
+        );
+        assert_eq!(load.state.revocations.unrecognized_entry_count, 1);
+        assert!(load.diagnostics.iter().any(|d| d.code
+            == DiagnosticCode::PolicyRevocationEntryNotUnderstood
+            && d.severity == DiagnosticSeverity::Warning));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn t89_crash_mid_revocation_ingest_leaves_prior_state_byte_for_byte_intact() {
+        let path = tmp_db_path("revocation-crash");
+        let sk = signing_key();
+        let trust = trust_store("k1", &sk);
+
+        {
+            let store = Store::open(&path).await.expect("open db");
+            let revocation_env = build_revocation_envelope(
+                "issuer-a",
+                1,
+                vec![revision_digest_entry(
+                    "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                    "r",
+                )],
+                "k1",
+                &sk,
+            );
+            store
+                .submit_policy_revocation(&revocation_env, &trust, now())
+                .await
+                .expect("first revocation");
+        }
+
+        // Simulate a crash mid-second-ingest: open a transaction, write a
+        // competing row, then drop the connection WITHOUT committing.
+        {
+            let store = Store::open(&path).await.expect("reopen db");
+            let mut conn = store.pool.acquire().await.expect("acquire conn");
+            sqlx::query("BEGIN IMMEDIATE")
+                .execute(&mut *conn)
+                .await
+                .expect("begin immediate");
+            sqlx::query(
+                "UPDATE policy_revocation_state SET max_sequence = 99 WHERE issuer = 'issuer-a'",
+            )
+            .execute(&mut *conn)
+            .await
+            .expect("uncommitted update");
+            drop(conn);
+            drop(store);
+        }
+
+        let store = Store::open(&path)
+            .await
+            .expect("reopen after simulated crash");
+        let load = store
+            .load_policy_cache(Some(&trust), now())
+            .await
+            .expect("load policy cache");
+        let hw = load
+            .state
+            .revocations
+            .max_sequence_by_issuer
+            .get("issuer-a")
+            .copied();
+        assert_eq!(
+            hw,
+            Some(1),
+            "the uncommitted max_sequence=99 update must not have survived"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn t91_rollback_into_revoked_last_known_good_never_resurrects_it() {
+        let path = tmp_db_path("revocation-rollback");
+        let sk = signing_key();
+        let trust = trust_store("k1", &sk);
+        let p1 = Uuid::new_v4();
+        let p2 = Uuid::new_v4();
+
+        let store = Store::open(&path).await.expect("open db");
+        let env1 = build_envelope(
+            "issuer-a",
+            1,
+            p1,
+            "k1",
+            &sk,
+            "2026-01-01T00:00:00Z",
+            "2027-01-01T00:00:00Z",
+        );
+        store
+            .submit_policy_bundle(&env1, &trust, now())
+            .await
+            .expect("activate p1");
+        let digest1 = digest_for_policy(
+            &store
+                .load_policy_cache(Some(&trust), now())
+                .await
+                .unwrap()
+                .state
+                .active
+                .unwrap(),
+            p1,
+        );
+
+        let env2 = build_envelope(
+            "issuer-a",
+            1,
+            p2,
+            "k1",
+            &sk,
+            "2026-01-01T00:00:00Z",
+            "2027-01-01T00:00:00Z",
+        );
+        store
+            .submit_policy_bundle(&env2, &trust, now())
+            .await
+            .expect("activate p2 (p1 becomes LKG)");
+
+        // Revoke p1's (the LKG's) revision digest.
+        let revocation_env = build_revocation_envelope(
+            "issuer-b",
+            1,
+            vec![revision_digest_entry(&digest1, "compromised")],
+            "k1",
+            &sk,
+        );
+        store
+            .submit_policy_revocation(&revocation_env, &trust, now())
+            .await
+            .expect("revoke p1");
+
+        // Roll back to "last known good" -- which is the now-revoked p1.
+        store
+            .rollback_policy_to_last_known_good(now())
+            .await
+            .expect("rollback");
+
+        let load = store
+            .load_policy_cache(Some(&trust), now())
+            .await
+            .expect("load after rollback");
+        assert!(
+            load.usable.is_empty(),
+            "rollback into a revoked LKG must never resurrect it"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
 }
