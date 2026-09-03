@@ -59,18 +59,22 @@
 //! proof (deleting one tenant's records leaves another tenant's rows
 //! completely untouched).
 //!
-//! **Honest scope note**: today, nothing in this codebase yet calls
-//! `record_lineage_tag` on the live claim/evidence-write path (there is no
-//! `tenant_id` column on `agent_events`/`claims`/`evidence`/`findings`
-//! themselves — this store predates any tenant concept, and FORNX-103
-//! deliberately introduced `TenantRef` only as a schema, not as a persisted
-//! column). This ticket builds the real, tested deletion-propagation
-//! *mechanism* — given a tenant's lineage tags, it really deletes the real
-//! rows they point at — but wiring every future longitudinal-artifact writer
-//! to call `record_lineage_tag` at write time is left to whichever ticket
-//! introduces that writer (e.g. a future FORNX-105 adjudication path). This
-//! module does not fabricate a "deletion succeeded" result against data that
-//! was never tagged in the first place.
+//! **FORNX-319 update — the live write path is now wired.**
+//! `Store::insert_event`/`insert_claim`/`insert_evidence`/`insert_finding`
+//! each record a [`DatasetLineageTag`] atomically alongside the row they
+//! insert (see [`retention_class_for_table`] for the classification rule
+//! and each method's own doc comment). There is still no `tenant_id`
+//! column on `agent_events`/`claims`/`evidence`/`findings` themselves —
+//! FORNX-103/106 deliberately kept [`TenantRef`] schema-only locally, and
+//! this ticket does not add one — so each insert path uses the record's own
+//! `session_id` as this local daemon's closest available tenant-scoping
+//! key (`Finding` has no `session_id` of its own; `insert_finding` resolves
+//! it from the referenced `claims` row instead). [`Store::sweep_expired_records`]
+//! is the bounded, incremental consumer of these tags: unlike
+//! [`Store::delete_records_for_tenant`]'s tenant-scoped hard delete of
+//! every known table, the sweep soft-purges `"evidence"` rows in place
+//! ([`Store::purge_evidence_payload`]) so a finding's verdict/rationale
+//! stay intact and readable after its evidence expires (AC2/AC3 below).
 //!
 //! # AC5: research/replay exports cannot bypass the normal
 //! classification/egress boundary
@@ -90,6 +94,7 @@
 
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use fornax_types::{DatasetLineageTag, RetentionClass, TenantRef};
 
 use crate::{Result, Store};
@@ -133,6 +138,26 @@ pub fn retention_duration_for(class: &RetentionClass) -> Duration {
         // An unrecognized tag is treated as the most sensitive, shortest-
         // lived class this binary knows about — see this module's AC1 table.
         RetentionClass::Unrecognized(_) => RAW_LOCAL_RETENTION,
+    }
+}
+
+/// Which [`RetentionClass`] a record written to `record_table` is tagged
+/// with at the live write path (FORNX-319 AC1, applying this module's own
+/// AC1 table to `Store::insert_event`/`insert_claim`/`insert_evidence`/
+/// `insert_finding`). `agent_events`/`claims`/`evidence` are all raw,
+/// single-session observations -> [`RetentionClass::RawLocal`]; `findings`
+/// are derived conclusions drawn from aggregated evidence ->
+/// [`RetentionClass::DerivedFinding`] — matching this module's own AC1
+/// table above. A table name outside [`KNOWN_RECORD_TABLES`] (should never
+/// happen at a real call site in this crate) falls back to
+/// [`RetentionClass::Unrecognized`], which [`retention_duration_for`]
+/// sweeps at the shortest, safest duration rather than silently retaining
+/// it forever.
+pub fn retention_class_for_table(record_table: &str) -> RetentionClass {
+    match record_table {
+        "agent_events" | "claims" | "evidence" => RetentionClass::RawLocal,
+        "findings" => RetentionClass::DerivedFinding,
+        other => RetentionClass::Unrecognized(other.to_string()),
     }
 }
 
@@ -236,28 +261,7 @@ impl Store {
         record_id: &str,
         tag: &DatasetLineageTag,
     ) -> Result<()> {
-        let retention_class_tag = match serde_json::to_value(&tag.retention_class)? {
-            serde_json::Value::String(s) => s,
-            other => other.to_string(),
-        };
-        sqlx::query(
-            "INSERT INTO dataset_lineage_tags
-                (id, record_table, record_id, schema_version, retention_class, tenant_ref,
-                 source_record_ids, recorded_at, deletion_requested_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        )
-        .bind(uuid::Uuid::new_v4().to_string())
-        .bind(record_table)
-        .bind(record_id)
-        .bind(tag.schema_version as i64)
-        .bind(retention_class_tag)
-        .bind(&tag.tenant_ref.0)
-        .bind(serde_json::to_string(&tag.source_record_ids)?)
-        .bind(&tag.recorded_at)
-        .bind(&tag.deletion_requested_at)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        crate::insert_lineage_tag_row(&self.pool, record_table, record_id, tag).await
     }
 
     /// All lineage tags recorded for `tenant`, joined with the real
@@ -362,6 +366,222 @@ impl Store {
 
         Ok(report)
     }
+
+    /// FORNX-319 AC2/AC3: purge one `evidence` row's raw `payload` in
+    /// place. This NEVER deletes the row, unlike
+    /// [`Store::delete_records_for_tenant`]'s handling of the other three
+    /// known tables — the finding/verdict/rationale/audit trail this
+    /// evidence once supported is stored elsewhere (`findings`, never on
+    /// `evidence` itself) and is completely untouched by this call; there
+    /// is no code path here that can recompute or alter a verdict as a
+    /// side effect (ADR-0001 D4). Sets `evidence_purged = 1` and overwrites
+    /// `payload` with [`evidence_expired_payload_marker`] — an explicit,
+    /// unmistakable "evidence expired" statement, never `{}` (an empty
+    /// object reads as "empty evidence was collected", exactly the false
+    /// impression this ticket's AC3 forbids) — so any reader of
+    /// `Evidence::payload`, present or future, sees an honest marker
+    /// instead of silence. Returns `true` if a row with this id existed.
+    pub async fn purge_evidence_payload(&self, evidence_id: &str) -> Result<bool> {
+        purge_evidence_payload_row(&self.pool, evidence_id).await
+    }
+
+    /// Bounded incremental retention sweep (FORNX-319 AC4/AC5/AC6).
+    /// Examines up to `batch_size` lineage tags, in `recorded_at` ascending
+    /// order starting strictly after `cursor` (`None` starts from the
+    /// beginning of the table), in ONE transaction bounded by rows
+    /// *examined* — never a single transaction over the whole table, so an
+    /// arbitrarily large backlog cannot hold a lock for longer than one
+    /// small batch, and a concurrent live insert (a separate connection out
+    /// of this store's pool) is never measurably delayed by a sweep in
+    /// progress.
+    ///
+    /// Every examined row is checked against
+    /// [`retention_duration_for`](tag.retention_class) (AC5: the sweep
+    /// calls this directly, never re-derives a duration) measured from
+    /// `tag.recorded_at` against `now` (a parameter so tests simulate
+    /// elapsed time instead of sleeping; an
+    /// [`RetentionClass::Unrecognized`] tag is swept at the shortest safe
+    /// default per AC6, exactly like every other caller of
+    /// `retention_duration_for`). An unexpired row's tag is left
+    /// completely untouched — a LATER call, once its window elapses, can
+    /// still find and process it; this is what keeps the sweep correct
+    /// without a single giant "find every expired row" query. An expired
+    /// row is dispatched by `record_table`: `"evidence"` is soft-purged via
+    /// [`Store::purge_evidence_payload`]; `"agent_events"`/`"claims"`/
+    /// `"findings"` are hard-deleted (matching
+    /// [`Store::delete_records_for_tenant`]'s own per-table match arms);
+    /// any other table is left alone. Either way, an EXPIRED row's lineage
+    /// tag is always removed, its purpose (find this record when its
+    /// window elapses) having been fulfilled.
+    ///
+    /// Returns [`SweepReport::next_cursor`] — the `recorded_at` of the last
+    /// examined row, or `None` once fewer than `batch_size` rows were
+    /// returned (the whole table has been examined this pass; a caller
+    /// should restart its own cursor at `None` on the next cycle rather
+    /// than getting stuck at the end).
+    ///
+    /// **Known ordering caveat**: `recorded_at` is an RFC3339 string
+    /// (`DatasetLineageTag::new` stamps `chrono::Utc::now().to_rfc3339()`,
+    /// whose subsecond digit count varies), and `ORDER BY recorded_at ASC`
+    /// is a plain SQLite text comparison — two timestamps a few
+    /// microseconds apart with different subsecond digit counts could sort
+    /// out of true chronological order. This never affects *correctness*
+    /// of what gets purged (that check always re-parses `recorded_at` with
+    /// `chrono` in Rust, not SQL text comparison) — only the exact
+    /// processing order within one very tight time window, which no AC
+    /// depends on.
+    pub async fn sweep_expired_records(
+        &self,
+        now: DateTime<Utc>,
+        cursor: Option<&str>,
+        batch_size: i64,
+    ) -> Result<SweepReport> {
+        let mut tx = self.pool.begin().await?;
+
+        let rows = sqlx::query_as::<_, LineageTagRow>(
+            "SELECT record_table, record_id, schema_version, retention_class, tenant_ref,
+                    source_record_ids, recorded_at, deletion_requested_at
+             FROM dataset_lineage_tags WHERE recorded_at > ?1 ORDER BY recorded_at ASC LIMIT ?2",
+        )
+        .bind(cursor.unwrap_or(""))
+        .bind(batch_size)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let examined = rows.len();
+        let mut report = SweepReport {
+            examined,
+            ..Default::default()
+        };
+        let mut last_recorded_at: Option<String> = None;
+
+        for row in rows {
+            let recorded_at = row.recorded_at.clone();
+            last_recorded_at = Some(recorded_at.clone());
+            let record: LineageTagRecord = row.try_into()?;
+
+            if !is_expired(&recorded_at, &record.tag.retention_class, now) {
+                continue;
+            }
+
+            match record.record_table.as_str() {
+                "evidence" => {
+                    purge_evidence_payload_row(&mut *tx, &record.record_id).await?;
+                    report.purged_evidence += 1;
+                }
+                "agent_events" => {
+                    sqlx::query("DELETE FROM agent_events WHERE id = ?1")
+                        .bind(&record.record_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    report.deleted_records += 1;
+                }
+                "claims" => {
+                    sqlx::query("DELETE FROM claims WHERE id = ?1")
+                        .bind(&record.record_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    report.deleted_records += 1;
+                }
+                "findings" => {
+                    sqlx::query("DELETE FROM findings WHERE id = ?1")
+                        .bind(&record.record_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    report.deleted_records += 1;
+                }
+                _ => {
+                    report.unknown_table_skipped += 1;
+                }
+            }
+
+            sqlx::query(
+                "DELETE FROM dataset_lineage_tags WHERE record_table = ?1 AND record_id = ?2",
+            )
+            .bind(&record.record_table)
+            .bind(&record.record_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+
+        report.more_remaining = examined == batch_size as usize;
+        report.next_cursor = if report.more_remaining {
+            last_recorded_at
+        } else {
+            None
+        };
+        Ok(report)
+    }
+}
+
+/// The explicit marker [`Store::purge_evidence_payload`] writes in place of
+/// a purged row's original payload (FORNX-319 AC3). A public function (not
+/// inlined at each call site) so a test or a future renderer can match on
+/// the exact honest shape rather than guessing at `Evidence::payload` once
+/// `evidence_purged` is `true`.
+pub fn evidence_expired_payload_marker() -> serde_json::Value {
+    serde_json::json!({
+        "evidence_expired": true,
+        "detail": "raw evidence payload purged per local retention policy; the finding/verdict this evidence once supported is unaffected",
+    })
+}
+
+async fn purge_evidence_payload_row<'e, E>(executor: E, evidence_id: &str) -> Result<bool>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let result = sqlx::query("UPDATE evidence SET payload = ?1, evidence_purged = 1 WHERE id = ?2")
+        .bind(evidence_expired_payload_marker().to_string())
+        .bind(evidence_id)
+        .execute(executor)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Whether a lineage tag's record has outlived
+/// [`retention_duration_for`]'s duration for its `RetentionClass`, measured
+/// from `recorded_at` (parsed as RFC3339) to `now`. A `recorded_at` that
+/// fails to parse (should never happen for a row this crate itself wrote)
+/// is treated as NOT expired — this function never guesses a record is due
+/// for deletion from a value it cannot actually read.
+fn is_expired(recorded_at: &str, class: &RetentionClass, now: DateTime<Utc>) -> bool {
+    let Ok(recorded_at) = DateTime::parse_from_rfc3339(recorded_at) else {
+        return false;
+    };
+    let recorded_at = recorded_at.with_timezone(&Utc);
+    let Ok(duration) = chrono::Duration::from_std(retention_duration_for(class)) else {
+        return false;
+    };
+    now.signed_duration_since(recorded_at) >= duration
+}
+
+/// What one [`Store::sweep_expired_records`] call did, for a caller (and
+/// this module's tests) to verify the sweep is genuinely bounded and
+/// incremental rather than an unbounded full-table pass (FORNX-319 AC4).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SweepReport {
+    /// Rows read from `dataset_lineage_tags` this call, regardless of
+    /// whether they turned out to be expired — the actual bound enforced
+    /// per call.
+    pub examined: usize,
+    /// `"evidence"` rows soft-purged (payload overwritten, row kept).
+    pub purged_evidence: usize,
+    /// `"agent_events"`/`"claims"`/`"findings"` rows hard-deleted.
+    pub deleted_records: usize,
+    /// Expired rows whose `record_table` was not one this store knows how
+    /// to act on — their lineage tag was still removed, but the
+    /// (unrecognized) underlying record, if any, was left untouched.
+    pub unknown_table_skipped: usize,
+    /// `true` when `examined == batch_size` — there may be more rows past
+    /// this batch; a caller should call again (with [`Self::next_cursor`])
+    /// rather than assuming the table is fully swept.
+    pub more_remaining: bool,
+    /// Pass this back as the next call's `cursor` to resume where this
+    /// batch left off. `None` once a call examines fewer than
+    /// `batch_size` rows (the end of the table was reached this pass).
+    pub next_cursor: Option<String>,
 }
 
 #[cfg(test)]
