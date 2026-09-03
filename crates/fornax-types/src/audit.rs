@@ -89,6 +89,11 @@ pub enum AuditTarget {
     Device {
         target_id: String,
     },
+    /// FORNX-319: the specific `evidence` row an `AuditAction::EvidencePurged`
+    /// event was raised for.
+    Evidence {
+        target_id: String,
+    },
     Organization {
         target_id: String,
     },
@@ -453,6 +458,20 @@ mod tests {
         let system = AuditActor::System;
         let json = serde_json::to_value(&system).unwrap();
         assert_eq!(json["actor_kind"], serde_json::json!("system"));
+    }
+
+    /// FORNX-319: `AuditTarget::Evidence` round-trips with the explicit
+    /// `evidence` wire tag, matching ADR-0011 §2's target-kind table.
+    #[test]
+    fn audit_target_evidence_round_trips_with_the_explicit_wire_tag() {
+        let target = AuditTarget::Evidence {
+            target_id: "ev-1".to_string(),
+        };
+        let json = serde_json::to_value(&target).unwrap();
+        assert_eq!(json["target_kind"], serde_json::json!("evidence"));
+        assert_eq!(json["target_id"], serde_json::json!("ev-1"));
+        let back: AuditTarget = serde_json::from_value(json).unwrap();
+        assert_eq!(back, target);
     }
 
     #[test]

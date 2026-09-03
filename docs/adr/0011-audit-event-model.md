@@ -151,6 +151,7 @@ Same tagged-object shape as `AuditActor`:
 | `role_assignment` | A `RoleAssignment` row. |
 | `permission` | An abstract permission name being checked (not a stored row). |
 | `device` | A device identity. |
+| `evidence` | FORNX-319: an `evidence` row, identified by its id — the target of an `evidence_purged` action. |
 | `organization` | A `fornax-cloud` organization. |
 | _(any other string)_ | Forward-compatibility catch-all. |
 
