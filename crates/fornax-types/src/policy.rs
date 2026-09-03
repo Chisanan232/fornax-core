@@ -28,12 +28,14 @@
 
 mod action_classification;
 mod bundle;
+pub mod cache;
 mod content;
 mod diagnostics;
 mod local;
 mod resolve;
 mod revision;
 mod target;
+pub mod trust_store;
 
 pub use action_classification::classify_action_class;
 pub use bundle::{
@@ -42,6 +44,12 @@ pub use bundle::{
     TrustedVerificationKeys, VerifiedPolicyBundle, BUNDLE_SCHEMA_VERSION, BUNDLE_SIGNING_DOMAIN,
     CLOCK_SKEW_TOLERANCE_SECONDS, MAX_PAYLOAD_BYTES, MAX_SIGNATURES,
     SUPPORTED_BUNDLE_SCHEMA_VERSIONS,
+};
+pub use cache::{
+    effective_outcome, evaluate_activation, freshness, member_freshness, staleness_floor,
+    ActivationDecision, ActivationOutcome, ActivationRejection, CacheGeneration, CacheSlotKind,
+    CachedBundleRef, EffectivePolicy, FreshnessTier, MemberFreshness, PolicyCacheState,
+    PolicyFreshness, RiskClassTiers, SequenceHighWater, POLICY_CACHE_SCHEMA_VERSION,
 };
 pub use content::{
     ActionClass, CacheScope, CollectionScope, EgressContentClass, EgressScope, EnforcementOutcome,
@@ -61,6 +69,10 @@ pub use revision::{
 pub use target::{
     BoundRevision, DeviceContext, OsFamily, PolicyBinding, TargetLevel, TargetScope, TargetSelector,
 };
+pub use trust_store::resolve_trust_store;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod cache_tests;

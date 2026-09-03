@@ -49,13 +49,18 @@ pub use graph::{
     DEFAULT_EXIT_CODE_FRESHNESS_SECONDS,
 };
 pub use policy::{
-    classify_action_class, resolve, ActionClass, BoundRevision, CacheScope, CollectionScope,
-    DeviceContext, DiagnosticCode, DiagnosticSeverity, EgressContentClass, EgressScope,
-    EnforcementOutcome, EnforcementRule, EnforcementScope, FieldProvenance, OsFamily,
-    PolicyBinding, PolicyContent, PolicyDiagnostic, PolicyDraft, PolicyFieldId, PolicyId,
-    PolicyRevisionBody, PolicyRevisionRef, PolicyValidationReport, PublishedPolicyRevision,
-    RedactionProfile, ResolvedPolicy, ResolvedValues, RevisionDigest, RiskClass, RiskClassSeconds,
-    SensorScope, TargetLevel, TargetScope, TargetSelector, VerdictOutcomes, POLICY_SCHEMA_VERSION,
+    classify_action_class, effective_outcome, evaluate_activation, freshness, member_freshness,
+    resolve, resolve_trust_store, staleness_floor, verify_bundle, ActionClass, ActivationDecision,
+    ActivationOutcome, ActivationRejection, BoundRevision, BundleRejection, CacheGeneration,
+    CacheScope, CacheSlotKind, CachedBundleRef, CollectionScope, DeviceContext, DiagnosticCode,
+    DiagnosticSeverity, EffectivePolicy, EgressContentClass, EgressScope, EnforcementOutcome,
+    EnforcementRule, EnforcementScope, FieldProvenance, FreshnessTier, KeyId, MemberFreshness,
+    OsFamily, PayloadDigest, PolicyBinding, PolicyCacheState, PolicyContent, PolicyDiagnostic,
+    PolicyDraft, PolicyFieldId, PolicyFreshness, PolicyId, PolicyRevisionBody, PolicyRevisionRef,
+    PolicyValidationReport, PublishedPolicyRevision, RedactionProfile, ResolvedPolicy,
+    ResolvedValues, RevisionDigest, RiskClass, RiskClassSeconds, RiskClassTiers, SensorScope,
+    SequenceHighWater, TargetLevel, TargetScope, TargetSelector, TrustedVerificationKeys,
+    VerdictOutcomes, VerifiedPolicyBundle, POLICY_CACHE_SCHEMA_VERSION, POLICY_SCHEMA_VERSION,
     SUPPORTED_POLICY_SCHEMA_VERSIONS,
 };
 pub use reliability_context::{
@@ -447,6 +452,17 @@ pub enum IngestMessage {
     Event(AgentEvent),
     Claim(Claim),
     Evidence(Evidence),
+    /// A signed policy bundle envelope (FORNX-119), imported via `fornax
+    /// policy import <path>`. `envelope` is the raw envelope JSON text
+    /// (`policy::SignedPolicyBundle`, base64 payload + signatures) exactly
+    /// as read from the file — parsing/verification happens daemon-side via
+    /// `fornax_store::Store::submit_policy_bundle`. Fire-and-forget over
+    /// the existing UDS, same as every other `IngestMessage` variant — no
+    /// new HTTP POST route (the localhost HTTP surface is GET-only,
+    /// deliberately, since it is browser-reachable).
+    PolicyBundle {
+        envelope: String,
+    },
     /// Adapter announces what its runtime can observe, once per connection.
     Capabilities(RuntimeCapabilities),
 }

@@ -20,11 +20,11 @@ use crate::{Provider, RuntimeCapabilities, SignalClass, Verdict};
 // Helpers
 // ------------------------------------------------------------------------
 
-fn empty_content() -> PolicyContent {
+pub(super) fn empty_content() -> PolicyContent {
     PolicyContent::default()
 }
 
-fn draft(content: PolicyContent) -> PolicyDraft {
+pub(super) fn draft(content: PolicyContent) -> PolicyDraft {
     PolicyDraft {
         policy_id: PolicyId(Uuid::from_u128(1)),
         revision: 1,
@@ -35,13 +35,13 @@ fn draft(content: PolicyContent) -> PolicyDraft {
     }
 }
 
-fn published(content: PolicyContent) -> PublishedPolicyRevision {
+pub(super) fn published(content: PolicyContent) -> PublishedPolicyRevision {
     draft(content)
         .publish("2026-01-01T00:00:00Z".to_string())
         .expect("draft should publish")
 }
 
-fn org_binding(org_id: &str, revision: &PublishedPolicyRevision) -> PolicyBinding {
+pub(super) fn org_binding(org_id: &str, revision: &PublishedPolicyRevision) -> PolicyBinding {
     PolicyBinding {
         binding_id: Uuid::new_v4(),
         scope: TargetScope::Org {
@@ -52,7 +52,11 @@ fn org_binding(org_id: &str, revision: &PublishedPolicyRevision) -> PolicyBindin
     }
 }
 
-fn team_binding(org_id: &str, team_id: &str, revision: &PublishedPolicyRevision) -> PolicyBinding {
+pub(super) fn team_binding(
+    org_id: &str,
+    team_id: &str,
+    revision: &PublishedPolicyRevision,
+) -> PolicyBinding {
     PolicyBinding {
         binding_id: Uuid::new_v4(),
         scope: TargetScope::Team {
@@ -64,7 +68,7 @@ fn team_binding(org_id: &str, team_id: &str, revision: &PublishedPolicyRevision)
     }
 }
 
-fn device_binding(device_id: &str, revision: &PublishedPolicyRevision) -> PolicyBinding {
+pub(super) fn device_binding(device_id: &str, revision: &PublishedPolicyRevision) -> PolicyBinding {
     PolicyBinding {
         binding_id: Uuid::new_v4(),
         scope: TargetScope::Device {
@@ -75,7 +79,7 @@ fn device_binding(device_id: &str, revision: &PublishedPolicyRevision) -> Policy
     }
 }
 
-fn local_user_binding(revision: &PublishedPolicyRevision) -> PolicyBinding {
+pub(super) fn local_user_binding(revision: &PublishedPolicyRevision) -> PolicyBinding {
     PolicyBinding {
         binding_id: Uuid::new_v4(),
         scope: TargetScope::LocalUser,
@@ -84,11 +88,11 @@ fn local_user_binding(revision: &PublishedPolicyRevision) -> PolicyBinding {
     }
 }
 
-fn bound(binding: PolicyBinding, revision: PublishedPolicyRevision) -> BoundRevision {
+pub(super) fn bound(binding: PolicyBinding, revision: PublishedPolicyRevision) -> BoundRevision {
     BoundRevision::new(binding, revision).expect("binding/revision digest should match")
 }
 
-fn device_ctx() -> DeviceContext {
+pub(super) fn device_ctx() -> DeviceContext {
     let mut team_ids = BTreeSet::new();
     team_ids.insert("team-1".to_string());
     let mut project_ids = BTreeSet::new();
@@ -104,7 +108,7 @@ fn device_ctx() -> DeviceContext {
     }
 }
 
-fn empty_capabilities() -> RuntimeCapabilities {
+pub(super) fn empty_capabilities() -> RuntimeCapabilities {
     RuntimeCapabilities {
         schema_version: crate::CAPABILITY_SCHEMA_VERSION,
         provider: Provider::ClaudeCode,
@@ -113,7 +117,7 @@ fn empty_capabilities() -> RuntimeCapabilities {
     }
 }
 
-fn cloud_sync_content(allowed: bool) -> PolicyContent {
+pub(super) fn cloud_sync_content(allowed: bool) -> PolicyContent {
     let mut c = empty_content();
     c.egress.cloud_sync_allowed = Some(allowed);
     c
@@ -989,15 +993,15 @@ const TEST_ONLY_NOT_A_SECRET_SEED_ROTATED: [u8; 32] = [
     0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x40,
 ];
 
-fn primary_signing_key() -> SigningKey {
+pub(super) fn primary_signing_key() -> SigningKey {
     SigningKey::from_bytes(&TEST_ONLY_NOT_A_SECRET_SEED_PRIMARY)
 }
 
-fn rotated_signing_key() -> SigningKey {
+pub(super) fn rotated_signing_key() -> SigningKey {
     SigningKey::from_bytes(&TEST_ONLY_NOT_A_SECRET_SEED_ROTATED)
 }
 
-fn trusted_key_for(
+pub(super) fn trusted_key_for(
     key_id: &str,
     signing_key: &SigningKey,
     not_before: Option<&str>,
@@ -1013,18 +1017,18 @@ fn trusted_key_for(
     }
 }
 
-fn trust_store(keys: Vec<TrustedKey>) -> TrustedVerificationKeys {
+pub(super) fn trust_store(keys: Vec<TrustedKey>) -> TrustedVerificationKeys {
     TrustedVerificationKeys {
         schema_version: 1,
         keys,
     }
 }
 
-fn sample_revision() -> PublishedPolicyRevision {
+pub(super) fn sample_revision() -> PublishedPolicyRevision {
     published(cloud_sync_content(true))
 }
 
-fn bundle_payload_with(
+pub(super) fn bundle_payload_with(
     revision: PublishedPolicyRevision,
     bindings: Vec<PolicyBinding>,
     sequence: u64,
@@ -1048,7 +1052,7 @@ fn bundle_payload_with(
     }
 }
 
-fn sample_bundle_payload(
+pub(super) fn sample_bundle_payload(
     revision: PublishedPolicyRevision,
     sequence: u64,
     not_before: &str,
@@ -1058,7 +1062,7 @@ fn sample_bundle_payload(
     bundle_payload_with(revision, vec![binding], sequence, not_before, expires_at)
 }
 
-fn sign_domain(payload_bytes: &[u8], signing_key: &SigningKey) -> String {
+pub(super) fn sign_domain(payload_bytes: &[u8], signing_key: &SigningKey) -> String {
     let mut msg = Vec::with_capacity(BUNDLE_SIGNING_DOMAIN.len() + payload_bytes.len());
     msg.extend_from_slice(BUNDLE_SIGNING_DOMAIN);
     msg.extend_from_slice(payload_bytes);
@@ -1066,12 +1070,12 @@ fn sign_domain(payload_bytes: &[u8], signing_key: &SigningKey) -> String {
     STANDARD.encode(sig.to_bytes())
 }
 
-fn sign_bare(payload_bytes: &[u8], signing_key: &SigningKey) -> String {
+pub(super) fn sign_bare(payload_bytes: &[u8], signing_key: &SigningKey) -> String {
     let sig = signing_key.sign(payload_bytes);
     STANDARD.encode(sig.to_bytes())
 }
 
-fn valid_signature_entry(
+pub(super) fn valid_signature_entry(
     key_id: &str,
     payload_bytes: &[u8],
     signing_key: &SigningKey,
@@ -1083,7 +1087,10 @@ fn valid_signature_entry(
     }
 }
 
-fn build_envelope_bytes(payload_bytes: &[u8], signatures: Vec<BundleSignature>) -> Vec<u8> {
+pub(super) fn build_envelope_bytes(
+    payload_bytes: &[u8],
+    signatures: Vec<BundleSignature>,
+) -> Vec<u8> {
     let envelope = SignedPolicyBundle {
         bundle_schema_version: BUNDLE_SCHEMA_VERSION,
         payload_b64: STANDARD.encode(payload_bytes),
@@ -1092,13 +1099,13 @@ fn build_envelope_bytes(payload_bytes: &[u8], signatures: Vec<BundleSignature>) 
     serde_json::to_vec(&envelope).unwrap()
 }
 
-fn base_now() -> DateTime<Utc> {
+pub(super) fn base_now() -> DateTime<Utc> {
     "2026-01-01T00:10:00Z".parse().unwrap()
 }
 
 /// Single-signer, in-window envelope + matching trust store, for tests that
 /// only care about behavior orthogonal to signing/windowing.
-fn valid_envelope_and_trust(
+pub(super) fn valid_envelope_and_trust(
     not_before: &str,
     expires_at: &str,
 ) -> (Vec<u8>, TrustedVerificationKeys) {
@@ -1112,7 +1119,7 @@ fn valid_envelope_and_trust(
     (envelope, trust)
 }
 
-fn deterministic_org_binding(
+pub(super) fn deterministic_org_binding(
     org_id: &str,
     revision: &PublishedPolicyRevision,
     binding_id: Uuid,
@@ -1127,7 +1134,7 @@ fn deterministic_org_binding(
     }
 }
 
-fn frozen_fixture_revision() -> PublishedPolicyRevision {
+pub(super) fn frozen_fixture_revision() -> PublishedPolicyRevision {
     let mut content = empty_content();
     content.egress.cloud_sync_allowed = Some(true);
     let mut d = draft(content);
