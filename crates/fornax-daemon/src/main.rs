@@ -27,6 +27,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, RwLock};
 
 mod policy_poll;
+mod retention_sweep;
 
 fn fornax_home() -> PathBuf {
     std::env::var("FORNAX_HOME")
@@ -312,6 +313,12 @@ async fn main() -> anyhow::Result<()> {
     // `policy_poll::resolve_poll_config`.
     let poll_task = policy_poll::spawn(state.clone(), home.clone());
 
+    // FORNX-319: background retention sweep, alongside the UDS ingest and
+    // policy poll tasks. Always enabled (unlike policy polling, which
+    // requires opt-in configuration) — see `retention_sweep`'s module docs
+    // for why it deliberately does not hold `AppState::processing`.
+    let retention_sweep_task = retention_sweep::spawn(state.clone(), db_path.clone());
+
     let app = Router::new()
         .route("/api/status", get(api_status))
         .route("/api/findings/recent", get(api_findings_recent))
@@ -341,6 +348,7 @@ async fn main() -> anyhow::Result<()> {
     // a crash" — there's nothing left to distinguish.
     uds_task.abort();
     poll_task.abort();
+    retention_sweep_task.abort();
     let _ = std::fs::remove_file(&sock_path);
     let _ = std::fs::remove_file(&pid_path);
     tracing::info!("fornaxd stopped");
