@@ -310,3 +310,20 @@ description for the follow-up ticket carve-out.
 - `AuditExportClass`'s fail-closed unrecognized-value handling means a
   future binary encountering an export class from an even-newer producer
   never accidentally over-shares that event's content.
+
+## Local ledger trust boundary (FORNX-315 addendum)
+
+FORNX-315 added `fornax-store`'s local, hash-chained persistence for
+`AuditEvent` (`crates/fornax-store/src/audit_ledger.rs`,
+`Store::append_audit_event`/`Store::verify_audit_chain`) — the storage/
+verification machinery this ADR's own "Non-goals" section above explicitly
+deferred. Its guarantee is real but narrow, and must not be
+over-interpreted:
+
+A local hash chain detects post-hoc edits by an actor who cannot recompute the whole chain forward from the point of the edit.
+
+It does NOT attest that the endpoint recorded every event it should have — an endpoint that simply never calls `append_audit_event` for some action produces a chain that verifies as valid while being silently incomplete.
+
+It does NOT make a compromised endpoint trustworthy — an attacker with full control of the Fornax process itself can fabricate a self-consistent chain from scratch, including events that never happened.
+
+The chain binds this store's own rows to each other; it is not a witness to anything outside the store. See `audit_ledger.rs`'s own module doc comment for the full statement and the four-mutation-shape detection order this boundary is exercised against.
