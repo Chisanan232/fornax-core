@@ -127,7 +127,17 @@ impl Store {
         let opts = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
             .map_err(StoreError::Db)?
             .create_if_missing(true)
-            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            // FORNX-319: WAL mode still allows only one writer transaction
+            // at a time. Without a busy timeout, a live insert racing a
+            // retention-sweep batch's transaction gets an immediate
+            // `SQLITE_BUSY` error instead of waiting a bounded amount of
+            // time for the other writer to finish — exactly the failure
+            // mode AC4 ("does not measurably block a concurrent insert")
+            // must not produce. Each sweep batch is already bounded (see
+            // `retention::Store::sweep_expired_records`), so 5s is a
+            // generous ceiling, never the expected wait.
+            .busy_timeout(std::time::Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
             .max_connections(4)
             .connect_with(opts)
@@ -165,7 +175,7 @@ impl Store {
     /// `retention::retention_class_for_table`'s doc comment for the same
     /// choice applied uniformly across all four insert paths.
     pub async fn insert_event(&self, e: &AgentEvent) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query(
             "INSERT INTO agent_events (id, session_id, provider, kind, observed_at, tool_name, tool_input, tool_response, raw)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -193,7 +203,7 @@ impl Store {
     /// See [`Store::insert_event`]'s doc comment — same atomic
     /// insert-plus-lineage-tag shape (FORNX-319 AC1).
     pub async fn insert_claim(&self, c: &Claim) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query(
             "INSERT INTO claims (id, session_id, source_event_id, text, subject, claimed_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -226,7 +236,7 @@ impl Store {
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query(
             "INSERT INTO evidence (id, session_id, source_event_id, kind, observed_at, payload, provenance, source, extension, evidence_purged)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -263,7 +273,7 @@ impl Store {
     /// an explicit orphaned-tenant marker rather than silently skipping the
     /// tag or panicking.
     pub async fn insert_finding(&self, f: &Finding) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let claim_session_id: Option<String> =
             sqlx::query_scalar("SELECT session_id FROM claims WHERE id = ?1")
                 .bind(f.claim_id.to_string())
