@@ -13,13 +13,28 @@
 -- the original event producer claimed.
 --
 -- `audit_ledger_high_water` is a single-row marker of the highest `seq`
--- ever assigned by this store, updated in the same transaction as every
--- append. Without it, deleting only the *trailing* rows of `audit_events`
--- leaves no internal gap and no broken `prev_hash` link for
--- `Store::verify_audit_chain` to notice -- the remaining rows still form a
--- perfectly coherent, shorter chain. This table exists purely so a
--- truncated tail is still detectable: see `verify_audit_chain`'s
--- `DivergenceKind::TruncatedTail` path.
+-- ever assigned by this store, plus that row's own `entry_hash`, updated
+-- in the same transaction as every append. Two distinct reasons this
+-- exists, not one:
+--
+-- 1. Detecting a truncated tail: without it, deleting only the *trailing*
+--    rows of `audit_events` leaves no internal gap and no broken
+--    `prev_hash` link for `Store::verify_audit_chain` to notice -- the
+--    remaining rows still form a perfectly coherent, shorter chain. See
+--    `verify_audit_chain`'s `DivergenceKind::TruncatedTail` path.
+-- 2. Making that truncation permanent, not merely detectable-until-the-next-
+--    append: `Store::append_audit_event` allocates the next `seq`/`prev_hash`
+--    from THIS table, never by re-reading `audit_events`'s own live max
+--    row. If it re-read the live table instead, an attacker who deletes
+--    trailing rows via direct SQLite access could have the very next
+--    legitimate append silently "heal" the sequence by continuing from the
+--    now-shorter tail, erasing every trace of the truncation. Because
+--    `max_seq`/`last_entry_hash` are themselves append-only (monotonic --
+--    an `ON CONFLICT` update never lowers `max_seq`) and untouched by
+--    anything that deletes from `audit_events`, a subsequent legitimate
+--    append instead resumes from where the ledger truly left off, which
+--    `verify_audit_chain` then correctly reports as a `MissingSeq` gap
+--    over the deleted rows rather than `Valid`.
 --
 -- No update or delete statement anywhere in this crate touches
 -- `audit_events` -- `Store::append_audit_event` is the only write path (see
@@ -38,5 +53,6 @@ CREATE TABLE IF NOT EXISTS audit_events (
 
 CREATE TABLE IF NOT EXISTS audit_ledger_high_water (
     id INTEGER PRIMARY KEY CHECK (id = 1),
-    max_seq INTEGER NOT NULL
+    max_seq INTEGER NOT NULL,
+    last_entry_hash TEXT NOT NULL
 );

@@ -171,7 +171,7 @@ impl AuditEventRow {
             entry_hash: self.entry_hash,
             export_class: self.export_class,
             event: serde_json::from_str(&self.payload).map_err(|e| {
-                StoreError::PolicyCacheCorrupt(format!("audit event_id={}: {e}", self.event_id))
+                StoreError::AuditLedgerCorrupt(format!("audit event_id={}: {e}", self.event_id))
             })?,
         })
     }
@@ -182,13 +182,24 @@ async fn append_audit_event_locked(
     event: &AuditEvent,
     now: DateTime<Utc>,
 ) -> Result<AppendedAuditEvent> {
-    let current: Option<(i64, String)> =
-        sqlx::query_as("SELECT seq, entry_hash FROM audit_events ORDER BY seq DESC LIMIT 1")
+    // The next seq/prev_hash are allocated from `audit_ledger_high_water`,
+    // NEVER by re-reading `audit_events`'s own live max row. If they came
+    // from the live table, an attacker who deletes trailing rows via
+    // direct SQLite access (bypassing this crate's API) could have the
+    // very next legitimate append silently "heal" the sequence by
+    // continuing from the now-shorter tail -- erasing every trace of the
+    // truncation instead of the next `verify_audit_chain` call surfacing
+    // it as a gap. `audit_ledger_high_water` is monotonic (never lowered,
+    // see the upsert below) and untouched by anything that deletes from
+    // `audit_events`, so it survives that kind of tampering intact. See
+    // `migrations/0010_audit_ledger.sql`'s comment for the full argument.
+    let current_high_water: Option<(i64, String)> =
+        sqlx::query_as("SELECT max_seq, last_entry_hash FROM audit_ledger_high_water WHERE id = 1")
             .fetch_optional(&mut *conn)
             .await?;
 
-    let (seq, prev_hash) = match current {
-        Some((last_seq, last_hash)) => (last_seq + 1, last_hash),
+    let (seq, prev_hash) = match current_high_water {
+        Some((max_seq, last_hash)) => (max_seq + 1, last_hash),
         None => (GENESIS_SEQ, genesis_prev_hash()),
     };
 
@@ -215,11 +226,21 @@ async fn append_audit_event_locked(
     .execute(&mut *conn)
     .await?;
 
+    // Monotonic by construction: the `WHERE` clause on the `DO UPDATE`
+    // refuses to lower `max_seq`/`last_entry_hash` even if this were ever
+    // called with a stale value (it never legitimately is, since `seq`
+    // above is always `current_high_water.max_seq + 1` within this same
+    // transaction -- this is defense in depth, not load-bearing for the
+    // normal path).
     sqlx::query(
-        "INSERT INTO audit_ledger_high_water (id, max_seq) VALUES (1, ?1)
-         ON CONFLICT(id) DO UPDATE SET max_seq = excluded.max_seq",
+        "INSERT INTO audit_ledger_high_water (id, max_seq, last_entry_hash) VALUES (1, ?1, ?2)
+         ON CONFLICT(id) DO UPDATE SET
+            max_seq = excluded.max_seq,
+            last_entry_hash = excluded.last_entry_hash
+         WHERE excluded.max_seq > audit_ledger_high_water.max_seq",
     )
     .bind(seq)
+    .bind(&entry_hash)
     .execute(&mut *conn)
     .await?;
 
@@ -530,6 +551,57 @@ mod tests {
                 first_bad_seq: 8,
                 kind: DivergenceKind::TruncatedTail,
             }
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Regression: a truncated tail must stay detectable even after a
+    /// SUBSEQUENT, entirely legitimate append -- proving the ledger does
+    /// not silently "heal" a truncation attack the next time a normal
+    /// caller uses `Store`'s own API. If `append_audit_event` allocated
+    /// `seq`/`prev_hash` by re-reading `audit_events`'s own live max row
+    /// (instead of the untouched, monotonic `audit_ledger_high_water`
+    /// marker), the new row would continue from the shortened tail and
+    /// every trace of the deleted rows would vanish -- `verify_audit_chain`
+    /// would wrongly report `Valid`. It must instead report `MissingSeq` at
+    /// the first deleted seq, because the new row picks up numbering from
+    /// the high-water mark (11), leaving 8..=10 as a real, permanent gap.
+    #[tokio::test]
+    async fn truncated_tail_survives_a_subsequent_legitimate_append() {
+        let path = tmp_db_path("truncate-then-append");
+        let store = Store::open(&path).await.expect("open db");
+        for i in 0..10 {
+            store
+                .append_audit_event(&sample_event(i), now())
+                .await
+                .expect("append event");
+        }
+
+        sqlx::query("DELETE FROM audit_events WHERE seq > 7")
+            .execute(&store.pool)
+            .await
+            .expect("truncate tail directly via raw SQL");
+
+        // An untampered process keeps running and appends one more,
+        // entirely legitimate, event after the truncation.
+        let appended = store
+            .append_audit_event(&sample_event(999), now())
+            .await
+            .expect("legitimate append after truncation");
+        assert_eq!(
+            appended.seq, 11,
+            "the new row must continue from the high-water mark (10), not the live table's shortened max (7)"
+        );
+
+        let result = store.verify_audit_chain().await.expect("verify chain");
+        assert_eq!(
+            result,
+            ChainVerification::Diverged {
+                first_bad_seq: 8,
+                kind: DivergenceKind::MissingSeq,
+            },
+            "the truncation must remain visible as a real gap, never silently healed"
         );
 
         std::fs::remove_file(&path).ok();
