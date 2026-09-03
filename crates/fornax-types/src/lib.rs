@@ -18,6 +18,7 @@ pub mod causal;
 pub mod experiment;
 pub mod extension;
 pub mod graph;
+pub mod policy;
 pub mod privacy;
 pub mod redact;
 pub mod reliability_context;
@@ -46,6 +47,16 @@ pub use graph::{
     staleness_of, staleness_of_default, EvidenceConflict, EvidenceGraph, EvidenceLink,
     EvidenceRelation, FreshnessWindow, MissingEvidence, StalenessAssessment,
     DEFAULT_EXIT_CODE_FRESHNESS_SECONDS,
+};
+pub use policy::{
+    resolve, ActionClass, BoundRevision, CacheScope, CollectionScope, DeviceContext,
+    DiagnosticCode, DiagnosticSeverity, EgressContentClass, EgressScope, EnforcementOutcome,
+    EnforcementRule, EnforcementScope, FieldProvenance, OsFamily, PolicyBinding, PolicyContent,
+    PolicyDiagnostic, PolicyDraft, PolicyFieldId, PolicyId, PolicyRevisionBody, PolicyRevisionRef,
+    PolicyValidationReport, PublishedPolicyRevision, RedactionProfile, ResolvedPolicy,
+    ResolvedValues, RevisionDigest, RiskClass, RiskClassSeconds, SensorScope, TargetLevel,
+    TargetScope, TargetSelector, VerdictOutcomes, POLICY_SCHEMA_VERSION,
+    SUPPORTED_POLICY_SCHEMA_VERSIONS,
 };
 pub use reliability_context::{
     aggregate_context, capability_fingerprint, cohort_id_for, evaluate_sample_support,
