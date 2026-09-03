@@ -962,3 +962,148 @@ fn provider_selector_restricts_matching() {
         .iter()
         .any(|d| d.code == DiagnosticCode::NoApplicablePolicy));
 }
+
+// ------------------------------------------------------------------------
+// FORNX-121 -- enforcement outcome wiring, end-to-end from real inputs
+// ------------------------------------------------------------------------
+
+/// AC: "Missing evidence (Verdict::Unavailable) is never treated as
+/// equivalent to Verdict::Verified." `VerdictOutcomes::for_verdict`'s match
+/// is exhaustive per-field (no wildcard arm), so this is a structural
+/// guarantee already -- this test pins it against a concrete rule where the
+/// two verdicts are configured to opposite extremes, so a future change
+/// that accidentally collapsed the two fields together would fail loudly
+/// here rather than only in an exhaustiveness-check refactor.
+#[test]
+fn unavailable_verdict_never_reads_the_verified_outcome() {
+    let outcomes = VerdictOutcomes {
+        verified: EnforcementOutcome::Allow,
+        unverified: EnforcementOutcome::ObserveOnly,
+        contradicted: EnforcementOutcome::Warn,
+        review: EnforcementOutcome::Warn,
+        unavailable: EnforcementOutcome::Block,
+    };
+    let mut content = empty_content();
+    content.enforcement.rules = Some(vec![EnforcementRule {
+        action_class: ActionClass::InfrastructureMutation,
+        risk_class: RiskClass::Critical,
+        outcomes,
+    }]);
+    let rev = published(content);
+    let items = vec![bound(org_binding("org-1", &rev), rev)];
+    let (resolved, _) = resolve(&items, &device_ctx());
+
+    let verified = resolved
+        .values
+        .enforcement_outcome_for(&ActionClass::InfrastructureMutation, Verdict::Verified);
+    let unavailable = resolved
+        .values
+        .enforcement_outcome_for(&ActionClass::InfrastructureMutation, Verdict::Unavailable);
+
+    assert_eq!(verified, EnforcementOutcome::Allow);
+    assert_eq!(unavailable, EnforcementOutcome::Block);
+    assert_ne!(
+        verified, unavailable,
+        "identical action_class, different verdict -- Unavailable must never fall through to Verified's outcome"
+    );
+}
+
+/// End-to-end exercise of the whole FORNX-121 wiring: a realistic org
+/// policy is authored via `PolicyDraft::publish`, resolved against a
+/// concrete `DeviceContext`, and then queried with `ActionClass` values
+/// produced by [`crate::policy::classify_action_class`] from real
+/// adapter-shaped tool-call data (Claude Code `Bash`/`Edit`, Codex
+/// `exec_command`) -- not hand-constructed `ActionClass` literals. This is
+/// the "policy simulator" AC: `enforcement_outcome_for` is the pure
+/// function a simulator calls, and this test proves it is wired to
+/// something a real classification produces, end to end.
+#[test]
+fn end_to_end_classification_and_resolved_policy_agree_on_enforcement_outcome() {
+    let mut content = empty_content();
+    content.enforcement.rules = Some(vec![
+        EnforcementRule {
+            action_class: ActionClass::CodeEdit,
+            risk_class: RiskClass::Low,
+            outcomes: VerdictOutcomes::uniform(EnforcementOutcome::Allow),
+        },
+        EnforcementRule {
+            action_class: ActionClass::InfrastructureMutation,
+            risk_class: RiskClass::Critical,
+            outcomes: VerdictOutcomes {
+                verified: EnforcementOutcome::Allow,
+                unverified: EnforcementOutcome::Warn,
+                contradicted: EnforcementOutcome::Block,
+                review: EnforcementOutcome::Block,
+                unavailable: EnforcementOutcome::Block,
+            },
+        },
+    ]);
+    let rev = published(content);
+    let items = vec![bound(org_binding("org-1", &rev), rev)];
+    let (resolved, diagnostics) = resolve(&items, &device_ctx());
+    assert!(
+        diagnostics.is_empty(),
+        "clean single-binding resolve should carry no diagnostics: {diagnostics:?}"
+    );
+
+    // A `terraform apply` shell invocation, shaped exactly like a real
+    // Claude Code Bash PostToolUse event's tool_input.
+    let terraform_apply = serde_json::json!({ "command": "terraform apply -auto-approve" });
+    let infra_action = classify_action_class(Provider::ClaudeCode, "Bash", Some(&terraform_apply));
+    assert_eq!(infra_action, ActionClass::InfrastructureMutation);
+    assert_eq!(
+        resolved
+            .values
+            .enforcement_outcome_for(&infra_action, Verdict::Unavailable),
+        EnforcementOutcome::Block,
+        "critical infra mutation with no verification evidence must not read as safe"
+    );
+    assert_eq!(
+        resolved
+            .values
+            .enforcement_outcome_for(&infra_action, Verdict::Verified),
+        EnforcementOutcome::Allow
+    );
+
+    // A low-risk code edit stays usable even in the same degraded
+    // (Unavailable) state -- AC: "low-risk workflows remain usable during
+    // appropriate degraded states."
+    let edit_action = classify_action_class(Provider::ClaudeCode, "Edit", None);
+    assert_eq!(edit_action, ActionClass::CodeEdit);
+    assert_eq!(
+        resolved
+            .values
+            .enforcement_outcome_for(&edit_action, Verdict::Unavailable),
+        EnforcementOutcome::Allow
+    );
+
+    // A Codex `exec_command` shell invocation classifies identically to the
+    // Claude Code `Bash` equivalent for the same command text -- the policy
+    // consumes `ActionClass`, never a provider-specific tool name.
+    let git_push = serde_json::json!({ "command": "git push origin main" });
+    let vcs_action = classify_action_class(Provider::Codex, "exec_command", Some(&git_push));
+    assert_eq!(vcs_action, ActionClass::VersionControlWrite);
+    // No rule was published for VersionControlWrite -- baseline's
+    // no-rule-published floor applies (ObserveOnly), never an invented
+    // block just because the action_class happens to be sensitive-sounding.
+    assert_eq!(
+        resolved
+            .values
+            .enforcement_outcome_for(&vcs_action, Verdict::Contradicted),
+        EnforcementOutcome::ObserveOnly
+    );
+
+    // A tool this policy has no opinion about and this classifier has no
+    // mapping for reads the same ObserveOnly floor.
+    let unmapped_action = classify_action_class(Provider::ClaudeCode, "Read", None);
+    assert_eq!(
+        unmapped_action,
+        ActionClass::Unrecognized("Read".to_string())
+    );
+    assert_eq!(
+        resolved
+            .values
+            .enforcement_outcome_for(&unmapped_action, Verdict::Contradicted),
+        EnforcementOutcome::ObserveOnly
+    );
+}
