@@ -26,6 +26,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, RwLock};
 
+mod audit_checkpoint_submit;
 mod policy_poll;
 
 fn fornax_home() -> PathBuf {
@@ -312,6 +313,12 @@ async fn main() -> anyhow::Result<()> {
     // `policy_poll::resolve_poll_config`.
     let poll_task = policy_poll::spawn(state.clone(), home.clone());
 
+    // FORNX-317: background audit checkpoint submission transport, best-
+    // effort and never load-bearing for the local critical path (ADR-0001
+    // D2). Disabled by default (no FORNAX_AUDIT_CHECKPOINT_URL / cloud sync
+    // not enabled) -- see `audit_checkpoint_submit::resolve_submit_config`.
+    let checkpoint_task = audit_checkpoint_submit::spawn(state.clone(), home.clone());
+
     let app = Router::new()
         .route("/api/status", get(api_status))
         .route("/api/findings/recent", get(api_findings_recent))
@@ -341,6 +348,7 @@ async fn main() -> anyhow::Result<()> {
     // a crash" — there's nothing left to distinguish.
     uds_task.abort();
     poll_task.abort();
+    checkpoint_task.abort();
     let _ = std::fs::remove_file(&sock_path);
     let _ = std::fs::remove_file(&pid_path);
     tracing::info!("fornaxd stopped");
