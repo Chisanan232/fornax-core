@@ -404,3 +404,428 @@ impl std::fmt::Display for AuditRef {
         write!(f, "{}:{}", self.issuer_scope, self.event_id)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_event() -> AuditEvent {
+        AuditEvent::new(
+            "d290f1ee-6c54-4b01-90e6-d701748f0851",
+            "2026-09-03T14:22:05Z",
+            AuditActor::Device {
+                actor_id: "device-7e2a1c".to_string(),
+            },
+            AuditAction::PolicyRevocationIngested,
+            AuditTarget::RevocationEntry {
+                target_id: "sha256:ab12".to_string(),
+            },
+            AuditOutcome::Revoked,
+            AuditExportClass::Metadata,
+        )
+    }
+
+    // --- AC2: AuditEvent and its enums round-trip through serde with
+    // stable, explicit wire names -------------------------------------
+
+    #[test]
+    fn audit_event_round_trips_losslessly() {
+        let event = sample_event();
+        let json = serde_json::to_string(&event).unwrap();
+        let back: AuditEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, back);
+    }
+
+    #[test]
+    fn audit_actor_wire_tags_are_explicit_snake_case() {
+        let device = AuditActor::Device {
+            actor_id: "d1".to_string(),
+        };
+        let json = serde_json::to_value(&device).unwrap();
+        assert_eq!(json["actor_kind"], serde_json::json!("device"));
+        assert_eq!(json["actor_id"], serde_json::json!("d1"));
+
+        let system = AuditActor::System;
+        let json = serde_json::to_value(&system).unwrap();
+        assert_eq!(json["actor_kind"], serde_json::json!("system"));
+    }
+
+    #[test]
+    fn every_canonical_audit_action_tag_round_trips_to_its_named_variant() {
+        let cases = [
+            ("\"permission_check\"", AuditAction::PermissionCheck),
+            (
+                "\"break_glass_activated\"",
+                AuditAction::BreakGlassActivated,
+            ),
+            (
+                "\"policy_bundle_activated\"",
+                AuditAction::PolicyBundleActivated,
+            ),
+            (
+                "\"policy_revocation_ingested\"",
+                AuditAction::PolicyRevocationIngested,
+            ),
+            (
+                "\"role_assignment_changed\"",
+                AuditAction::RoleAssignmentChanged,
+            ),
+        ];
+        for (json, expected) in cases {
+            let v: AuditAction = serde_json::from_str(json).unwrap();
+            assert_eq!(v, expected, "tag {json} did not parse to its named variant");
+            let back = serde_json::to_string(&v).unwrap();
+            assert_eq!(back, json);
+        }
+    }
+
+    #[test]
+    fn every_canonical_audit_outcome_tag_round_trips_to_its_named_variant() {
+        let cases = [
+            ("\"granted\"", AuditOutcome::Granted),
+            ("\"denied\"", AuditOutcome::Denied),
+            (
+                "\"granted_via_break_glass\"",
+                AuditOutcome::GrantedViaBreakGlass,
+            ),
+            (
+                "\"break_glass_activated\"",
+                AuditOutcome::BreakGlassActivated,
+            ),
+            ("\"revoked\"", AuditOutcome::Revoked),
+            ("\"expired\"", AuditOutcome::Expired),
+        ];
+        for (json, expected) in cases {
+            let v: AuditOutcome = serde_json::from_str(json).unwrap();
+            assert_eq!(v, expected, "tag {json} did not parse to its named variant");
+            let back = serde_json::to_string(&v).unwrap();
+            assert_eq!(back, json);
+        }
+    }
+
+    #[test]
+    fn every_canonical_audit_export_class_tag_round_trips_to_its_named_variant() {
+        let cases = [
+            ("\"metadata\"", AuditExportClass::Metadata),
+            ("\"finding_summary\"", AuditExportClass::FindingSummary),
+            (
+                "\"sensitive_evidence_ref\"",
+                AuditExportClass::SensitiveEvidenceRef,
+            ),
+            ("\"raw_content\"", AuditExportClass::RawContent),
+        ];
+        for (json, expected) in cases {
+            let v: AuditExportClass = serde_json::from_str(json).unwrap();
+            assert_eq!(v, expected, "tag {json} did not parse to its named variant");
+            let back = serde_json::to_string(&v).unwrap();
+            assert_eq!(back, json);
+        }
+    }
+
+    // --- AC3: unknown enum variant / unknown top-level field parses
+    // successfully and re-serializes to the same content; unsupported
+    // schema_version fails loudly ---------------------------------------
+
+    #[test]
+    fn unrecognized_audit_action_tag_round_trips_the_original_string() {
+        let json = r#""quantum_reclassification""#;
+        let v: AuditAction = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            v,
+            AuditAction::Unrecognized("quantum_reclassification".to_string())
+        );
+        let back = serde_json::to_string(&v).unwrap();
+        assert_eq!(back, json);
+    }
+
+    #[test]
+    fn unrecognized_audit_outcome_tag_round_trips_the_original_string() {
+        let json = r#""quantum_verified""#;
+        let v: AuditOutcome = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            v,
+            AuditOutcome::Unrecognized("quantum_verified".to_string())
+        );
+        let back = serde_json::to_string(&v).unwrap();
+        assert_eq!(back, json);
+    }
+
+    #[test]
+    fn unrecognized_audit_export_class_tag_round_trips_the_original_string() {
+        let json = r#""quantum_export""#;
+        let v: AuditExportClass = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            v,
+            AuditExportClass::Unrecognized("quantum_export".to_string())
+        );
+        let back = serde_json::to_string(&v).unwrap();
+        assert_eq!(back, json);
+    }
+
+    #[test]
+    fn unrecognized_actor_kind_parses_as_unrecognized_variant_not_a_hard_failure() {
+        let json = r#"{"actor_kind": "quantum_actor", "extra": "field"}"#;
+        let v: AuditActor = serde_json::from_str(json).unwrap();
+        assert_eq!(v, AuditActor::Unrecognized);
+    }
+
+    #[test]
+    fn unrecognized_target_kind_parses_as_unrecognized_variant_not_a_hard_failure() {
+        let json = r#"{"target_kind": "quantum_target", "target_id": "x"}"#;
+        let v: AuditTarget = serde_json::from_str(json).unwrap();
+        assert_eq!(v, AuditTarget::Unrecognized);
+    }
+
+    #[test]
+    fn audit_event_with_unrecognized_enum_variants_parses_and_round_trips() {
+        let json = serde_json::json!({
+            "schema_version": 1,
+            "event_id": "e1",
+            "occurred_at": "2026-09-03T14:22:05Z",
+            "actor": {"actor_kind": "quantum_actor"},
+            "action": "quantum_action",
+            "target": {"target_kind": "quantum_target"},
+            "outcome": "quantum_outcome",
+            "export_class": "quantum_export",
+        });
+        let event: AuditEvent = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(event.actor, AuditActor::Unrecognized);
+        assert_eq!(
+            event.action,
+            AuditAction::Unrecognized("quantum_action".to_string())
+        );
+        assert_eq!(
+            event.outcome,
+            AuditOutcome::Unrecognized("quantum_outcome".to_string())
+        );
+        assert_eq!(
+            event.export_class,
+            AuditExportClass::Unrecognized("quantum_export".to_string())
+        );
+
+        let reserialized = serde_json::to_value(&event).unwrap();
+        assert_eq!(reserialized["action"], serde_json::json!("quantum_action"));
+        assert_eq!(
+            reserialized["outcome"],
+            serde_json::json!("quantum_outcome")
+        );
+        assert_eq!(
+            reserialized["export_class"],
+            serde_json::json!("quantum_export")
+        );
+    }
+
+    #[test]
+    fn unknown_top_level_field_on_a_supported_schema_version_survives_round_trip() {
+        let json = r#"{
+            "schema_version": 1,
+            "event_id": "e1",
+            "occurred_at": "2026-09-03T14:22:05Z",
+            "actor": {"actor_kind": "system"},
+            "action": "permission_check",
+            "target": {"target_kind": "permission", "target_id": "read_findings"},
+            "outcome": "granted",
+            "export_class": "metadata",
+            "future_correlation_scheme": "v2-trace-id"
+        }"#;
+        let event: AuditEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            event.unknown.get("future_correlation_scheme"),
+            Some(&serde_json::json!("v2-trace-id"))
+        );
+
+        let reser = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            reser["future_correlation_scheme"],
+            serde_json::json!("v2-trace-id")
+        );
+    }
+
+    #[test]
+    fn truly_incompatible_schema_version_fails_explicitly_rather_than_silently_parsing() {
+        let json = r#"{
+            "schema_version": 999,
+            "event_id": "e1",
+            "occurred_at": "2026-09-03T14:22:05Z",
+            "actor": {"actor_kind": "system"},
+            "action": "permission_check",
+            "target": {"target_kind": "permission", "target_id": "read_findings"},
+            "outcome": "granted",
+            "export_class": "metadata"
+        }"#;
+        let err = serde_json::from_str::<AuditEvent>(json).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("999") && msg.contains("not supported"),
+            "expected an explicit error naming the offending version, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_audit_event_rejects_unsupported_schema_version() {
+        let mut event = sample_event();
+        event.schema_version = 42;
+        let err = validate_audit_event(&event).unwrap_err();
+        match err {
+            AuditEventRejection::UnsupportedSchemaVersion { found, supported } => {
+                assert_eq!(found, 42);
+                assert_eq!(supported, SUPPORTED_AUDIT_SCHEMA_VERSIONS.to_vec());
+            }
+        }
+    }
+
+    // --- AC4: three-axis contrast --------------------------------------
+
+    /// Proves `AuditExportClass`, `RetentionClass`, and `ContentClass` are
+    /// orthogonal: no wire tag string is reused across the three axes, so a
+    /// bare tag string can never be ambiguous about which axis it belongs
+    /// to. See ADR-0011 §3 for the full narrative contrast.
+    #[test]
+    fn audit_export_class_retention_class_and_content_class_share_no_wire_tags() {
+        let export_tags = [
+            "metadata",
+            "finding_summary",
+            "sensitive_evidence_ref",
+            "raw_content",
+        ];
+        let retention_tags = [
+            "raw_local",
+            "sanitized_replay_fixture",
+            "aggregated_feature",
+            "derived_finding",
+        ];
+        let content_tags = [
+            "tool_telemetry",
+            "provider_diagnostic",
+            "experimental_signal",
+            "raw_provider_metadata",
+        ];
+
+        for tag in export_tags {
+            assert!(
+                !retention_tags.contains(&tag) && !content_tags.contains(&tag),
+                "export-class tag {tag:?} collides with another classification axis"
+            );
+        }
+        for tag in retention_tags {
+            assert!(
+                !content_tags.contains(&tag),
+                "retention-class tag {tag:?} collides with content-class"
+            );
+        }
+    }
+
+    #[test]
+    fn unrecognized_export_class_is_treated_as_non_exportable_the_safe_default() {
+        let unrecognized = AuditExportClass::Unrecognized("quantum_export".to_string());
+        assert!(!unrecognized.is_exportable());
+        assert!(!AuditExportClass::RawContent.is_exportable());
+        assert!(!AuditExportClass::SensitiveEvidenceRef.is_exportable());
+        assert!(AuditExportClass::Metadata.is_exportable());
+        assert!(AuditExportClass::FindingSummary.is_exportable());
+    }
+
+    // --- AC5: AuditRef format, parser, Display, and the audit_ref: None
+    // regression ----------------------------------------------------------
+
+    #[test]
+    fn audit_ref_round_trips_through_parse_and_display() {
+        let reference = AuditRef::new(
+            "horonomy-policy-issuer-1",
+            "d290f1ee-6c54-4b01-90e6-d701748f0851",
+        );
+        let formatted = reference.to_string();
+        assert_eq!(
+            formatted,
+            "horonomy-policy-issuer-1:d290f1ee-6c54-4b01-90e6-d701748f0851"
+        );
+        let parsed = AuditRef::parse(&formatted).unwrap();
+        assert_eq!(parsed, reference);
+    }
+
+    #[test]
+    fn audit_ref_parse_rejects_missing_separator() {
+        let err = AuditRef::parse("no-colon-here").unwrap_err();
+        assert!(matches!(err, AuditRefParseError::MissingSeparator { .. }));
+    }
+
+    #[test]
+    fn audit_ref_parse_rejects_empty_issuer_scope() {
+        let err = AuditRef::parse(":event-only").unwrap_err();
+        assert!(matches!(err, AuditRefParseError::EmptyIssuerScope { .. }));
+    }
+
+    #[test]
+    fn audit_ref_parse_rejects_empty_event_id() {
+        let err = AuditRef::parse("issuer-only:").unwrap_err();
+        assert!(matches!(err, AuditRefParseError::EmptyEventId { .. }));
+    }
+
+    #[test]
+    fn audit_ref_parse_splits_on_first_colon_only_preserving_the_rest_in_event_id() {
+        // event_id containing a colon is preserved intact; only
+        // issuer_scope is constrained to be colon-free per the ADR's format
+        // rule.
+        let parsed = AuditRef::parse("issuer:namespace:event-id").unwrap();
+        assert_eq!(parsed.issuer_scope, "issuer");
+        assert_eq!(parsed.event_id, "namespace:event-id");
+    }
+
+    /// `Option<AuditRef>` deserializes fine from `null`/absent, proven in
+    /// isolation (a small wrapper struct we control), plus a direct
+    /// regression against the real `RevocationEntry` type using an
+    /// `audit_ref: null` JSON literal — proving today's `audit_ref: None`
+    /// behavior is unaffected by anything this module adds, without
+    /// modifying `revocation.rs` itself (out of scope for FORNX-314; see
+    /// the ADR §6 and the PR description for the follow-up carve-out).
+    #[test]
+    fn option_audit_ref_deserializes_from_null_and_absent() {
+        #[derive(Debug, Deserialize, Serialize, PartialEq)]
+        struct Wrapper {
+            #[serde(default)]
+            audit_ref: Option<String>,
+        }
+
+        let from_null: Wrapper = serde_json::from_str(r#"{"audit_ref": null}"#).unwrap();
+        assert_eq!(from_null.audit_ref, None);
+
+        let from_absent: Wrapper = serde_json::from_str("{}").unwrap();
+        assert_eq!(from_absent.audit_ref, None);
+
+        // A well-formed AuditRef string still parses on the way in when a
+        // caller chooses to interpret the field that way.
+        let from_value: Wrapper =
+            serde_json::from_str(r#"{"audit_ref": "issuer-1:event-1"}"#).unwrap();
+        let parsed = AuditRef::parse(from_value.audit_ref.as_deref().unwrap()).unwrap();
+        assert_eq!(parsed, AuditRef::new("issuer-1", "event-1"));
+    }
+
+    #[test]
+    fn revocation_entry_audit_ref_null_continues_to_parse_and_serialize_exactly_as_today() {
+        // Direct regression against the real `RevocationEntry` type
+        // (`crate::policy::revocation::RevocationEntry`), built from a JSON
+        // literal so we never need `RevocationTarget`'s private digest
+        // constructors. `RevocationEntry` is `#[serde(deny_unknown_fields)]`
+        // with no `#[serde(default)]` on `audit_ref`, so the field must be
+        // present as literal `null` (not simply absent) -- this test proves
+        // that shape is untouched by anything added in this module.
+        use crate::RevocationEntry;
+
+        let json = serde_json::json!({
+            "target": {
+                "target_kind": "payload_digest",
+                "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            "revoked_at": "2026-09-03T14:22:05Z",
+            "reason": "compromised signing key",
+            "audit_ref": null,
+            "superseded_by": null
+        });
+
+        let entry: RevocationEntry = serde_json::from_value(json).unwrap();
+        assert_eq!(entry.audit_ref, None);
+
+        let reser = serde_json::to_value(&entry).unwrap();
+        assert_eq!(reser["audit_ref"], serde_json::Value::Null);
+    }
+}
