@@ -39,6 +39,7 @@ use super::content::{ActionClass, EnforcementOutcome, RiskClass, RiskClassSecond
 use super::diagnostics::PolicyValidationReport;
 use super::resolve::ResolvedPolicy;
 use super::revision::{PolicyId, RevisionDigest};
+use super::revocation::{RevocationEntry, RevocationTarget, VerifiedRevocationList};
 use crate::Verdict;
 
 pub const POLICY_CACHE_SCHEMA_VERSION: u32 = 1;
@@ -92,6 +93,246 @@ pub struct SequenceHighWater {
     pub last_seen_at: DateTime<Utc>,
 }
 
+/// What matched, for diagnostic/error attribution -- returned by
+/// [`RevocationSet::hit`]. Deliberately small: only what a diagnostic or
+/// [`ActivationRejection::Revoked`] needs to say *why*, never the raw
+/// [`RevocationEntry`] (which may carry an `audit_ref` not meant for every
+/// surface this hit is threaded through).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevocationHit {
+    pub target: RevocationTarget,
+    pub reason: String,
+    pub revoked_at: String,
+}
+
+/// Metadata stored per revoked digest -- deviation from the design sketch's
+/// bare `BTreeSet<Digest>`: `hit()` must return `reason`/`revoked_at`
+/// attribution, which a bare set cannot hold. See ADR-0009.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevocationHitMeta {
+    pub reason: String,
+    pub revoked_at: String,
+}
+
+/// The local, sticky, union-only set of revoked digests (FORNX-123).
+/// **Issuer-agnostic on the device**: an entry from ANY trusted issuer
+/// revokes any digest -- cross-tenant isolation is enforced by the cloud's
+/// authorization at publish time, not device-verifiable, so this type does
+/// not attempt to fake it. See `docs/adr/0009-policy-revocation-and-emergency-control.md`.
+///
+/// Deviation from the design sketch: `revision_digests`/`payload_digests`
+/// are `BTreeMap<_, RevocationHitMeta>`, not bare `BTreeSet<_>` -- `hit()`
+/// must return attribution (`target`/`reason`/`revoked_at`), which a bare
+/// set cannot carry. Field names are unchanged from the sketch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RevocationSet {
+    pub revision_digests: BTreeMap<RevisionDigest, RevocationHitMeta>,
+    pub payload_digests: BTreeMap<PayloadDigest, RevocationHitMeta>,
+    pub max_sequence_by_issuer: BTreeMap<String, u64>,
+    pub unrecognized_entry_count: u64,
+}
+
+impl RevocationSet {
+    /// Checks both digest kinds -- a re-wrapped bundle (same content,
+    /// different `bundle_id`/envelope, therefore different `payload_digest`
+    /// but the SAME `revision_digest`) is caught by the revision-digest
+    /// entry; an issuer revoking by `payload_digest` alone still catches an
+    /// exact-envelope resubmission. Revision-digest is checked first (no
+    /// significance to the order beyond determinism -- a digest is never
+    /// revoked under both kinds with different attribution in this design).
+    pub fn hit(&self, rev: &RevisionDigest, payload: &PayloadDigest) -> Option<RevocationHit> {
+        if let Some(meta) = self.revision_digests.get(rev) {
+            return Some(RevocationHit {
+                target: RevocationTarget::RevisionDigest {
+                    digest: rev.clone(),
+                },
+                reason: meta.reason.clone(),
+                revoked_at: meta.revoked_at.clone(),
+            });
+        }
+        if let Some(meta) = self.payload_digests.get(payload) {
+            return Some(RevocationHit {
+                target: RevocationTarget::PayloadDigest {
+                    digest: payload.clone(),
+                },
+                reason: meta.reason.clone(),
+                revoked_at: meta.revoked_at.clone(),
+            });
+        }
+        None
+    }
+}
+
+/// Exhaustive, no panics.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum RevocationIngestRejection {
+    #[error(
+        "sequence {candidate} for issuer {issuer:?} did not advance past high-water {high_water}"
+    )]
+    SequenceNotAdvanced {
+        issuer: String,
+        candidate: u64,
+        high_water: u64,
+    },
+    #[error("persistence failure: {detail}")]
+    Persistence { detail: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevocationIngestDecision {
+    Apply {
+        issuer: String,
+        sequence: u64,
+        new_entries: Vec<RevocationEntry>,
+        superseded_sequence: Option<u64>,
+    },
+    AlreadyCurrent {
+        issuer: String,
+        sequence: u64,
+    },
+}
+
+/// PURE -- no I/O, `now` unused today (kept as a parameter for symmetry with
+/// [`evaluate_activation`] and because a future check, e.g. per-issuer rate
+/// limiting, may need it) but the decision itself has no time dimension:
+/// revocation entries carry no expiry (see `super::revocation`'s module
+/// docs), so nothing here consults a clock.
+///
+/// `sequence < high_water` -> reject (`SequenceNotAdvanced`). `sequence ==
+/// high_water` -> `AlreadyCurrent` (idempotent re-import, no duplicate
+/// rows). `sequence > high_water` -> `Apply` with `new_entries` computed as
+/// the set difference against every digest already recorded in
+/// `state.revocations` -- entries are NEVER removed by a newer list that
+/// omits them; only genuinely new entries are returned for the caller to
+/// persist (existing rows are left untouched).
+pub fn evaluate_revocation_ingest(
+    candidate: &VerifiedRevocationList,
+    state: &PolicyCacheState,
+    _now: DateTime<Utc>,
+) -> Result<RevocationIngestDecision, RevocationIngestRejection> {
+    let issuer = candidate.issuer().to_string();
+    let candidate_sequence = candidate.sequence();
+
+    let existing_high_water = state
+        .revocations
+        .max_sequence_by_issuer
+        .get(&issuer)
+        .copied();
+
+    if let Some(hw) = existing_high_water {
+        if candidate_sequence < hw {
+            return Err(RevocationIngestRejection::SequenceNotAdvanced {
+                issuer,
+                candidate: candidate_sequence,
+                high_water: hw,
+            });
+        }
+        if candidate_sequence == hw {
+            return Ok(RevocationIngestDecision::AlreadyCurrent {
+                issuer,
+                sequence: candidate_sequence,
+            });
+        }
+    }
+
+    let new_entries: Vec<RevocationEntry> = candidate
+        .entries()
+        .iter()
+        .filter(|entry| match &entry.target {
+            RevocationTarget::RevisionDigest { digest } => {
+                !state.revocations.revision_digests.contains_key(digest)
+            }
+            RevocationTarget::PayloadDigest { digest } => {
+                !state.revocations.payload_digests.contains_key(digest)
+            }
+            RevocationTarget::Unrecognized => true,
+        })
+        .cloned()
+        .collect();
+
+    Ok(RevocationIngestDecision::Apply {
+        issuer,
+        sequence: candidate_sequence,
+        new_entries,
+        superseded_sequence: existing_high_water,
+    })
+}
+
+/// Converts today's silent fail-open (a wholly unusable generation quietly
+/// resolving to baseline's `ObserveOnly`-for-everything, see this module's
+/// top doc comment) into a loud, queryable signal. Deliberately thin: NO
+/// new enforcement semantics live here, and NO default per-action-class
+/// risk assumption is invented to "fix" the gap -- that would contradict
+/// `docs/adr/0006-policy-as-data.md` and `action_classification.rs`'s
+/// explicit "never a silently invented risk assumption" discipline. Wiring
+/// this into an actual enforcement decision is out of this ticket's scope
+/// (a future enforcement-wiring ticket's job) -- this only computes and
+/// surfaces the posture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyPosture {
+    Normal,
+    Degraded { reason: PolicyDegradationReason },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyDegradationReason {
+    Revoked,
+    Unverifiable,
+    TrustStoreUnavailable,
+    NoUsableGeneration,
+}
+
+/// Pins an explicit precedence for the (fairly common) case where multiple
+/// diagnostic codes are present at once -- e.g. a generation that fell back
+/// to last-known-good because of revocation also triggers the pre-existing
+/// FORNX-119 "nothing usable" diagnostic once LKG is *also* unusable. The
+/// most-specific cause wins: `Revoked` > `Unverifiable` >
+/// `TrustStoreUnavailable` > `NoUsableGeneration`. A fresh install that has
+/// never had a bundle imported (`ever_configured == false`) is `Normal`,
+/// not `Degraded` -- mirroring [`freshness`]'s own `Unconfigured` tier: no
+/// floor/posture penalty is invented merely because nothing has ever been
+/// configured.
+pub fn compute_posture(
+    ever_configured: bool,
+    usable_is_empty: bool,
+    diagnostics: &[super::diagnostics::PolicyDiagnostic],
+) -> PolicyPosture {
+    use super::diagnostics::DiagnosticCode;
+
+    if !usable_is_empty || !ever_configured {
+        return PolicyPosture::Normal;
+    }
+    if diagnostics
+        .iter()
+        .any(|d| d.code == DiagnosticCode::PolicyCacheRevoked)
+    {
+        return PolicyPosture::Degraded {
+            reason: PolicyDegradationReason::Revoked,
+        };
+    }
+    if diagnostics
+        .iter()
+        .any(|d| d.code == DiagnosticCode::PolicyCacheUnverifiable)
+    {
+        return PolicyPosture::Degraded {
+            reason: PolicyDegradationReason::Unverifiable,
+        };
+    }
+    if diagnostics
+        .iter()
+        .any(|d| d.code == DiagnosticCode::TrustStoreUnavailable)
+    {
+        return PolicyPosture::Degraded {
+            reason: PolicyDegradationReason::TrustStoreUnavailable,
+        };
+    }
+    PolicyPosture::Degraded {
+        reason: PolicyDegradationReason::NoUsableGeneration,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyCacheState {
     pub schema_version: u32,
@@ -103,6 +344,11 @@ pub struct PolicyCacheState {
     pub high_water: BTreeMap<(String, PolicyId), SequenceHighWater>,
     /// Sticky: once `true`, never `false` again.
     pub ever_configured: bool,
+    /// FORNX-123: the local, sticky, union-only set of revoked digests.
+    /// Never populated by anything in `verify_bundle`/`verify_revocation_list`
+    /// themselves — only by [`evaluate_revocation_ingest`]'s persisted
+    /// decision.
+    pub revocations: RevocationSet,
 }
 
 /// Derive order == strictness order; `meet` is per-field max, mirroring
@@ -386,6 +632,19 @@ pub enum ActivationRejection {
     BindingsUnusable(#[source] PolicyValidationReport),
     #[error("persistence failure: {detail}")]
     Persistence { detail: String },
+    /// FORNX-123: the candidate's `revision_digest`/`payload_digest` is on
+    /// the local revocation list. Checked FIRST in [`evaluate_activation`],
+    /// before lineage/sequence -- "must never be trusted again" outranks
+    /// every other rejection reason. A revoked bundle's signature is still
+    /// perfectly valid (`verify_bundle` never sees the revocation list at
+    /// all); this is the one place that fact is caught.
+    #[error("policy_id {policy_id:?} candidate is revoked: {reason} (revoked_at={revoked_at})")]
+    Revoked {
+        policy_id: PolicyId,
+        target: RevocationTarget,
+        reason: String,
+        revoked_at: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -438,6 +697,23 @@ pub fn evaluate_activation(
 ) -> Result<ActivationDecision, ActivationRejection> {
     let issuer = candidate.payload().provenance.issuer.clone();
     let policy_id = candidate.revision().body().policy_id;
+
+    // FORNX-123: revocation is checked FIRST, before lineage/sequence --
+    // "must never be trusted again" outranks every other rejection reason.
+    // A revoked bundle's signature is still perfectly valid (`verify_bundle`
+    // never consults the revocation list), so this is the one place that
+    // fact is caught.
+    if let Some(hit) = state
+        .revocations
+        .hit(candidate.revision().digest(), candidate.payload_digest())
+    {
+        return Err(ActivationRejection::Revoked {
+            policy_id,
+            target: hit.target,
+            reason: hit.reason,
+            revoked_at: hit.revoked_at,
+        });
+    }
 
     // Lineage/issuer binding: scoped per-lineage, not global. Any
     // high-water row ever recorded for this policy_id under a different

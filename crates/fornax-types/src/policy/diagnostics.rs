@@ -58,6 +58,21 @@ pub enum DiagnosticCode {
     PolicyRollbackRejected,
     PolicyIssuerMismatch,
     TrustStoreUnavailable,
+    // -- FORNX-123 policy revocation -- additive only, same closed-enum
+    // caveat as the FORNX-119 block above: a cross-repo consumer built
+    // against a prior version of this enum must be updated to handle these.
+    /// A cached generation's member(s) were found on the local revocation
+    /// list -- Error severity, since a revoked-but-still-cryptographically-
+    /// valid bundle being unusable is the entire point of this ticket, not
+    /// a mere warning.
+    PolicyCacheRevoked,
+    /// A revocation list entry named a `target_kind` this binary does not
+    /// recognize -- forward-compat, never fatal to parsing the rest of the
+    /// list. See `RevocationTarget::Unrecognized`.
+    PolicyRevocationEntryNotUnderstood,
+    /// A submitted revocation list was rejected (e.g. sequence did not
+    /// advance) -- mirrors `PolicyRollbackRejected`'s severity choice.
+    PolicyRevocationRejected,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
