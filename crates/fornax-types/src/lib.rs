@@ -210,7 +210,7 @@ pub struct Evidence {
     /// renderer never mistakes a purge for "no evidence was ever
     /// collected" (ADR-0001 D4: the verdict/rationale this evidence once
     /// supported are never recomputed or altered by a purge).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub evidence_purged: bool,
 }
 
