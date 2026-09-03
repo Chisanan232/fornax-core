@@ -170,8 +170,9 @@ impl AuditEventRow {
             prev_hash: self.prev_hash,
             entry_hash: self.entry_hash,
             export_class: self.export_class,
-            event: serde_json::from_str(&self.payload)
-                .map_err(|e| StoreError::PolicyCacheCorrupt(format!("audit event_id={}: {e}", self.event_id)))?,
+            event: serde_json::from_str(&self.payload).map_err(|e| {
+                StoreError::PolicyCacheCorrupt(format!("audit event_id={}: {e}", self.event_id))
+            })?,
         })
     }
 }
@@ -275,11 +276,15 @@ async fn verify_audit_chain_conn(conn: &mut SqliteConnection) -> Result<ChainVer
     .fetch_all(&mut *conn)
     .await?;
 
-    let mut expected_seq: i64 = GENESIS_SEQ;
     let mut expected_prev_hash = genesis_prev_hash();
     let mut last_seen_seq: i64 = 0;
 
-    for row in &rows {
+    // `expected_seq` is derived from the row's position in this ordered
+    // scan (`GENESIS_SEQ + index`), not a hand-incremented counter -- it is
+    // exactly what `row.seq` must equal if no prior row triggered an early
+    // return, which is the property `MissingSeq` below is checking for.
+    for (index, row) in rows.iter().enumerate() {
+        let expected_seq = GENESIS_SEQ + index as i64;
         if row.seq != expected_seq {
             return Ok(ChainVerification::Diverged {
                 first_bad_seq: expected_seq,
@@ -303,7 +308,6 @@ async fn verify_audit_chain_conn(conn: &mut SqliteConnection) -> Result<ChainVer
         }
 
         expected_prev_hash = row.entry_hash.clone();
-        expected_seq += 1;
         last_seen_seq = row.seq;
     }
 
