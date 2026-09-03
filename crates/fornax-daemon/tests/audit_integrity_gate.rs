@@ -679,15 +679,18 @@ fn no_source_or_doc_overclaims_what_audit_verification_proves() {
         "impossible to tamper",
     ];
 
-    // This very file legitimately contains every one of the phrases above,
-    // as the literal patterns it scans for -- exclude it from the scan it
-    // performs on everything else.
+    // This test file, and this ticket's own release sign-off doc, both
+    // legitimately quote every one of the phrases above verbatim -- as the
+    // literal patterns under test, and as a description of them in the
+    // sign-off's gate-item table, respectively. Exclude both from the scan
+    // they describe/perform against everything else.
     let this_file =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/audit_integrity_gate.rs");
+    let signoff_doc = repo_root.join("docs/release/v0.7.0-audit-integrity-gate-signoff.md");
 
     let mut offending: Vec<(String, &str)> = Vec::new();
     for entry in walk_source_and_doc_files(&repo_root) {
-        if entry == this_file {
+        if entry == this_file || entry == signoff_doc {
             continue;
         }
         let Ok(contents) = std::fs::read_to_string(&entry) else {
