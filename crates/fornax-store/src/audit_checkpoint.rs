@@ -357,3 +357,298 @@ mod tests {
         assert_eq!(with_none, with_some);
     }
 }
+
+/// Integration tests against a real `Store`/SQLite file -- the pure-function
+/// tests above never open a database or run `0012_audit_checkpoints.sql`
+/// itself, so they cannot catch a column-name mismatch between the
+/// migration, `AuditCheckpointRow`'s `FromRow` derive, and `RECEIPT_COLUMNS`,
+/// or a bind-order mistake in `store_audit_checkpoint_receipt`'s INSERT.
+/// These tests exercise that real path end-to-end.
+#[cfg(test)]
+mod store_integration_tests {
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine;
+    use ed25519_dalek::{Signer, SigningKey};
+    use fornax_types::policy::{
+        BundleSignature, KeyId, SignatureAlgorithm, TrustedKey, TrustedVerificationKeys,
+    };
+    use fornax_types::{
+        verify_audit_checkpoint, AuditCheckpointPayload, AuditExportClass,
+        DeviceReportedChainStatus, LedgerHead, SignedAuditCheckpoint,
+        AUDIT_CHECKPOINT_SCHEMA_VERSION, AUDIT_CHECKPOINT_SIGNING_DOMAIN,
+    };
+    use fornax_types::{AuditAction, AuditActor, AuditEvent, AuditOutcome, AuditTarget};
+    use uuid::Uuid;
+
+    use super::*;
+
+    fn tmp_db_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "fornax-store-audit-checkpoint-test-{name}-{}.db",
+            Uuid::new_v4()
+        ))
+    }
+
+    fn now() -> chrono::DateTime<chrono::Utc> {
+        "2026-09-03T00:00:00Z".parse().unwrap()
+    }
+
+    fn sample_event(n: usize) -> AuditEvent {
+        AuditEvent::new(
+            format!("event-{n}"),
+            "2026-09-03T00:00:00Z",
+            AuditActor::Device {
+                actor_id: format!("device-{n}"),
+            },
+            AuditAction::PermissionCheck,
+            AuditTarget::Permission {
+                target_id: format!("perm-{n}"),
+            },
+            AuditOutcome::Granted,
+            AuditExportClass::Metadata,
+        )
+    }
+
+    /// Reimplements `audit_ledger::compute_entry_hash` (private to that
+    /// module) using only its `pub` [`crate::audit_ledger::AUDIT_LEDGER_DOMAIN`]
+    /// constant, so this test can forge a self-consistent replacement row
+    /// without widening that function's visibility (out of this ticket's
+    /// scope -- `audit_ledger.rs` is explicitly untouched, see ADR-0012
+    /// §11).
+    fn recompute_entry_hash_for_test(seq: i64, prev_hash: &str, payload_bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(crate::audit_ledger::AUDIT_LEDGER_DOMAIN);
+        hasher.update(seq.to_be_bytes());
+        hasher.update(prev_hash.as_bytes());
+        hasher.update(payload_bytes);
+        let hash = hasher.finalize();
+        let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+        format!("sha256:{hex}")
+    }
+
+    fn signing_key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn trust_store(key_id: &str, key: &SigningKey) -> TrustedVerificationKeys {
+        TrustedVerificationKeys {
+            schema_version: 1,
+            keys: vec![TrustedKey {
+                key_id: KeyId(key_id.to_string()),
+                algorithm: SignatureAlgorithm::Ed25519,
+                public_key_b64: B64.encode(key.verifying_key().to_bytes()),
+                not_before: None,
+                not_after: None,
+                comment: None,
+            }],
+        }
+    }
+
+    /// Builds a real, independently-verifiable `SignedAuditCheckpoint`
+    /// envelope attesting `head_ledger_seq`/`head_entry_hash`, signs it, and
+    /// runs it through `fornax_types::verify_audit_checkpoint` -- exactly
+    /// the flow `fornax-daemon`'s submission path follows -- so the
+    /// resulting `VerifiedAuditCheckpoint` this test stores is the real
+    /// type `Store::store_audit_checkpoint_receipt` expects, not a
+    /// hand-constructed stand-in.
+    fn verified_checkpoint(
+        key_id: &str,
+        key: &SigningKey,
+        checkpoint_seq: u64,
+        head_ledger_seq: i64,
+        head_entry_hash: &str,
+        device_id: &str,
+    ) -> (fornax_types::VerifiedAuditCheckpoint, Vec<u8>) {
+        let payload = AuditCheckpointPayload {
+            checkpoint_schema_version: AUDIT_CHECKPOINT_SCHEMA_VERSION,
+            issuer: "fornax-cloud:org-1".to_string(),
+            device_id: device_id.to_string(),
+            checkpoint_seq,
+            issued_at: "2026-09-03T00:00:05Z".to_string(),
+            observed_at: "2026-09-03T00:00:00Z".to_string(),
+            head: LedgerHead {
+                ledger_seq: head_ledger_seq,
+                entry_hash: head_entry_hash.to_string(),
+            },
+            device_reported_chain_status: DeviceReportedChainStatus {
+                status: "valid".to_string(),
+                first_bad_ledger_seq: None,
+                divergence_kind: None,
+            },
+            prev_checkpoint: None,
+        };
+        let payload_bytes = serde_json::to_vec(&payload).unwrap();
+        let mut signed_message = AUDIT_CHECKPOINT_SIGNING_DOMAIN.to_vec();
+        signed_message.extend_from_slice(&payload_bytes);
+        let signature = key.sign(&signed_message);
+        let envelope = SignedAuditCheckpoint {
+            checkpoint_schema_version: AUDIT_CHECKPOINT_SCHEMA_VERSION,
+            payload_b64: B64.encode(&payload_bytes),
+            signatures: vec![BundleSignature {
+                key_id: KeyId(key_id.to_string()),
+                algorithm: SignatureAlgorithm::Ed25519,
+                signature_b64: B64.encode(signature.to_bytes()),
+            }],
+        };
+        let envelope_bytes = serde_json::to_vec(&envelope).unwrap();
+        let trusted = trust_store(key_id, key);
+        let verified = verify_audit_checkpoint(&envelope_bytes, &trusted, now())
+            .expect("hand-built checkpoint must verify");
+        (verified, envelope_bytes)
+    }
+
+    /// End-to-end: append real audit events, store a real verified
+    /// checkpoint receipt anchored to the tail, read it back through all
+    /// three accessors, and confirm `evaluate_all_checkpoint_receipts`
+    /// reports `Consistent` against the real `audit_events` table --
+    /// proving the migration, `FromRow` derive, `RECEIPT_COLUMNS`, and the
+    /// INSERT's bind order all actually agree with each other.
+    #[tokio::test]
+    async fn store_and_read_back_a_real_verified_receipt_and_evaluate_consistent() {
+        let path = tmp_db_path("roundtrip");
+        let store = Store::open(&path).await.expect("open db");
+
+        let mut appended = None;
+        for i in 0..3 {
+            appended = Some(
+                store
+                    .append_audit_event(&sample_event(i), now())
+                    .await
+                    .expect("append event"),
+            );
+        }
+        let tail = appended.expect("at least one event appended");
+
+        let key = signing_key(41);
+        let (verified, envelope_bytes) =
+            verified_checkpoint("k1", &key, 1, tail.seq, &tail.entry_hash, "device-abc");
+        let envelope_json = String::from_utf8(envelope_bytes).unwrap();
+
+        store
+            .store_audit_checkpoint_receipt(&verified, &envelope_json)
+            .await
+            .expect("store receipt");
+
+        let all = store
+            .audit_checkpoint_receipts()
+            .await
+            .expect("list receipts");
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].checkpoint_seq, 1);
+        assert_eq!(all[0].head_ledger_seq, tail.seq);
+        assert_eq!(all[0].head_entry_hash, tail.entry_hash);
+        assert_eq!(all[0].device_id, "device-abc");
+        assert_eq!(all[0].envelope, envelope_json);
+
+        let first = store
+            .first_audit_checkpoint_receipt()
+            .await
+            .expect("first receipt")
+            .expect("a receipt exists");
+        assert_eq!(first.checkpoint_seq, 1);
+
+        let latest = store
+            .latest_audit_checkpoint_receipt()
+            .await
+            .expect("latest receipt")
+            .expect("a receipt exists");
+        assert_eq!(latest.checkpoint_seq, 1);
+
+        let results = store
+            .evaluate_all_checkpoint_receipts()
+            .await
+            .expect("evaluate receipts");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].1, CheckpointConsistencyVerdict::Consistent);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Regression: after a raw-SQL mutation of the row `audit_events`
+    /// currently occupying the attested `head_ledger_seq`, the SAME stored
+    /// receipt flips from `Consistent` to `AnchorRewritten` -- proving the
+    /// §8.2 verdict logic actually fires against real rows, not just the
+    /// pure-function fixtures in the sibling test module above.
+    #[tokio::test]
+    async fn evaluate_all_checkpoint_receipts_detects_a_real_anchor_rewrite() {
+        let path = tmp_db_path("anchor-rewrite");
+        let store = Store::open(&path).await.expect("open db");
+
+        let appended = store
+            .append_audit_event(&sample_event(0), now())
+            .await
+            .expect("append event");
+
+        let key = signing_key(42);
+        let (verified, envelope_bytes) = verified_checkpoint(
+            "k1",
+            &key,
+            1,
+            appended.seq,
+            &appended.entry_hash,
+            "device-abc",
+        );
+        let envelope_json = String::from_utf8(envelope_bytes).unwrap();
+        store
+            .store_audit_checkpoint_receipt(&verified, &envelope_json)
+            .await
+            .expect("store receipt");
+
+        let before = store
+            .evaluate_all_checkpoint_receipts()
+            .await
+            .expect("evaluate before mutation");
+        assert_eq!(before[0].1, CheckpointConsistencyVerdict::Consistent);
+
+        // The chain must stay internally VALID after this mutation (only
+        // `AnchorRewritten`'s branch requires that -- `ChainVerification`
+        // must be `Valid`, never `Diverged`) -- so both `payload` and
+        // `entry_hash` are rewritten TOGETHER, self-consistently, exactly
+        // as an attacker with full control of the process (not merely raw
+        // SQLite access) could forge: a different event, re-hashed
+        // correctly over the SAME `prev_hash` (genesis, since this is the
+        // sole row). `verify_audit_chain` alone cannot distinguish this
+        // from a legitimate row; only the checkpoint receipt can.
+        let forged_payload = serde_json::to_string(&sample_event(999)).unwrap();
+        let genesis_prev_hash = format!("sha256:{}", "0".repeat(64));
+        let forged_entry_hash = recompute_entry_hash_for_test(
+            appended.seq,
+            &genesis_prev_hash,
+            forged_payload.as_bytes(),
+        );
+        assert_ne!(
+            forged_entry_hash, appended.entry_hash,
+            "the forged row must actually differ from what was attested"
+        );
+        sqlx::query("UPDATE audit_events SET payload = ?, entry_hash = ? WHERE seq = ?")
+            .bind(&forged_payload)
+            .bind(&forged_entry_hash)
+            .bind(appended.seq)
+            .execute(&store.pool)
+            .await
+            .expect("forge a self-consistent replacement row directly via raw SQL");
+
+        assert_eq!(
+            store.verify_audit_chain().await.expect("verify chain"),
+            ChainVerification::Valid,
+            "the forged row must still verify as an internally self-consistent chain"
+        );
+
+        let after = store
+            .evaluate_all_checkpoint_receipts()
+            .await
+            .expect("evaluate after mutation");
+        assert_eq!(after.len(), 1);
+        assert!(
+            matches!(
+                after[0].1,
+                CheckpointConsistencyVerdict::AnchorRewritten { .. }
+            ),
+            "expected AnchorRewritten, got {:?}",
+            after[0].1
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+}
