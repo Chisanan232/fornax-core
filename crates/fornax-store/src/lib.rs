@@ -12,8 +12,11 @@ use sqlx::SqlitePool;
 use std::path::Path;
 use std::str::FromStr;
 
+pub mod audit_ledger;
 pub mod policy_cache;
 pub mod retention;
+
+pub use audit_ledger::{AppendedAuditEvent, AuditLedgerEntry, ChainVerification, DivergenceKind};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
