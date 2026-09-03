@@ -390,6 +390,17 @@ impl Store {
     }
 
     /// Every appended audit event, oldest first (`fornax audit list`).
+    ///
+    /// Fails on the first row whose `payload` does not deserialize back
+    /// into `AuditEvent`, rather than `evidence_for_session`'s
+    /// N-1-good-rows-plus-a-named-`failed`-list shape (FORNX-289). That
+    /// shape exists for evidence because a verifier genuinely wants "the
+    /// rows that are usable" even when some aren't; a bad row here should
+    /// never happen for anything `append_audit_event` itself wrote (its
+    /// payload always round-trips), so any failure is far more likely a
+    /// corrupted/tampered ledger -- exactly the case `verify_audit_chain`
+    /// exists to surface authoritatively. Callers who need the chain
+    /// integrity check should call that, not infer it from a partial list.
     pub async fn audit_events(&self) -> Result<Vec<AuditLedgerEntry>> {
         let rows = sqlx::query_as::<_, AuditEventRow>(
             "SELECT seq, event_id, recorded_at, prev_hash, entry_hash, export_class, payload
