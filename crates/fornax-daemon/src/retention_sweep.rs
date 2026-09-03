@@ -33,17 +33,20 @@
 //! purge/delete behavior is the actual mechanism that keeps the store
 //! bounded over time; this check only surfaces when that isn't keeping up.
 //!
-//! **Audit-ledger retention window.** Once FORNX-315's audit ledger table
-//! exists, it must NOT be swept by this task at all: an audit trail's value
-//! is in outliving the raw evidence it once corroborated, so it needs a
-//! materially longer retention window than [`fornax_store::retention::RAW_LOCAL_RETENTION`]/
-//! [`fornax_store::retention::DERIVED_FINDING_RETENTION`] — this is a
-//! documented policy statement only (no code change here), since the audit
-//! ledger table does not exist on this branch yet (see this crate's
-//! `main.rs` module docs / this ticket's PR description for the FORNX-315
-//! sequencing note). When FORNX-315 lands, its table must be added to
-//! neither `fornax_store::retention::KNOWN_RECORD_TABLES` nor swept by this
-//! task using the same short-lived durations as ordinary evidence.
+//! **Audit-ledger retention window.** FORNX-315's `audit_events` table
+//! (append-only, hash-chained — see `fornax_store::audit_ledger`) is
+//! confirmed absent from [`fornax_store::retention::KNOWN_RECORD_TABLES`]
+//! and is therefore never touched by this sweep at all — a lineage tag is
+//! never recorded for it in the first place, so there is nothing for a
+//! sweep pass to find. This is a deliberate policy statement, not an
+//! oversight: an audit trail's value is in outliving the raw evidence it
+//! once corroborated, so it needs a materially longer retention window
+//! than [`fornax_store::retention::RAW_LOCAL_RETENTION`]/
+//! [`fornax_store::retention::DERIVED_FINDING_RETENTION`] — likely "kept
+//! indefinitely, or on its own much longer explicit schedule" — a decision
+//! left to whichever future ticket defines the audit ledger's own
+//! retention/rotation policy, not silently inherited from this module's
+//! short-lived evidence/finding durations.
 
 use std::path::PathBuf;
 use std::time::Duration;
