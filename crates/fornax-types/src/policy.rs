@@ -34,6 +34,7 @@ mod diagnostics;
 mod local;
 mod resolve;
 mod revision;
+mod revocation;
 mod target;
 pub mod trust_store;
 
@@ -46,10 +47,12 @@ pub use bundle::{
     SUPPORTED_BUNDLE_SCHEMA_VERSIONS,
 };
 pub use cache::{
-    effective_outcome, evaluate_activation, freshness, member_freshness, staleness_floor,
-    ActivationDecision, ActivationOutcome, ActivationRejection, CacheGeneration, CacheSlotKind,
-    CachedBundleRef, EffectivePolicy, FreshnessTier, MemberFreshness, PolicyCacheState,
-    PolicyFreshness, RiskClassTiers, SequenceHighWater, POLICY_CACHE_SCHEMA_VERSION,
+    compute_posture, effective_outcome, evaluate_activation, evaluate_revocation_ingest, freshness,
+    member_freshness, staleness_floor, ActivationDecision, ActivationOutcome, ActivationRejection,
+    CacheGeneration, CacheSlotKind, CachedBundleRef, EffectivePolicy, FreshnessTier,
+    MemberFreshness, PolicyCacheState, PolicyDegradationReason, PolicyFreshness, PolicyPosture,
+    RevocationHit, RevocationHitMeta, RevocationIngestDecision, RevocationIngestRejection,
+    RevocationSet, RiskClassTiers, SequenceHighWater, POLICY_CACHE_SCHEMA_VERSION,
 };
 pub use content::{
     ActionClass, CacheScope, CollectionScope, EgressContentClass, EgressScope, EnforcementOutcome,
@@ -66,6 +69,11 @@ pub use revision::{
     canonical_bytes, digest_of, PolicyDraft, PolicyId, PolicyRevisionBody, PolicyRevisionRef,
     PublishedPolicyRevision, RevisionDigest,
 };
+pub use revocation::{
+    verify_revocation_list, RevocationEntry, RevocationPayload, RevocationRejection,
+    RevocationTarget, SignedRevocationList, VerifiedRevocationList, MAX_REVOCATION_ENTRIES,
+    REVOCATION_SCHEMA_VERSION, REVOCATION_SIGNING_DOMAIN, SUPPORTED_REVOCATION_SCHEMA_VERSIONS,
+};
 pub use target::{
     BoundRevision, DeviceContext, OsFamily, PolicyBinding, TargetLevel, TargetScope, TargetSelector,
 };
@@ -76,3 +84,6 @@ mod tests;
 
 #[cfg(test)]
 mod cache_tests;
+
+#[cfg(test)]
+mod revocation_tests;

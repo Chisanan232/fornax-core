@@ -49,19 +49,25 @@ pub use graph::{
     DEFAULT_EXIT_CODE_FRESHNESS_SECONDS,
 };
 pub use policy::{
-    classify_action_class, effective_outcome, evaluate_activation, freshness, member_freshness,
-    resolve, resolve_trust_store, staleness_floor, verify_bundle, ActionClass, ActivationDecision,
+    classify_action_class, compute_posture, effective_outcome, evaluate_activation,
+    evaluate_revocation_ingest, freshness, member_freshness, resolve, resolve_trust_store,
+    staleness_floor, verify_bundle, verify_revocation_list, ActionClass, ActivationDecision,
     ActivationOutcome, ActivationRejection, BoundRevision, BundleRejection, CacheGeneration,
     CacheScope, CacheSlotKind, CachedBundleRef, CollectionScope, DeviceContext, DiagnosticCode,
     DiagnosticSeverity, EffectivePolicy, EgressContentClass, EgressScope, EnforcementOutcome,
     EnforcementRule, EnforcementScope, FieldProvenance, FreshnessTier, KeyId, MemberFreshness,
-    OsFamily, PayloadDigest, PolicyBinding, PolicyCacheState, PolicyContent, PolicyDiagnostic,
-    PolicyDraft, PolicyFieldId, PolicyFreshness, PolicyId, PolicyRevisionBody, PolicyRevisionRef,
-    PolicyValidationReport, PublishedPolicyRevision, RedactionProfile, ResolvedPolicy,
-    ResolvedValues, RevisionDigest, RiskClass, RiskClassSeconds, RiskClassTiers, SensorScope,
-    SequenceHighWater, TargetLevel, TargetScope, TargetSelector, TrustedVerificationKeys,
-    VerdictOutcomes, VerifiedPolicyBundle, POLICY_CACHE_SCHEMA_VERSION, POLICY_SCHEMA_VERSION,
-    SUPPORTED_POLICY_SCHEMA_VERSIONS,
+    OsFamily, PayloadDigest, PolicyBinding, PolicyCacheState, PolicyContent,
+    PolicyDegradationReason, PolicyDiagnostic, PolicyDraft, PolicyFieldId, PolicyFreshness,
+    PolicyId, PolicyPosture, PolicyRevisionBody, PolicyRevisionRef, PolicyValidationReport,
+    PublishedPolicyRevision, RedactionProfile, ResolvedPolicy, ResolvedValues, RevisionDigest,
+    RevocationEntry, RevocationHit, RevocationHitMeta, RevocationIngestDecision,
+    RevocationIngestRejection, RevocationPayload, RevocationRejection, RevocationSet,
+    RevocationTarget, RiskClass, RiskClassSeconds, RiskClassTiers, SensorScope, SequenceHighWater,
+    SignedRevocationList, TargetLevel, TargetScope, TargetSelector, TrustedVerificationKeys,
+    VerdictOutcomes, VerifiedPolicyBundle, VerifiedRevocationList, MAX_REVOCATION_ENTRIES,
+    POLICY_CACHE_SCHEMA_VERSION, POLICY_SCHEMA_VERSION, REVOCATION_SCHEMA_VERSION,
+    REVOCATION_SIGNING_DOMAIN, SUPPORTED_POLICY_SCHEMA_VERSIONS,
+    SUPPORTED_REVOCATION_SCHEMA_VERSIONS,
 };
 pub use reliability_context::{
     aggregate_context, capability_fingerprint, cohort_id_for, evaluate_sample_support,
@@ -461,6 +467,14 @@ pub enum IngestMessage {
     /// new HTTP POST route (the localhost HTTP surface is GET-only,
     /// deliberately, since it is browser-reachable).
     PolicyBundle {
+        envelope: String,
+    },
+    /// A signed policy revocation list envelope (FORNX-123), imported via
+    /// `fornax policy import <path>` (which dispatches on the artifact's own
+    /// top-level shape -- see that command's doc). `envelope` is the raw
+    /// envelope JSON text (`policy::SignedRevocationList`) exactly as read
+    /// from the file. Same fire-and-forget UDS path as `PolicyBundle`.
+    PolicyRevocation {
         envelope: String,
     },
     /// Adapter announces what its runtime can observe, once per connection.

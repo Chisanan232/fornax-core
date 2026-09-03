@@ -45,6 +45,7 @@ fn empty_state() -> PolicyCacheState {
         last_known_good: None,
         high_water: BTreeMap::new(),
         ever_configured: false,
+        revocations: RevocationSet::default(),
     }
 }
 
