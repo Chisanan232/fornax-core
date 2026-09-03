@@ -49,13 +49,13 @@ pub use graph::{
     DEFAULT_EXIT_CODE_FRESHNESS_SECONDS,
 };
 pub use policy::{
-    resolve, ActionClass, BoundRevision, CacheScope, CollectionScope, DeviceContext,
-    DiagnosticCode, DiagnosticSeverity, EgressContentClass, EgressScope, EnforcementOutcome,
-    EnforcementRule, EnforcementScope, FieldProvenance, OsFamily, PolicyBinding, PolicyContent,
-    PolicyDiagnostic, PolicyDraft, PolicyFieldId, PolicyId, PolicyRevisionBody, PolicyRevisionRef,
-    PolicyValidationReport, PublishedPolicyRevision, RedactionProfile, ResolvedPolicy,
-    ResolvedValues, RevisionDigest, RiskClass, RiskClassSeconds, SensorScope, TargetLevel,
-    TargetScope, TargetSelector, VerdictOutcomes, POLICY_SCHEMA_VERSION,
+    classify_action_class, resolve, ActionClass, BoundRevision, CacheScope, CollectionScope,
+    DeviceContext, DiagnosticCode, DiagnosticSeverity, EgressContentClass, EgressScope,
+    EnforcementOutcome, EnforcementRule, EnforcementScope, FieldProvenance, OsFamily,
+    PolicyBinding, PolicyContent, PolicyDiagnostic, PolicyDraft, PolicyFieldId, PolicyId,
+    PolicyRevisionBody, PolicyRevisionRef, PolicyValidationReport, PublishedPolicyRevision,
+    RedactionProfile, ResolvedPolicy, ResolvedValues, RevisionDigest, RiskClass, RiskClassSeconds,
+    SensorScope, TargetLevel, TargetScope, TargetSelector, VerdictOutcomes, POLICY_SCHEMA_VERSION,
     SUPPORTED_POLICY_SCHEMA_VERSIONS,
 };
 pub use reliability_context::{
