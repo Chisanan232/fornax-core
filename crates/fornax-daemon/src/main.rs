@@ -1722,6 +1722,7 @@ mod tests {
             provenance: "claude_code:1.2.3:PostToolUse:Edit#heuristic:tool_input".to_string(),
             source: None,
             extension: None,
+            evidence_purged: false,
         };
         handle_message(&state, IngestMessage::Evidence(evidence), &mut hint)
             .await
@@ -1798,6 +1799,7 @@ mod tests {
             provenance: "opencode:1.18.25:PostToolUse:bash#tool_response".to_string(),
             source: None,
             extension: Some(extension),
+            evidence_purged: false,
         };
         handle_message(&state, IngestMessage::Evidence(evidence), &mut hint)
             .await
@@ -1885,6 +1887,7 @@ mod tests {
             provenance: "claude_code:1.2.3:PostToolUse:Bash#tool_response:git_commit".to_string(),
             source: None,
             extension: None,
+            evidence_purged: false,
         };
         handle_message(&state, IngestMessage::Evidence(evidence), &mut hint)
             .await
@@ -2058,6 +2061,7 @@ mod tests {
                 Some("0.0.1".to_string()),
             )),
             extension: None,
+            evidence_purged: false,
         };
         handle_message(&state, IngestMessage::Evidence(evidence), &mut hint)
             .await
@@ -2258,6 +2262,7 @@ mod tests {
             provenance: "claude_code:1.2.3:PostToolUse:Bash#tool_response".to_string(),
             source: None,
             extension: None,
+            evidence_purged: false,
         };
         handle_message(&state, IngestMessage::Evidence(evidence), &mut hint)
             .await
@@ -2431,6 +2436,7 @@ mod tests {
             provenance: "claude_code:1.2.3:PostToolUse:Bash#tool_response".to_string(),
             source: None,
             extension: None,
+            evidence_purged: false,
         };
         handle_message(&state, IngestMessage::Evidence(evidence), &mut hint)
             .await
@@ -2588,6 +2594,7 @@ mod tests {
             provenance: "test".to_string(),
             source: None,
             extension: None,
+            evidence_purged: false,
         }
     }
 

@@ -199,6 +199,19 @@ pub struct Evidence {
     /// canonical-vs-extension boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extension: Option<extension::ExtensionEnvelope>,
+    /// FORNX-319: `true` once this row's raw `payload` has been purged by
+    /// the local retention sweep (`fornax_store::retention`) after its
+    /// `RetentionClass::RawLocal` retention window elapsed. `false` for
+    /// every row written before this field existed and for every row whose
+    /// evidence has not (yet) expired — `#[serde(default)]` keeps the wire
+    /// shape backward compatible. When `true`, `payload` no longer holds
+    /// the original observation; it holds an explicit "evidence expired"
+    /// marker (see `fornax_store::retention::purge_evidence_payload`) so a
+    /// renderer never mistakes a purge for "no evidence was ever
+    /// collected" (ADR-0001 D4: the verdict/rationale this evidence once
+    /// supported are never recomputed or altered by a purge).
+    #[serde(default)]
+    pub evidence_purged: bool,
 }
 
 /// Strongly-typed canonical payload shapes, one per [`EvidenceKind`] variant
@@ -506,6 +519,7 @@ mod evidence_schema_tests {
             provenance: "test".into(),
             source: None,
             extension: None,
+            evidence_purged: false,
         }
     }
 
@@ -815,6 +829,7 @@ mod domain_type_tests {
             provenance: "test".into(),
             source: None,
             extension: None,
+            evidence_purged: false,
         };
         let msg = IngestMessage::Evidence(evidence);
         let json = serde_json::to_value(&msg).unwrap();

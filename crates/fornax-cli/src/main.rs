@@ -2700,6 +2700,7 @@ trust_level = \"trusted\"\n";
                 provenance: "codex:rollout:exec_command_end".into(),
                 source: None,
                 extension: None,
+                evidence_purged: false,
             };
             store
                 .insert_evidence(&evidence)
@@ -2978,6 +2979,7 @@ trust_level = \"trusted\"\n";
                     derived_from: Vec::new(),
                 }),
                 extension: None,
+                evidence_purged: false,
             };
             store
                 .insert_evidence(&evidence)
@@ -3063,6 +3065,7 @@ trust_level = \"trusted\"\n";
                 provenance: "claude_code:PostToolUse:Bash#heuristic:stderr_empty".into(),
                 source: None,
                 extension: Some(extension),
+                evidence_purged: false,
             };
             store
                 .insert_evidence(&evidence)
