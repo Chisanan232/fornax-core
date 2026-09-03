@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 pub mod adapter;
 pub mod audit;
+pub mod audit_checkpoint;
 pub mod capabilities;
 pub mod causal;
 pub mod experiment;
@@ -31,6 +32,12 @@ pub use audit::{
     validate_audit_event, AuditAction, AuditActor, AuditEvent, AuditEventRejection,
     AuditExportClass, AuditOutcome, AuditRef, AuditRefParseError, AuditTarget,
     AUDIT_SCHEMA_VERSION, SUPPORTED_AUDIT_SCHEMA_VERSIONS,
+};
+pub use audit_checkpoint::{
+    divergence_kind_wire, verify_audit_checkpoint, AuditCheckpointPayload, AuditCheckpointRequest,
+    CheckpointRejection, DeviceReportedChainStatus, LedgerHead, PrevCheckpoint,
+    SignedAuditCheckpoint, VerifiedAuditCheckpoint, AUDIT_CHECKPOINT_SCHEMA_VERSION,
+    AUDIT_CHECKPOINT_SIGNING_DOMAIN, SUPPORTED_CHECKPOINT_SCHEMA_VERSIONS,
 };
 pub use capabilities::{
     CapabilityProbe, CapabilitySignal, LegacyCapabilitiesWire, RuntimeCapabilities,
