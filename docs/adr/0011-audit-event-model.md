@@ -106,6 +106,7 @@ this ADR:
 | `policy_bundle_activated` | A signed policy bundle was verified and activated locally (ADR-0007/0008). |
 | `policy_revocation_ingested` | A signed revocation list was verified and its entries ingested (ADR-0009). |
 | `role_assignment_changed` | A `RoleAssignment` was created, modified, or removed. |
+| `evidence_purged` | FORNX-319: a `RetentionClass::RawLocal` evidence row's payload was purged by the local retention sweep (`fornax-store::retention`) once its retention window elapsed. |
 | _(any other string)_ | Forward-compatibility catch-all. |
 
 This set is deliberately small and will grow additively as new
@@ -150,6 +151,7 @@ Same tagged-object shape as `AuditActor`:
 | `role_assignment` | A `RoleAssignment` row. |
 | `permission` | An abstract permission name being checked (not a stored row). |
 | `device` | A device identity. |
+| `evidence` | FORNX-319: an `evidence` row, identified by its id — the target of an `evidence_purged` action. |
 | `organization` | A `fornax-cloud` organization. |
 | _(any other string)_ | Forward-compatibility catch-all. |
 

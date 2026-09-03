@@ -4,8 +4,8 @@
 //! dependency.
 
 use fornax_types::{
-    AgentEvent, Claim, Evidence, EvidenceGraph, EvidenceLink, Finding, LegacyCapabilitiesWire,
-    MissingEvidence, RuntimeCapabilities,
+    AgentEvent, Claim, DatasetLineageTag, Evidence, EvidenceGraph, EvidenceLink, Finding,
+    LegacyCapabilitiesWire, MissingEvidence, RuntimeCapabilities, TenantRef,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
@@ -58,6 +58,44 @@ fn from_tag<T: serde::de::DeserializeOwned>(s: &str) -> Result<T> {
     ))?)
 }
 
+/// Shared insert body for a `dataset_lineage_tags` row, generic over
+/// `sqlx::Executor` so it can run against either the pool (`Store::
+/// record_lineage_tag`, e.g. from `retention`'s own tests) or an
+/// in-progress transaction (the four `insert_*` methods below, FORNX-319
+/// AC1 — the row and its lineage tag must commit or roll back together).
+pub(crate) async fn insert_lineage_tag_row<'e, E>(
+    executor: E,
+    record_table: &str,
+    record_id: &str,
+    tag: &DatasetLineageTag,
+) -> Result<()>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let retention_class_tag = match serde_json::to_value(&tag.retention_class)? {
+        serde_json::Value::String(s) => s,
+        other => other.to_string(),
+    };
+    sqlx::query(
+        "INSERT INTO dataset_lineage_tags
+            (id, record_table, record_id, schema_version, retention_class, tenant_ref,
+             source_record_ids, recorded_at, deletion_requested_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(record_table)
+    .bind(record_id)
+    .bind(tag.schema_version as i64)
+    .bind(retention_class_tag)
+    .bind(&tag.tenant_ref.0)
+    .bind(serde_json::to_string(&tag.source_record_ids)?)
+    .bind(&tag.recorded_at)
+    .bind(&tag.deletion_requested_at)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
 /// `<path>` with `suffix` appended to the file name, e.g.
 /// `append_ext("a/db.sqlite", "-wal")` -> `a/db.sqlite-wal` (SQLite's own
 /// naming convention for WAL-mode sidecar files, not a `.` extension).
@@ -100,7 +138,17 @@ impl Store {
         let opts = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
             .map_err(StoreError::Db)?
             .create_if_missing(true)
-            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            // FORNX-319: WAL mode still allows only one writer transaction
+            // at a time. Without a busy timeout, a live insert racing a
+            // retention-sweep batch's transaction gets an immediate
+            // `SQLITE_BUSY` error instead of waiting a bounded amount of
+            // time for the other writer to finish — exactly the failure
+            // mode AC4 ("does not measurably block a concurrent insert")
+            // must not produce. Each sweep batch is already bounded (see
+            // `retention::Store::sweep_expired_records`), so 5s is a
+            // generous ceiling, never the expected wait.
+            .busy_timeout(std::time::Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
             .max_connections(4)
             .connect_with(opts)
@@ -128,7 +176,17 @@ impl Store {
         Ok(Self { pool })
     }
 
+    /// Insert one `agent_events` row and, atomically in the same
+    /// transaction, its `dataset_lineage_tags` row (FORNX-319 AC1) — a
+    /// failed tag insert rolls back the event insert too, so AC1 ("every
+    /// row has a corresponding lineage tag") is never merely probabilistic.
+    /// No `tenant_id` column exists on `agent_events` itself (FORNX-103/106:
+    /// `TenantRef` stays schema-only locally) — `session_id` is used as this
+    /// local daemon's closest available tenant-scoping key; see
+    /// `retention::retention_class_for_table`'s doc comment for the same
+    /// choice applied uniformly across all four insert paths.
     pub async fn insert_event(&self, e: &AgentEvent) -> Result<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query(
             "INSERT INTO agent_events (id, session_id, provider, kind, observed_at, tool_name, tool_input, tool_response, raw)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -142,12 +200,21 @@ impl Store {
         .bind(e.tool_input.as_ref().map(|v| v.to_string()))
         .bind(e.tool_response.as_ref().map(|v| v.to_string()))
         .bind(e.raw.to_string())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        let lineage_tag = DatasetLineageTag::new(
+            retention::retention_class_for_table("agent_events"),
+            TenantRef(e.session_id.clone()),
+        );
+        insert_lineage_tag_row(&mut *tx, "agent_events", &e.id.to_string(), &lineage_tag).await?;
+        tx.commit().await?;
         Ok(())
     }
 
+    /// See [`Store::insert_event`]'s doc comment — same atomic
+    /// insert-plus-lineage-tag shape (FORNX-319 AC1).
     pub async fn insert_claim(&self, c: &Claim) -> Result<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query(
             "INSERT INTO claims (id, session_id, source_event_id, text, subject, claimed_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -158,11 +225,21 @@ impl Store {
         .bind(&c.text)
         .bind(&c.subject)
         .bind(&c.claimed_at)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        let lineage_tag = DatasetLineageTag::new(
+            retention::retention_class_for_table("claims"),
+            TenantRef(c.session_id.clone()),
+        );
+        insert_lineage_tag_row(&mut *tx, "claims", &c.id.to_string(), &lineage_tag).await?;
+        tx.commit().await?;
         Ok(())
     }
 
+    /// See [`Store::insert_event`]'s doc comment — same atomic
+    /// insert-plus-lineage-tag shape (FORNX-319 AC1). `ev.evidence_purged`
+    /// is always `false` for a freshly-collected row; a purge only ever
+    /// happens later, via [`retention::purge_evidence_payload`].
     pub async fn insert_evidence(&self, ev: &Evidence) -> Result<()> {
         let source = ev.source.as_ref().map(serde_json::to_string).transpose()?;
         let extension = ev
@@ -170,9 +247,10 @@ impl Store {
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query(
-            "INSERT INTO evidence (id, session_id, source_event_id, kind, observed_at, payload, provenance, source, extension)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO evidence (id, session_id, source_event_id, kind, observed_at, payload, provenance, source, extension, evidence_purged)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         )
         .bind(ev.id.to_string())
         .bind(&ev.session_id)
@@ -183,12 +261,35 @@ impl Store {
         .bind(&ev.provenance)
         .bind(source)
         .bind(extension)
-        .execute(&self.pool)
+        .bind(ev.evidence_purged)
+        .execute(&mut *tx)
         .await?;
+        let lineage_tag = DatasetLineageTag::new(
+            retention::retention_class_for_table("evidence"),
+            TenantRef(ev.session_id.clone()),
+        );
+        insert_lineage_tag_row(&mut *tx, "evidence", &ev.id.to_string(), &lineage_tag).await?;
+        tx.commit().await?;
         Ok(())
     }
 
+    /// See [`Store::insert_event`]'s doc comment — same atomic
+    /// insert-plus-lineage-tag shape (FORNX-319 AC1). `Finding` carries no
+    /// `session_id` of its own, unlike the other three record types — this
+    /// resolves it from the referenced `claims` row, inside the same
+    /// transaction, so the tenant scoping stays uniform across all four
+    /// insert paths without adding a column to `findings`. A `claim_id`
+    /// with no matching `claims` row (should not happen for a finding
+    /// produced by this crate's own verify pipeline) tags the finding under
+    /// an explicit orphaned-tenant marker rather than silently skipping the
+    /// tag or panicking.
     pub async fn insert_finding(&self, f: &Finding) -> Result<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let claim_session_id: Option<String> =
+            sqlx::query_scalar("SELECT session_id FROM claims WHERE id = ?1")
+                .bind(f.claim_id.to_string())
+                .fetch_optional(&mut *tx)
+                .await?;
         sqlx::query(
             "INSERT INTO findings (id, claim_id, verdict, evidence_ids, verifier_name, rationale, computed_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -200,8 +301,15 @@ impl Store {
         .bind(&f.verifier_name)
         .bind(&f.rationale)
         .bind(&f.computed_at)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        let tenant = TenantRef(
+            claim_session_id.unwrap_or_else(|| format!("orphaned-finding-claim-{}", f.claim_id)),
+        );
+        let lineage_tag =
+            DatasetLineageTag::new(retention::retention_class_for_table("findings"), tenant);
+        insert_lineage_tag_row(&mut *tx, "findings", &f.id.to_string(), &lineage_tag).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -311,7 +419,7 @@ impl Store {
     /// elsewhere still fails loudly per FORNX-158's original design.
     pub async fn evidence_for_session(&self, session_id: &str) -> Result<EvidenceReadOutcome> {
         let rows = sqlx::query_as::<_, EvidenceRow>(
-            "SELECT id, session_id, source_event_id, kind, observed_at, payload, provenance, source, extension
+            "SELECT id, session_id, source_event_id, kind, observed_at, payload, provenance, source, extension, evidence_purged
              FROM evidence WHERE session_id = ?1 ORDER BY observed_at ASC",
         )
         .bind(session_id)
@@ -556,6 +664,10 @@ struct EvidenceRow {
     /// `Evidence::extension == None` (see
     /// `migrations/0005_evidence_extension.sql`).
     extension: Option<String>,
+    /// `0` for any row written before FORNX-319's 0010 migration (the
+    /// column's `DEFAULT 0`) — reads back as `Evidence::evidence_purged ==
+    /// false`, the correct honest default for a row nothing has purged.
+    evidence_purged: bool,
 }
 
 impl TryFrom<EvidenceRow> for Evidence {
@@ -571,6 +683,7 @@ impl TryFrom<EvidenceRow> for Evidence {
             provenance: r.provenance,
             source: r.source.map(|s| serde_json::from_str(&s)).transpose()?,
             extension: r.extension.map(|s| serde_json::from_str(&s)).transpose()?,
+            evidence_purged: r.evidence_purged,
         })
     }
 }
@@ -862,6 +975,7 @@ mod tests {
                 derived_from: Vec::new(),
             }),
             extension: None,
+            evidence_purged: false,
         };
         store
             .insert_evidence(&evidence)
@@ -1443,6 +1557,7 @@ mod tests {
             provenance: "test".into(),
             source: None,
             extension: Some(extension),
+            evidence_purged: false,
         };
         store
             .insert_evidence(&evidence)
@@ -1501,6 +1616,7 @@ mod tests {
             provenance: "test".into(),
             source: None,
             extension: None,
+            evidence_purged: false,
         };
         store.insert_evidence(&good).await.expect("insert good row");
 
@@ -1568,6 +1684,7 @@ mod tests {
             provenance: "test".into(),
             source: None,
             extension: None,
+            evidence_purged: false,
         }
     }
 
