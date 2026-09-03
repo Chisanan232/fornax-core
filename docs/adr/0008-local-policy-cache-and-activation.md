@@ -266,6 +266,10 @@ turn this cache from a safety mechanism into a ticking outage timer for
 every device that uses it. The correct sequencing is: build a refresh
 transport first, then wire enforcement to consume these floors.
 
+**Closed by ADR-0010 (FORNX-311).** A background policy poll transport now
+exists; the refresh-transport prerequisite named above is satisfied.
+Enforcement wiring itself remains a separate, still-open future ticket.
+
 ## Consequences
 
 - Local policy state now survives a daemon restart and a period of offline
