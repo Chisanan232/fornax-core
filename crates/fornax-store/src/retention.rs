@@ -1143,6 +1143,26 @@ mod tests {
             );
         }
 
+        // AC1 also requires: no untagged rows exist in any of the four
+        // tables. A positive per-row check (above) can't catch a fifth
+        // insert path added later that forgets to tag — walk each table
+        // with a LEFT JOIN against dataset_lineage_tags instead.
+        for table in ["agent_events", "claims", "evidence", "findings"] {
+            let untagged: (i64,) = sqlx::query_as(&format!(
+                "SELECT COUNT(*) FROM {table} t \
+                 LEFT JOIN dataset_lineage_tags d \
+                 ON d.record_table = '{table}' AND d.record_id = t.id \
+                 WHERE d.record_id IS NULL"
+            ))
+            .fetch_one(&store.pool)
+            .await
+            .unwrap_or_else(|e| panic!("count untagged rows in {table}: {e}"));
+            assert_eq!(
+                untagged.0, 0,
+                "{table} must have zero untagged rows after live-path inserts"
+            );
+        }
+
         std::fs::remove_file(&path).ok();
     }
 
@@ -1228,6 +1248,27 @@ mod tests {
             .expect("query finding before sweep")
             .expect("finding exists before sweep");
 
+        // AC2: a pre-existing, unrelated audit event must survive the
+        // sweep-driven purge byte-for-byte, and the chain must extend
+        // (not fork/corrupt) when the sweep appends its own event.
+        let sentinel = fornax_types::audit::AuditEvent::new(
+            "pre-existing-unrelated-event",
+            "2026-09-03T00:00:00Z",
+            fornax_types::audit::AuditActor::Device {
+                actor_id: "device-sentinel".to_string(),
+            },
+            fornax_types::audit::AuditAction::PermissionCheck,
+            fornax_types::audit::AuditTarget::Permission {
+                target_id: "perm-sentinel".to_string(),
+            },
+            fornax_types::audit::AuditOutcome::Granted,
+            fornax_types::audit::AuditExportClass::Metadata,
+        );
+        let sentinel_appended = store
+            .append_audit_event(&sentinel, Utc::now())
+            .await
+            .expect("append sentinel audit event");
+
         let report = store
             .sweep_expired_records(Utc::now(), None, 100)
             .await
@@ -1264,17 +1305,30 @@ mod tests {
         // FORNX-319/FORNX-315: the sweep-driven purge must have emitted an
         // EvidencePurged audit event too, after tx committed.
         let audit_events = store.audit_events().await.expect("read audit ledger");
-        assert_eq!(audit_events.len(), 1);
+        assert_eq!(audit_events.len(), 2);
         assert_eq!(
-            audit_events[0].event.action,
+            audit_events[0].event, sentinel,
+            "the pre-existing sentinel event must survive the purge unchanged"
+        );
+        assert_eq!(audit_events[0].seq, sentinel_appended.seq);
+        assert_eq!(audit_events[0].entry_hash, sentinel_appended.entry_hash);
+        assert_eq!(
+            audit_events[1].event.action,
             fornax_types::audit::AuditAction::EvidencePurged
         );
         assert_eq!(
-            audit_events[0].event.target,
+            audit_events[1].event.target,
             fornax_types::audit::AuditTarget::Evidence {
                 target_id: evidence.id.to_string()
             }
         );
+
+        // The sweep's append must extend the chain, not fork or corrupt it.
+        let chain_state = store
+            .verify_audit_chain()
+            .await
+            .expect("verify audit chain");
+        assert_eq!(chain_state, crate::ChainVerification::Valid);
 
         let remaining_tag_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM dataset_lineage_tags WHERE record_table = 'evidence' AND record_id = ?1",
