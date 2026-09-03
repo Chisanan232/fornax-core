@@ -151,12 +151,37 @@ impl HighWaterRow {
     }
 }
 
+/// `policy_cache_generation_members` rows for one generation, unjoined --
+/// this is the authoritative member list. Used alongside the `JOIN` below to
+/// detect a dangling member reference (a member row whose `bundle_id`/
+/// `payload_digest` no longer resolves to a stored bundle row) that an
+/// `INNER JOIN` alone would silently drop instead of surfacing as corrupt.
+/// This can only arise from direct database tampering/corruption --
+/// `Store::submit_policy_bundle` always writes the bundle row before the
+/// member row, in the same transaction -- but a generation must still never
+/// be served as if that member simply didn't exist (see this module's doc
+/// comment: "a generation is never served partially loaded").
+#[derive(sqlx::FromRow)]
+struct RawMemberRow {
+    policy_id: String,
+    bundle_id: String,
+    payload_digest: String,
+}
+
 async fn load_generation(conn: &mut SqliteConnection, generation: i64) -> Result<CacheGeneration> {
     let row = sqlx::query_as::<_, GenerationRow>(
         "SELECT written_at FROM policy_cache_generations WHERE generation = ?1",
     )
     .bind(generation)
     .fetch_one(&mut *conn)
+    .await?;
+
+    let raw_rows = sqlx::query_as::<_, RawMemberRow>(
+        "SELECT policy_id, bundle_id, payload_digest FROM policy_cache_generation_members
+         WHERE generation = ?1 ORDER BY policy_id ASC",
+    )
+    .bind(generation)
+    .fetch_all(&mut *conn)
     .await?;
 
     let member_rows = sqlx::query_as::<_, MemberRow>(
@@ -173,9 +198,49 @@ async fn load_generation(conn: &mut SqliteConnection, generation: i64) -> Result
     .fetch_all(&mut *conn)
     .await?;
 
-    let mut members = Vec::with_capacity(member_rows.len());
-    for row in member_rows {
-        members.push(row.into_cached_bundle_ref()?);
+    let mut resolved: std::collections::HashMap<(String, String), MemberRow> = member_rows
+        .into_iter()
+        .map(|r| ((r.bundle_id.clone(), r.payload_digest.clone()), r))
+        .collect();
+
+    let mut members = Vec::with_capacity(raw_rows.len());
+    for raw in raw_rows {
+        let key = (raw.bundle_id.clone(), raw.payload_digest.clone());
+        match resolved.remove(&key) {
+            Some(resolved_row) => members.push(resolved_row.into_cached_bundle_ref()?),
+            None => {
+                // Dangling reference: no bundle row for this member. Stand
+                // in a ref carrying only the fields we actually have --
+                // `bundle_id`/`payload_digest` are correct, so
+                // `try_generation_usable`'s own envelope lookup by those two
+                // keys will correctly find nothing and reject this member
+                // (and therefore the whole generation) exactly as it would
+                // for a member whose envelope bytes went missing any other
+                // way. The remaining fields are placeholders, never read on
+                // this path.
+                members.push(CachedBundleRef {
+                    bundle_id: Uuid::parse_str(&raw.bundle_id)
+                        .map_err(|e| StoreError::PolicyCacheCorrupt(e.to_string()))?,
+                    issuer: String::new(),
+                    sequence: 0,
+                    policy_id: PolicyId(
+                        Uuid::parse_str(&raw.policy_id)
+                            .map_err(|e| StoreError::PolicyCacheCorrupt(e.to_string()))?,
+                    ),
+                    revision: 0,
+                    revision_digest: from_tag::<RevisionDigest>(&format!(
+                        "sha256:{}",
+                        "0".repeat(64)
+                    ))?,
+                    payload_digest: from_tag::<PayloadDigest>(&raw.payload_digest)?,
+                    verified_by: KeyId(String::new()),
+                    not_before: DateTime::<Utc>::UNIX_EPOCH,
+                    expires_at: DateTime::<Utc>::UNIX_EPOCH,
+                    first_activated_at: DateTime::<Utc>::UNIX_EPOCH,
+                    confirmed_at: DateTime::<Utc>::UNIX_EPOCH,
+                });
+            }
+        }
     }
 
     Ok(CacheGeneration {
@@ -698,19 +763,34 @@ mod tests {
         ed25519_dalek::SigningKey::from_bytes(&TEST_SEED)
     }
 
-    fn trust_store(key_id: &str, sk: &ed25519_dalek::SigningKey) -> TrustedVerificationKeys {
+    fn trust_key(
+        key_id: &str,
+        sk: &ed25519_dalek::SigningKey,
+        not_after: Option<&str>,
+    ) -> fornax_types::policy::TrustedKey {
         use base64::engine::general_purpose::STANDARD;
         use base64::Engine;
+        fornax_types::policy::TrustedKey {
+            key_id: KeyId(key_id.to_string()),
+            algorithm: SignatureAlgorithm::Ed25519,
+            public_key_b64: STANDARD.encode(sk.verifying_key().to_bytes()),
+            not_before: None,
+            not_after: not_after.map(str::to_string),
+            comment: None,
+        }
+    }
+
+    fn trust_store(key_id: &str, sk: &ed25519_dalek::SigningKey) -> TrustedVerificationKeys {
         TrustedVerificationKeys {
             schema_version: 1,
-            keys: vec![fornax_types::policy::TrustedKey {
-                key_id: KeyId(key_id.to_string()),
-                algorithm: SignatureAlgorithm::Ed25519,
-                public_key_b64: STANDARD.encode(sk.verifying_key().to_bytes()),
-                not_before: None,
-                not_after: None,
-                comment: None,
-            }],
+            keys: vec![trust_key(key_id, sk, None)],
+        }
+    }
+
+    fn trust_store_multi(keys: Vec<fornax_types::policy::TrustedKey>) -> TrustedVerificationKeys {
+        TrustedVerificationKeys {
+            schema_version: 1,
+            keys,
         }
     }
 
@@ -995,21 +1075,24 @@ mod tests {
             ActivationOutcome::Activated { generation: 2, .. }
         ));
 
-        // At reload time, k1 is no longer trusted at all (trust store only
-        // has k2) -- generation 2's own member (signed by k2) is fine, but
-        // this simulates the case where the CURRENT active generation's
-        // member becomes unverifiable (k2 retired), falling back to LKG
-        // (generation 1, signed by k1, which the reload trust store here
-        // must still trust).
-        let trust_only_k1 = trust_store("k1", &sk1);
+        // At reload time, k2 is still *present* in the trust store but its
+        // `not_after` has lapsed -- this is retirement (`BundleRejection::
+        // KeyRetired`), a distinct code path from `k2` being altogether
+        // absent (`UnknownKeyId`). `k1` remains valid (no `not_after`), so
+        // the reload must fall back to LKG (generation 1, signed by k1) and
+        // that fallback must succeed against this same trust store.
+        let trust_k1_valid_k2_retired = trust_store_multi(vec![
+            trust_key("k1", &sk1, None),
+            trust_key("k2", &sk2, Some("2025-12-01T00:00:00Z")),
+        ]);
         let load = store
-            .load_policy_cache(Some(&trust_only_k1), now())
+            .load_policy_cache(Some(&trust_k1_valid_k2_retired), now())
             .await
             .expect("load policy cache");
         assert_eq!(
             load.loaded_slot,
             Some(CacheSlotKind::LastKnownGood),
-            "generation 2 (signed by now-untrusted k2) must be unusable, falling back to LKG"
+            "generation 2 (signed by now-retired k2) must be unusable, falling back to LKG"
         );
         assert_eq!(load.usable.len(), 1);
 
@@ -1104,15 +1187,25 @@ mod tests {
         sqlx::query("COMMIT").execute(&mut *conn).await.unwrap();
         drop(conn);
 
+        // Trust both k1 and k2 at reload so the fallback to LKG (generation
+        // 1, signed by k1) is not itself blocked by a missing key -- this
+        // isolates the assertion to "one unusable member rejects the whole
+        // generation", not "the reload trust store happens to be too narrow".
+        let trust_both = trust_store_multi(vec![
+            trust_key("k1", &sk1, None),
+            trust_key("k2", &sk2, None),
+        ]);
         let load = store
-            .load_policy_cache(Some(&trust2), now())
+            .load_policy_cache(Some(&trust_both), now())
             .await
             .expect("load policy cache");
-        assert_ne!(
+        assert_eq!(
             load.loaded_slot,
-            Some(CacheSlotKind::Active),
-            "a generation with one unusable member must never be served"
+            Some(CacheSlotKind::LastKnownGood),
+            "a generation with one unusable member must never be served -- \
+             must fall back to LKG (generation 1), not merely avoid Active"
         );
+        assert_eq!(load.usable.len(), 1);
 
         std::fs::remove_file(&path).ok();
     }
