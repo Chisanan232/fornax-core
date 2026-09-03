@@ -26,6 +26,7 @@
 //! - **Diagnostics** ([`diagnostics::PolicyDiagnostic`]) are actionable:
 //!   every one carries a non-empty `message` and `remediation`.
 
+mod action_classification;
 mod content;
 mod diagnostics;
 mod local;
@@ -33,6 +34,7 @@ mod resolve;
 mod revision;
 mod target;
 
+pub use action_classification::classify_action_class;
 pub use content::{
     ActionClass, CacheScope, CollectionScope, EgressContentClass, EgressScope, EnforcementOutcome,
     EnforcementRule, EnforcementScope, PolicyContent, RedactionProfile, ResolvedValues, RiskClass,
