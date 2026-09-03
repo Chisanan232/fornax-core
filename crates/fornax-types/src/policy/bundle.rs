@@ -304,10 +304,360 @@ pub enum TrustStoreError {
     Empty,
 }
 
+/// Exhaustive rejection vocabulary for [`verify_bundle`]. Every variant
+/// names exactly one failure mode in the evaluation order documented on
+/// [`verify_bundle`] itself.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum BundleRejection {
+    #[error("envelope is malformed: {detail}")]
+    MalformedEnvelope { detail: String },
+    #[error("bundle_schema_version {found} is not supported (supported: {supported:?})")]
+    UnsupportedBundleSchemaVersion { found: u32, supported: Vec<u32> },
+    #[error("envelope bundle_schema_version {envelope} does not match payload's {payload}")]
+    SchemaVersionMismatch { envelope: u32, payload: u32 },
+    #[error("payload_b64 is not valid strict-canonical base64: {detail}")]
+    MalformedPayloadEncoding { detail: String },
+    #[error("payload is {found} bytes, exceeding the {max}-byte limit")]
+    PayloadTooLarge { found: usize, max: usize },
+    #[error("bundle carries no signatures")]
+    NoSignatures,
+    #[error("bundle carries {found} signatures, exceeding the {max} limit")]
+    TooManySignatures { found: usize, max: usize },
+    #[error("no signature names a key_id present in the trust store: offered {offered:?}")]
+    UnknownKeyId { offered: Vec<KeyId> },
+    #[error("key {key_id:?} uses unsupported algorithm {algorithm:?}")]
+    UnsupportedAlgorithm {
+        key_id: KeyId,
+        algorithm: SignatureAlgorithm,
+    },
+    #[error("signature for key {key_id:?} is malformed")]
+    MalformedSignature { key_id: KeyId },
+    #[error("key {key_id:?} is not yet valid: not_before={not_before}, now={now}")]
+    KeyNotYetValid {
+        key_id: KeyId,
+        not_before: String,
+        now: DateTime<Utc>,
+    },
+    #[error("key {key_id:?} has been retired: not_after={not_after}, now={now}")]
+    KeyRetired {
+        key_id: KeyId,
+        not_after: String,
+        now: DateTime<Utc>,
+    },
+    #[error("signature is invalid for trusted, current key(s): {key_ids:?}")]
+    SignatureInvalid { key_ids: Vec<KeyId> },
+    #[error("payload is malformed: {detail}")]
+    MalformedPayload { detail: String },
+    #[error("field {field} has a malformed timestamp: {value:?}")]
+    MalformedTimestamp { field: &'static str, value: String },
+    #[error("bundle not yet valid: not_before={not_before}, now={now}, tolerance_seconds={tolerance_seconds}")]
+    BundleNotYetValid {
+        not_before: String,
+        now: DateTime<Utc>,
+        tolerance_seconds: i64,
+    },
+    #[error("bundle expired: expires_at={expires_at}, now={now}")]
+    BundleExpired {
+        expires_at: String,
+        now: DateTime<Utc>,
+    },
+    #[error("binding {binding_id} references digest {expected}, but the bundle's revision digest is {actual}")]
+    BindingRevisionMismatch {
+        binding_id: Uuid,
+        expected: String,
+        actual: String,
+    },
+}
+
 fn decode_verifying_key(key: &TrustedKey) -> Result<VerifyingKey, ()> {
     let bytes = strict_base64()
         .decode(&key.public_key_b64)
         .map_err(|_| ())?;
     let arr: [u8; 32] = bytes.try_into().map_err(|_| ())?;
     VerifyingKey::from_bytes(&arr).map_err(|_| ())
+}
+
+/// Records `reason` only if no reason has been recorded yet, so the
+/// eventual "nothing verified" error is deterministic (the *first*
+/// known-but-unusable key's reason) rather than depending on iteration
+/// order surfacing whichever reason happened to be evaluated last.
+fn record_skip(slot: &mut Option<BundleRejection>, reason: BundleRejection) {
+    if slot.is_none() {
+        *slot = Some(reason);
+    }
+}
+
+fn parse_rfc3339(field: &'static str, value: &str) -> Result<DateTime<Utc>, BundleRejection> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|_| BundleRejection::MalformedTimestamp {
+            field,
+            value: value.to_string(),
+        })
+}
+
+/// See module docs for the trust-boundary/domain-separation/verify-then-parse
+/// invariants. Evaluation order (normative — signature-before-semantics):
+///
+/// 1. Parse envelope.
+/// 2. Check `bundle_schema_version` is supported.
+/// 3. Check `1..=MAX_SIGNATURES` signatures are present.
+/// 4. Strict-decode `payload_b64`, enforcing [`MAX_PAYLOAD_BYTES`].
+/// 5. For each signature, in order: look up `key_id` in the trust store;
+///    check the key's own validity window against `now` (never against the
+///    bundle's unauthenticated `issued_at`); check algorithm; decode
+///    signature bytes; `verify_strict` over `BUNDLE_SIGNING_DOMAIN ‖
+///    payload_bytes`. First success wins (threshold 1) — the loop always
+///    runs to completion (or to the first success) rather than returning on
+///    the first unusable signature, so an out-of-window or otherwise
+///    unusable key earlier in the list can never mask a later signature
+///    that verifies against a different, currently-valid key. This is what
+///    makes D4 rotation work: a bundle signed by both an outgoing key past
+///    its `not_after` and an incoming key still verifies via the incoming
+///    key regardless of which signature appears first.
+/// 6. Parse `payload_bytes` into [`BundlePayload`] (subsumes the inner
+///    revision's own digest-mismatch rejection via its `TryFrom`).
+/// 7. Check `payload.bundle_schema_version == envelope`'s.
+/// 8. Parse timestamps.
+/// 9. Window check: `not_before` gets [`CLOCK_SKEW_TOLERANCE_SECONDS`] of
+///    grace; `expires_at` gets none — this asymmetry is deliberate, see
+///    module docs and `docs/adr/0007-signed-policy-bundles.md`.
+/// 10. Every binding's `revision_ref.digest` must equal the revision's own
+///     digest.
+/// 11. Construct [`VerifiedPolicyBundle`].
+pub fn verify_bundle(
+    envelope_bytes: &[u8],
+    trusted: &TrustedVerificationKeys,
+    now: DateTime<Utc>,
+) -> Result<VerifiedPolicyBundle, BundleRejection> {
+    // 1. Parse envelope.
+    let envelope: SignedPolicyBundle =
+        serde_json::from_slice(envelope_bytes).map_err(|e| BundleRejection::MalformedEnvelope {
+            detail: e.to_string(),
+        })?;
+
+    // 2. Schema version supported.
+    if !SUPPORTED_BUNDLE_SCHEMA_VERSIONS.contains(&envelope.bundle_schema_version) {
+        return Err(BundleRejection::UnsupportedBundleSchemaVersion {
+            found: envelope.bundle_schema_version,
+            supported: SUPPORTED_BUNDLE_SCHEMA_VERSIONS.to_vec(),
+        });
+    }
+
+    // 3. Signature count bounds.
+    if envelope.signatures.is_empty() {
+        return Err(BundleRejection::NoSignatures);
+    }
+    if envelope.signatures.len() > MAX_SIGNATURES {
+        return Err(BundleRejection::TooManySignatures {
+            found: envelope.signatures.len(),
+            max: MAX_SIGNATURES,
+        });
+    }
+
+    // 4. Strict-decode payload, bound size.
+    let payload_bytes = strict_base64().decode(&envelope.payload_b64).map_err(|e| {
+        BundleRejection::MalformedPayloadEncoding {
+            detail: e.to_string(),
+        }
+    })?;
+    if payload_bytes.len() > MAX_PAYLOAD_BYTES {
+        return Err(BundleRejection::PayloadTooLarge {
+            found: payload_bytes.len(),
+            max: MAX_PAYLOAD_BYTES,
+        });
+    }
+
+    // 5. Per-signature verification, first success wins (threshold 1). A
+    // known key_id that turns out unusable for some reason (out of its
+    // validity window, an algorithm mismatch, malformed key/signature
+    // material) never aborts the loop early -- a later signature in the
+    // same bundle may still verify against a *different*, currently-valid
+    // trusted key. This is exactly the D4 rotation case: an old key past
+    // its `not_after` alongside a new key that is still valid must still
+    // verify via the new key. Only the first such reason is kept
+    // (`first_skip_reason`), for a deterministic error in the rarer case
+    // nothing ultimately verifies.
+    let mut signed_message = Vec::with_capacity(BUNDLE_SIGNING_DOMAIN.len() + payload_bytes.len());
+    signed_message.extend_from_slice(BUNDLE_SIGNING_DOMAIN);
+    signed_message.extend_from_slice(&payload_bytes);
+
+    let mut offered_key_ids: Vec<KeyId> = Vec::new();
+    let mut trusted_current_but_failed: Vec<KeyId> = Vec::new();
+    let mut first_skip_reason: Option<BundleRejection> = None;
+    let mut verified_by: Option<KeyId> = None;
+
+    for sig_entry in &envelope.signatures {
+        offered_key_ids.push(sig_entry.key_id.clone());
+
+        let Some(trusted_key) = trusted.get(&sig_entry.key_id) else {
+            continue;
+        };
+
+        if let Some(not_before) = &trusted_key.not_before {
+            match parse_rfc3339("trusted_key.not_before", not_before) {
+                Ok(nb) if now < nb => {
+                    record_skip(
+                        &mut first_skip_reason,
+                        BundleRejection::KeyNotYetValid {
+                            key_id: sig_entry.key_id.clone(),
+                            not_before: not_before.clone(),
+                            now,
+                        },
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    record_skip(&mut first_skip_reason, e);
+                    continue;
+                }
+                Ok(_) => {}
+            }
+        }
+        if let Some(not_after) = &trusted_key.not_after {
+            match parse_rfc3339("trusted_key.not_after", not_after) {
+                Ok(na) if now > na => {
+                    record_skip(
+                        &mut first_skip_reason,
+                        BundleRejection::KeyRetired {
+                            key_id: sig_entry.key_id.clone(),
+                            not_after: not_after.clone(),
+                            now,
+                        },
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    record_skip(&mut first_skip_reason, e);
+                    continue;
+                }
+                Ok(_) => {}
+            }
+        }
+
+        if !matches!(sig_entry.algorithm, SignatureAlgorithm::Ed25519)
+            || !matches!(trusted_key.algorithm, SignatureAlgorithm::Ed25519)
+        {
+            record_skip(
+                &mut first_skip_reason,
+                BundleRejection::UnsupportedAlgorithm {
+                    key_id: sig_entry.key_id.clone(),
+                    algorithm: sig_entry.algorithm.clone(),
+                },
+            );
+            continue;
+        }
+
+        let Ok(verifying_key) = decode_verifying_key(trusted_key) else {
+            record_skip(
+                &mut first_skip_reason,
+                BundleRejection::MalformedSignature {
+                    key_id: sig_entry.key_id.clone(),
+                },
+            );
+            continue;
+        };
+
+        let Ok(sig_bytes) = strict_base64().decode(&sig_entry.signature_b64) else {
+            record_skip(
+                &mut first_skip_reason,
+                BundleRejection::MalformedSignature {
+                    key_id: sig_entry.key_id.clone(),
+                },
+            );
+            continue;
+        };
+        let Ok(sig_arr) = <[u8; 64]>::try_from(sig_bytes) else {
+            record_skip(
+                &mut first_skip_reason,
+                BundleRejection::MalformedSignature {
+                    key_id: sig_entry.key_id.clone(),
+                },
+            );
+            continue;
+        };
+        let signature = Signature::from_bytes(&sig_arr);
+
+        match verifying_key.verify_strict(&signed_message, &signature) {
+            Ok(()) => {
+                verified_by = Some(sig_entry.key_id.clone());
+                break;
+            }
+            Err(_) => trusted_current_but_failed.push(sig_entry.key_id.clone()),
+        }
+    }
+
+    let verified_by = if let Some(k) = verified_by {
+        k
+    } else if !trusted_current_but_failed.is_empty() {
+        // Tampering (a trusted, currently-valid key whose signature simply
+        // doesn't check out) outranks a mere configuration problem
+        // elsewhere in the signature list.
+        return Err(BundleRejection::SignatureInvalid {
+            key_ids: trusted_current_but_failed,
+        });
+    } else if let Some(reason) = first_skip_reason {
+        return Err(reason);
+    } else {
+        return Err(BundleRejection::UnknownKeyId {
+            offered: offered_key_ids,
+        });
+    };
+
+    // 6. Parse payload (only now, post-authentication).
+    let payload: BundlePayload =
+        serde_json::from_slice(&payload_bytes).map_err(|e| BundleRejection::MalformedPayload {
+            detail: e.to_string(),
+        })?;
+
+    // 7. Schema version cross-check.
+    if payload.bundle_schema_version != envelope.bundle_schema_version {
+        return Err(BundleRejection::SchemaVersionMismatch {
+            envelope: envelope.bundle_schema_version,
+            payload: payload.bundle_schema_version,
+        });
+    }
+
+    // 8. Parse timestamps.
+    let not_before = parse_rfc3339("not_before", &payload.not_before)?;
+    let expires_at = parse_rfc3339("expires_at", &payload.expires_at)?;
+    // issued_at is parsed for validation shape only; it is not otherwise
+    // authenticated or trusted for any decision here.
+    parse_rfc3339("issued_at", &payload.issued_at)?;
+
+    // 9. Window check -- asymmetric clock skew (see module docs).
+    if now < not_before - chrono::Duration::seconds(CLOCK_SKEW_TOLERANCE_SECONDS) {
+        return Err(BundleRejection::BundleNotYetValid {
+            not_before: payload.not_before.clone(),
+            now,
+            tolerance_seconds: CLOCK_SKEW_TOLERANCE_SECONDS,
+        });
+    }
+    if now > expires_at {
+        return Err(BundleRejection::BundleExpired {
+            expires_at: payload.expires_at.clone(),
+            now,
+        });
+    }
+
+    // 10. Binding digests must match the bundle's revision digest.
+    let revision_digest = payload.revision.digest().as_str().to_string();
+    for binding in &payload.bindings {
+        let expected = binding.revision_ref.digest.as_str();
+        if expected != revision_digest {
+            return Err(BundleRejection::BindingRevisionMismatch {
+                binding_id: binding.binding_id,
+                expected: expected.to_string(),
+                actual: revision_digest,
+            });
+        }
+    }
+
+    // 11. Construct.
+    let payload_digest = digest_payload_bytes(&payload_bytes);
+    Ok(VerifiedPolicyBundle {
+        payload,
+        verified_by,
+        payload_digest,
+    })
 }
