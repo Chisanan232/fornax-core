@@ -398,7 +398,14 @@ pub fn verify_audit_checkpoint(
         }
     }
 
-    let payload: AuditCheckpointPayload = serde_json::from_value(payload_value).map_err(|e| {
+    // Typed parse comes from `payload_bytes` directly, NOT from
+    // `payload_value` -- `serde_json::Value`'s `Map::insert` silently keeps
+    // only the last occurrence of a repeated key, which would mask a
+    // duplicate-field payload that `serde_json::from_slice`'s derived
+    // struct visitor correctly rejects (`duplicate field "x"`). The `Value`
+    // parse above exists solely for the key-PRESENCE check; it must never
+    // become the source of the typed value.
+    let payload: AuditCheckpointPayload = serde_json::from_slice(&payload_bytes).map_err(|e| {
         CheckpointRejection::MalformedPayload {
             detail: e.to_string(),
         }
@@ -824,6 +831,40 @@ mod tests {
                 key: "divergence_kind"
             }
         ));
+    }
+
+    /// Regression: the §3.3 key-presence check parses the payload bytes
+    /// into a `serde_json::Value` first, whose `Map::insert` would
+    /// silently collapse a REPEATED field to its last occurrence if the
+    /// typed parse were ever performed from that `Value` rather than from
+    /// the original bytes -- masking a duplicate-field payload that
+    /// `serde_json`'s derived struct visitor otherwise correctly rejects.
+    /// Hand-built JSON text (not `serde_json::json!`, which cannot express
+    /// a literal duplicate key) proves the typed parse still runs against
+    /// the raw bytes.
+    #[test]
+    fn duplicate_checkpoint_seq_key_in_raw_bytes_is_still_rejected() {
+        let key = signing_key(25);
+        let trusted = trust_store("k1", &key);
+        let payload_text = r#"{
+            "checkpoint_schema_version":1,
+            "issuer":"fornax-cloud:org-1",
+            "device_id":"device-1",
+            "checkpoint_seq":1,
+            "checkpoint_seq":99,
+            "issued_at":"2026-09-03T12:00:05Z",
+            "observed_at":"2026-09-03T12:00:00Z",
+            "head":{"ledger_seq":5,"entry_hash":"sha256:e967d0e31e6afd2a3a0f5bd805e39f85eb0eeb4e176e88e0e65d3c26a1cba464"},
+            "device_reported_chain_status":{"status":"valid","first_bad_ledger_seq":null,"divergence_kind":null},
+            "prev_checkpoint":null
+        }"#;
+        let payload_bytes = payload_text.as_bytes().to_vec();
+        let envelope_bytes = envelope_json("k1", &key, &payload_bytes);
+        let err = verify_audit_checkpoint(&envelope_bytes, &trusted, now()).unwrap_err();
+        assert!(
+            matches!(err, CheckpointRejection::MalformedPayload { ref detail } if detail.contains("duplicate field")),
+            "a duplicate checkpoint_seq key must still be rejected as a malformed payload, got: {err}"
+        );
     }
 
     #[test]
