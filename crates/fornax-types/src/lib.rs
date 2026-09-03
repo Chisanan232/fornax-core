@@ -49,13 +49,18 @@ pub use graph::{
     DEFAULT_EXIT_CODE_FRESHNESS_SECONDS,
 };
 pub use policy::{
-    classify_action_class, resolve, ActionClass, BoundRevision, CacheScope, CollectionScope,
-    DeviceContext, DiagnosticCode, DiagnosticSeverity, EgressContentClass, EgressScope,
-    EnforcementOutcome, EnforcementRule, EnforcementScope, FieldProvenance, OsFamily,
-    PolicyBinding, PolicyContent, PolicyDiagnostic, PolicyDraft, PolicyFieldId, PolicyId,
-    PolicyRevisionBody, PolicyRevisionRef, PolicyValidationReport, PublishedPolicyRevision,
-    RedactionProfile, ResolvedPolicy, ResolvedValues, RevisionDigest, RiskClass, RiskClassSeconds,
-    SensorScope, TargetLevel, TargetScope, TargetSelector, VerdictOutcomes, POLICY_SCHEMA_VERSION,
+    classify_action_class, effective_outcome, evaluate_activation, freshness, member_freshness,
+    resolve, resolve_trust_store, staleness_floor, verify_bundle, ActionClass, ActivationDecision,
+    ActivationOutcome, ActivationRejection, BoundRevision, BundleRejection, CacheGeneration,
+    CacheScope, CacheSlotKind, CachedBundleRef, CollectionScope, DeviceContext, DiagnosticCode,
+    DiagnosticSeverity, EffectivePolicy, EgressContentClass, EgressScope, EnforcementOutcome,
+    EnforcementRule, EnforcementScope, FieldProvenance, FreshnessTier, KeyId, MemberFreshness,
+    OsFamily, PayloadDigest, PolicyBinding, PolicyCacheState, PolicyContent, PolicyDiagnostic,
+    PolicyDraft, PolicyFieldId, PolicyFreshness, PolicyId, PolicyRevisionBody, PolicyRevisionRef,
+    PolicyValidationReport, PublishedPolicyRevision, RedactionProfile, ResolvedPolicy,
+    ResolvedValues, RevisionDigest, RiskClass, RiskClassSeconds, RiskClassTiers, SensorScope,
+    SequenceHighWater, TargetLevel, TargetScope, TargetSelector, TrustedVerificationKeys,
+    VerdictOutcomes, VerifiedPolicyBundle, POLICY_CACHE_SCHEMA_VERSION, POLICY_SCHEMA_VERSION,
     SUPPORTED_POLICY_SCHEMA_VERSIONS,
 };
 pub use reliability_context::{

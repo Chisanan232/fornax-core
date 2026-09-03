@@ -46,6 +46,18 @@ pub enum DiagnosticCode {
     RequiredSignalUnavailable,
     UnrecognizedEnvValue,
     NoApplicablePolicy,
+    // -- FORNX-119 local policy cache -- additive only. This enum is
+    // closed (no `Unrecognized` tail), so a cross-repo consumer (e.g.
+    // fornax-cloud's authoring UI) built against a prior version of this
+    // enum must be updated to handle these new variants; see
+    // docs/adr/0008-local-policy-cache-and-activation.md.
+    PolicyCacheStale,
+    PolicyCacheExpired,
+    PolicyCacheUnverifiable,
+    PolicyCacheUnavailable,
+    PolicyRollbackRejected,
+    PolicyIssuerMismatch,
+    TrustStoreUnavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
