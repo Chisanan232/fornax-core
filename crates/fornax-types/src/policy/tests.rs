@@ -1,5 +1,6 @@
 //! FORNX-116 acceptance-test scenarios (T1-T27, see
-//! `docs/adr/0006-policy-as-data.md`).
+//! `docs/adr/0006-policy-as-data.md`), plus a FORNX-121 section proving the
+//! enforcement outcome computation end-to-end from real classified actions.
 
 use std::collections::BTreeSet;
 
@@ -1105,5 +1106,89 @@ fn end_to_end_classification_and_resolved_policy_agree_on_enforcement_outcome() 
             .values
             .enforcement_outcome_for(&unmapped_action, Verdict::Contradicted),
         EnforcementOutcome::ObserveOnly
+    );
+}
+
+/// AC: "Unit tests cover combinations of risk class, verdict, missing
+/// capability, and stale/offline policy." A binding whose `TargetSelector`
+/// requires a signal the device's declared `RuntimeCapabilities` doesn't
+/// report never matches (`RequiredSignalUnavailable`) -- its enforcement
+/// rules never apply, and `enforcement_outcome_for` reads the baseline
+/// `ObserveOnly` floor even though the org intended to `Block`. This is a
+/// deliberate consequence of resolve()'s existing selector-matching
+/// contract (never a new behavior introduced here); this test exists so
+/// the enforcement-specific instance of it is pinned explicitly, not left
+/// as an emergent property only covered indirectly by
+/// `required_signal_unavailable_prevents_a_match_and_emits_a_warning`.
+#[test]
+fn missing_required_capability_falls_back_to_baseline_observe_only_not_the_intended_block() {
+    let mut content = empty_content();
+    content.enforcement.rules = Some(vec![EnforcementRule {
+        action_class: ActionClass::InfrastructureMutation,
+        risk_class: RiskClass::Critical,
+        outcomes: VerdictOutcomes::uniform(EnforcementOutcome::Block),
+    }]);
+    let rev = published(content);
+    let mut binding = org_binding("org-1", &rev);
+    binding.selector = TargetSelector {
+        providers: None,
+        os_families: None,
+        requires_signals: Some(vec![SignalClass::ReasoningSummary]),
+    };
+    let items = vec![bound(binding, rev)];
+
+    let mut ctx = device_ctx();
+    ctx.capabilities = empty_capabilities(); // this device never declared ReasoningSummary
+    let (resolved, diagnostics) = resolve(&items, &ctx);
+
+    assert!(diagnostics
+        .iter()
+        .any(|d| d.code == DiagnosticCode::RequiredSignalUnavailable));
+    assert_eq!(
+        resolved
+            .values
+            .enforcement_outcome_for(&ActionClass::InfrastructureMutation, Verdict::Contradicted),
+        EnforcementOutcome::ObserveOnly,
+        "an org's Block rule must never silently apply when its own required capability is missing"
+    );
+
+    // Same rule, same action_class, on a device that DOES declare the
+    // required signal: the binding matches and the intended Block applies.
+    let mut ctx_with_signal = device_ctx();
+    ctx_with_signal.capabilities = RuntimeCapabilities {
+        schema_version: crate::CAPABILITY_SCHEMA_VERSION,
+        provider: Provider::ClaudeCode,
+        signals: vec![crate::CapabilitySignal {
+            class: SignalClass::ReasoningSummary,
+            state: crate::SignalAvailability::Available,
+            detail: None,
+        }],
+        notes: std::collections::HashMap::new(),
+    };
+    let rev2 = published({
+        let mut c = empty_content();
+        c.enforcement.rules = Some(vec![EnforcementRule {
+            action_class: ActionClass::InfrastructureMutation,
+            risk_class: RiskClass::Critical,
+            outcomes: VerdictOutcomes::uniform(EnforcementOutcome::Block),
+        }]);
+        c
+    });
+    let mut binding2 = org_binding("org-1", &rev2);
+    binding2.selector = TargetSelector {
+        providers: None,
+        os_families: None,
+        requires_signals: Some(vec![SignalClass::ReasoningSummary]),
+    };
+    let items2 = vec![bound(binding2, rev2)];
+    let (resolved2, diagnostics2) = resolve(&items2, &ctx_with_signal);
+    assert!(diagnostics2
+        .iter()
+        .all(|d| d.code != DiagnosticCode::RequiredSignalUnavailable));
+    assert_eq!(
+        resolved2
+            .values
+            .enforcement_outcome_for(&ActionClass::InfrastructureMutation, Verdict::Contradicted),
+        EnforcementOutcome::Block
     );
 }

@@ -18,12 +18,16 @@
 //!
 //! Grounded in the real tool-name shapes captured in
 //! `docs/research/adapter-capability-matrix.md` and produced by
-//! `fornax-adapter-claude`/`fornax-adapter-codex` (see those crates'
-//! `AgentAdapter::normalize` implementations): Claude Code hook events carry
-//! `tool_name` values like `"Bash"`/`"Edit"`/`"Write"`; Codex's rollout
-//! tailer normalizes every shell invocation to the canonical `tool_name`
-//! `"exec_command"` regardless of the provider-native `custom_tool_call`/
-//! `exec_command_end` shape it came from.
+//! `fornax-adapter-claude`/`fornax-adapter-codex`/`fornax-adapter-opencode`
+//! (see those crates' `AgentAdapter::normalize` implementations): Claude
+//! Code hook events carry `tool_name` values like `"Bash"`/`"Edit"`/
+//! `"Write"`; Codex's rollout tailer normalizes every shell invocation to
+//! the canonical `tool_name` `"exec_command"` regardless of the
+//! provider-native `custom_tool_call`/`exec_command_end` shape it came from;
+//! OpenCode's `tool.execute.before`/`tool.execute.after` hooks currently
+//! only ever normalize a shell invocation as `"bash"` — every other
+//! OpenCode tool name is genuinely unmapped today (no other tool_name value
+//! has been observed live), not silently guessed at.
 
 use super::content::ActionClass;
 use crate::Provider;
@@ -41,13 +45,18 @@ pub fn classify_action_class(
     tool_input: Option<&serde_json::Value>,
 ) -> ActionClass {
     match (provider, tool_name) {
-        (_, "Bash") | (Provider::Codex, "exec_command") => {
+        (_, "Bash") | (Provider::Codex, "exec_command") | (Provider::OpenCode, "bash") => {
             classify_shell_command(command_text(tool_input).as_deref())
         }
         (Provider::ClaudeCode, "Edit" | "Write" | "MultiEdit" | "NotebookEdit") => {
             ActionClass::CodeEdit
         }
         (Provider::ClaudeCode, "WebFetch" | "WebSearch") => ActionClass::NetworkFetch,
+        // fornax-adapter-opencode currently only ever normalizes "bash" as
+        // a tool_name (see docs/research/adapter-capability-matrix.md and
+        // that crate's `tool.execute.before`/`after` handling) -- every
+        // other OpenCode tool name is genuinely unmapped pending its own
+        // ticket, not silently guessed at here.
         _ => ActionClass::Unrecognized(tool_name.to_string()),
     }
 }
@@ -79,21 +88,27 @@ fn classify_shell_command(command: Option<&str>) -> ActionClass {
         return ActionClass::ShellCommand;
     };
     let normalized = command.to_ascii_lowercase();
-    let first_word = normalized.split_whitespace().next().unwrap_or("");
 
+    // Every check below is a whole-string `contains`, deliberately —
+    // `tool_input.command` is a full shell line that may carry a `cd repo
+    // &&`/`sudo`/pipeline prefix before the command this heuristic actually
+    // cares about (e.g. `cd /repo && git push origin main`). A first-token
+    // check would miss exactly that shape and silently *loosen* the
+    // classification, which this function's doc comment promises never
+    // happens.
     if contains_any(&normalized, CREDENTIAL_PATH_MARKERS) {
         return ActionClass::CredentialAccess;
     }
     if contains_any(&normalized, INFRA_MUTATION_PHRASES) {
         return ActionClass::InfrastructureMutation;
     }
-    if first_word == "git" && contains_any(&normalized, VCS_WRITE_PHRASES) {
+    if contains_any(&normalized, VCS_WRITE_PHRASES) {
         return ActionClass::VersionControlWrite;
     }
     if contains_any(&normalized, PACKAGE_INSTALL_PHRASES) {
         return ActionClass::PackageInstall;
     }
-    if first_word == "curl" || first_word == "wget" {
+    if contains_any(&normalized, NETWORK_FETCH_PHRASES) {
         return ActionClass::NetworkFetch;
     }
     ActionClass::ShellCommand
@@ -134,20 +149,20 @@ const INFRA_MUTATION_PHRASES: &[&str] = &[
     "docker system prune",
 ];
 
-/// `git` subcommands/flags that mutate committed history or push to a
+/// `git` subcommand phrases that mutate committed history or push to a
 /// remote, as opposed to read-only inspection (`git status`, `git log`,
-/// `git diff`).
+/// `git diff`). Anchored on `"git "` + the subcommand (not a bare verb like
+/// `"tag"`) so `git log --tags` doesn't false-positive as a write.
 const VCS_WRITE_PHRASES: &[&str] = &[
-    "push",
-    "commit",
-    "tag",
-    "merge",
-    "rebase",
-    "cherry-pick",
-    "reset --hard",
-    "clean -f",
-    "branch -d",
-    "branch -D",
+    "git push",
+    "git commit",
+    "git tag",
+    "git merge",
+    "git rebase",
+    "git cherry-pick",
+    "git reset --hard",
+    "git clean -f",
+    "git branch -d",
 ];
 
 /// Package-manager install/add invocations across the ecosystems this
@@ -168,6 +183,11 @@ const PACKAGE_INSTALL_PHRASES: &[&str] = &[
     "gem install",
     "go install",
 ];
+
+/// Network-fetch commands. `"curl "`/`"wget "` (trailing space, not a bare
+/// first-token check) so a `cd repo && curl ...` prefix or pipeline still
+/// matches.
+const NETWORK_FETCH_PHRASES: &[&str] = &["curl ", "wget "];
 
 #[cfg(test)]
 mod tests {
@@ -255,6 +275,29 @@ mod tests {
     }
 
     #[test]
+    fn git_log_with_tags_flag_is_not_version_control_write() {
+        // Regression: a bare "tag" substring check would false-positive on
+        // this read-only inspection command.
+        let input = bash_input("git log --tags");
+        assert_eq!(
+            classify_action_class(Provider::ClaudeCode, "Bash", Some(&input)),
+            ActionClass::ShellCommand
+        );
+    }
+
+    #[test]
+    fn cd_prefixed_git_push_is_still_version_control_write() {
+        // Regression: real agent-issued commands are routinely prefixed
+        // with `cd <repo> &&` -- a first-token check on "git" would miss
+        // this shape entirely.
+        let input = bash_input("cd /repo && git push origin main");
+        assert_eq!(
+            classify_action_class(Provider::ClaudeCode, "Bash", Some(&input)),
+            ActionClass::VersionControlWrite
+        );
+    }
+
+    #[test]
     fn npm_install_is_package_install() {
         let input = bash_input("npm install left-pad --save");
         assert_eq!(
@@ -318,6 +361,23 @@ mod tests {
         assert_eq!(
             classify_action_class(Provider::Codex, "exec_command", Some(&input)),
             ActionClass::VersionControlWrite
+        );
+    }
+
+    #[test]
+    fn opencode_bash_uses_the_same_command_heuristics_as_claude_bash() {
+        let input = bash_input("npm install left-pad");
+        assert_eq!(
+            classify_action_class(Provider::OpenCode, "bash", Some(&input)),
+            ActionClass::PackageInstall
+        );
+    }
+
+    #[test]
+    fn opencode_unmapped_tool_is_unrecognized_pending_its_own_ticket() {
+        assert_eq!(
+            classify_action_class(Provider::OpenCode, "edit", None),
+            ActionClass::Unrecognized("edit".to_string())
         );
     }
 
