@@ -14,6 +14,7 @@ use std::str::FromStr;
 
 pub mod audit_checkpoint;
 pub mod audit_ledger;
+pub mod compliance_report;
 pub mod policy_cache;
 pub mod retention;
 
@@ -21,6 +22,10 @@ pub use audit_checkpoint::{
     evaluate_checkpoint_consistency, AuditCheckpointReceipt, CheckpointConsistencyVerdict,
 };
 pub use audit_ledger::{AppendedAuditEvent, AuditLedgerEntry, ChainVerification, DivergenceKind};
+pub use compliance_report::{
+    CheckpointAnchoringSection, ComplianceReport, ComplianceReportBody, LedgerIntegritySection,
+    LedgerIntegrityStatus, RetentionClassObservation, RetentionSection,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
