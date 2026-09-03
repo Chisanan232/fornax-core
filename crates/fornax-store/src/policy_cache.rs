@@ -502,6 +502,27 @@ impl Store {
         let state = load_state_from_conn(&mut conn).await?;
         let mut diagnostics = Vec::new();
 
+        // FORNX-123: one unrecognized target_kind entry must never make the
+        // whole revocation list unparseable -- it is counted
+        // (`unrecognized_entry_count`) and surfaced here as a Warning,
+        // un-actionable but never fatal.
+        if state.revocations.unrecognized_entry_count > 0 {
+            diagnostics.push(PolicyDiagnostic::new(
+                DiagnosticCode::PolicyRevocationEntryNotUnderstood,
+                DiagnosticSeverity::Warning,
+                format!(
+                    "{} revocation list entr{} named a target_kind this binary does not recognize",
+                    state.revocations.unrecognized_entry_count,
+                    if state.revocations.unrecognized_entry_count == 1 {
+                        "y"
+                    } else {
+                        "ies"
+                    }
+                ),
+                "upgrade this binary to a version that understands the newer target_kind",
+            ));
+        }
+
         let Some(trusted) = trusted else {
             diagnostics.push(unavailable_diagnostic(
                 "no trust store configured; cached bundles cannot be re-verified",
