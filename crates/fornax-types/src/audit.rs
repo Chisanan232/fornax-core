@@ -97,6 +97,13 @@ pub enum AuditTarget {
     Organization {
         target_id: String,
     },
+    /// FORNX-322: the compliance report a `fornax audit report` invocation
+    /// just generated — `target_id` is that report's own digest, so the
+    /// audit trail names exactly which report was produced without
+    /// embedding the report's content in the event itself.
+    ComplianceReport {
+        target_id: String,
+    },
     #[serde(other)]
     Unrecognized,
 }
@@ -117,6 +124,10 @@ pub enum AuditAction {
     /// its retention window elapsed. See
     /// `docs/adr/0011-audit-event-model.md` §2's table.
     EvidencePurged,
+    /// FORNX-322: `fornax audit report` generated a local compliance report.
+    /// Recording this as its own auditable action means generating a report
+    /// is itself evidenced in the very ledger the report reads from.
+    ComplianceReportGenerated,
     /// Forward-compatibility catch-all. Preserves and round-trips the
     /// original wire string verbatim — see the module docs' "Two enum
     /// shapes" section.
@@ -474,6 +485,20 @@ mod tests {
         assert_eq!(back, target);
     }
 
+    /// FORNX-322: `AuditTarget::ComplianceReport` round-trips with the
+    /// explicit `compliance_report` wire tag.
+    #[test]
+    fn audit_target_compliance_report_round_trips_with_the_explicit_wire_tag() {
+        let target = AuditTarget::ComplianceReport {
+            target_id: "sha256:deadbeef".to_string(),
+        };
+        let json = serde_json::to_value(&target).unwrap();
+        assert_eq!(json["target_kind"], serde_json::json!("compliance_report"));
+        assert_eq!(json["target_id"], serde_json::json!("sha256:deadbeef"));
+        let back: AuditTarget = serde_json::from_value(json).unwrap();
+        assert_eq!(back, target);
+    }
+
     #[test]
     fn every_canonical_audit_action_tag_round_trips_to_its_named_variant() {
         let cases = [
@@ -495,6 +520,10 @@ mod tests {
                 AuditAction::RoleAssignmentChanged,
             ),
             ("\"evidence_purged\"", AuditAction::EvidencePurged),
+            (
+                "\"compliance_report_generated\"",
+                AuditAction::ComplianceReportGenerated,
+            ),
         ];
         for (json, expected) in cases {
             let v: AuditAction = serde_json::from_str(json).unwrap();
