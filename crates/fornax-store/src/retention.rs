@@ -385,6 +385,21 @@ impl Store {
         purge_evidence_payload_row(&self.pool, evidence_id).await
     }
 
+    /// Whether the `evidence` row named `evidence_id` has been purged
+    /// (FORNX-319 AC3) — `None` if no such row exists (never fabricated as
+    /// `false`, which would be indistinguishable from "exists and not
+    /// purged"). Lets a renderer (e.g. `fornax-daemon`'s
+    /// `/api/evidence-graph`) annotate a linked evidence id as "evidence
+    /// expired" without re-fetching and re-parsing the whole row.
+    pub async fn is_evidence_purged(&self, evidence_id: &str) -> Result<Option<bool>> {
+        let row: Option<(bool,)> =
+            sqlx::query_as("SELECT evidence_purged FROM evidence WHERE id = ?1")
+                .bind(evidence_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(purged,)| purged))
+    }
+
     /// Bounded incremental retention sweep (FORNX-319 AC4/AC5/AC6).
     /// Examines up to `batch_size` lineage tags, in `recorded_at` ascending
     /// order starting strictly after `cursor` (`None` starts from the
