@@ -26,6 +26,7 @@
 //! - **Diagnostics** ([`diagnostics::PolicyDiagnostic`]) are actionable:
 //!   every one carries a non-empty `message` and `remediation`.
 
+mod bundle;
 mod content;
 mod diagnostics;
 mod local;
@@ -33,6 +34,13 @@ mod resolve;
 mod revision;
 mod target;
 
+pub use bundle::{
+    verify_bundle, BundlePayload, BundleProvenance, BundleRejection, BundleSignature, KeyId,
+    PayloadDigest, SignatureAlgorithm, SignedPolicyBundle, TrustStoreError, TrustedKey,
+    TrustedVerificationKeys, VerifiedPolicyBundle, BUNDLE_SCHEMA_VERSION, BUNDLE_SIGNING_DOMAIN,
+    CLOCK_SKEW_TOLERANCE_SECONDS, MAX_PAYLOAD_BYTES, MAX_SIGNATURES,
+    SUPPORTED_BUNDLE_SCHEMA_VERSIONS,
+};
 pub use content::{
     ActionClass, CacheScope, CollectionScope, EgressContentClass, EgressScope, EnforcementOutcome,
     EnforcementRule, EnforcementScope, PolicyContent, RedactionProfile, ResolvedValues, RiskClass,
