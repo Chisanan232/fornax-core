@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use ed25519_dalek::{Signer, SigningKey};
 use uuid::Uuid;
 
@@ -967,6 +967,7 @@ fn provider_selector_restricts_matching() {
         .iter()
         .any(|d| d.code == DiagnosticCode::NoApplicablePolicy));
 }
+
 // ============================================================================
 // FORNX-118 -- signed policy bundle scenarios (T28+, see
 // `docs/adr/0007-signed-policy-bundles.md`)
@@ -981,9 +982,17 @@ const TEST_ONLY_NOT_A_SECRET_SEED_PRIMARY: [u8; 32] = [
     0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
     0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
 ];
+const TEST_ONLY_NOT_A_SECRET_SEED_ROTATED: [u8; 32] = [
+    0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30,
+    0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x40,
+];
 
 fn primary_signing_key() -> SigningKey {
     SigningKey::from_bytes(&TEST_ONLY_NOT_A_SECRET_SEED_PRIMARY)
+}
+
+fn rotated_signing_key() -> SigningKey {
+    SigningKey::from_bytes(&TEST_ONLY_NOT_A_SECRET_SEED_ROTATED)
 }
 
 fn trusted_key_for(
@@ -1007,6 +1016,10 @@ fn trust_store(keys: Vec<TrustedKey>) -> TrustedVerificationKeys {
         schema_version: 1,
         keys,
     }
+}
+
+fn sample_revision() -> PublishedPolicyRevision {
+    published(cloud_sync_content(true))
 }
 
 fn bundle_payload_with(
@@ -1033,11 +1046,26 @@ fn bundle_payload_with(
     }
 }
 
+fn sample_bundle_payload(
+    revision: PublishedPolicyRevision,
+    sequence: u64,
+    not_before: &str,
+    expires_at: &str,
+) -> BundlePayload {
+    let binding = org_binding("org-1", &revision);
+    bundle_payload_with(revision, vec![binding], sequence, not_before, expires_at)
+}
+
 fn sign_domain(payload_bytes: &[u8], signing_key: &SigningKey) -> String {
     let mut msg = Vec::with_capacity(BUNDLE_SIGNING_DOMAIN.len() + payload_bytes.len());
     msg.extend_from_slice(BUNDLE_SIGNING_DOMAIN);
     msg.extend_from_slice(payload_bytes);
     let sig = signing_key.sign(&msg);
+    STANDARD.encode(sig.to_bytes())
+}
+
+fn sign_bare(payload_bytes: &[u8], signing_key: &SigningKey) -> String {
+    let sig = signing_key.sign(payload_bytes);
     STANDARD.encode(sig.to_bytes())
 }
 
@@ -1060,6 +1088,26 @@ fn build_envelope_bytes(payload_bytes: &[u8], signatures: Vec<BundleSignature>) 
         signatures,
     };
     serde_json::to_vec(&envelope).unwrap()
+}
+
+fn base_now() -> DateTime<Utc> {
+    "2026-01-01T00:10:00Z".parse().unwrap()
+}
+
+/// Single-signer, in-window envelope + matching trust store, for tests that
+/// only care about behavior orthogonal to signing/windowing.
+fn valid_envelope_and_trust(
+    not_before: &str,
+    expires_at: &str,
+) -> (Vec<u8>, TrustedVerificationKeys) {
+    let revision = sample_revision();
+    let payload = sample_bundle_payload(revision, 1, not_before, expires_at);
+    let payload_bytes = serde_json::to_vec(&payload).unwrap();
+    let sk = primary_signing_key();
+    let sig = valid_signature_entry("primary", &payload_bytes, &sk);
+    let envelope = build_envelope_bytes(&payload_bytes, vec![sig]);
+    let trust = trust_store(vec![trusted_key_for("primary", &sk, None, None)]);
+    (envelope, trust)
 }
 
 fn deterministic_org_binding(
@@ -1116,6 +1164,414 @@ fn generate_signed_bundle_fixture_v1() {
 }
 
 #[test]
+fn t28_valid_signature_in_window_verifies() {
+    let (envelope, trust) =
+        valid_envelope_and_trust("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z");
+    let verified = verify_bundle(&envelope, &trust, base_now()).expect("should verify");
+    assert_eq!(verified.verified_by(), &KeyId("primary".to_string()));
+    assert_eq!(verified.payload().sequence, 1);
+}
+
+#[test]
+fn t29_tampered_payload_after_signing_is_signature_invalid() {
+    let revision = sample_revision();
+    let payload =
+        sample_bundle_payload(revision, 1, "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z");
+    let payload_bytes = serde_json::to_vec(&payload).unwrap();
+    let sk = primary_signing_key();
+    let sig = valid_signature_entry("primary", &payload_bytes, &sk);
+    let mut tampered = payload_bytes.clone();
+    let idx = tampered.iter().position(|b| *b != 0).unwrap_or(0);
+    tampered[idx] ^= 0xFF;
+    let envelope = build_envelope_bytes(&tampered, vec![sig]);
+    let trust = trust_store(vec![trusted_key_for("primary", &sk, None, None)]);
+    let err = verify_bundle(&envelope, &trust, base_now()).unwrap_err();
+    assert!(matches!(err, BundleRejection::SignatureInvalid { .. }));
+}
+
+#[test]
+fn t30_signature_from_wrong_key_but_known_key_id_is_signature_invalid_not_unknown_key_id() {
+    let revision = sample_revision();
+    let payload =
+        sample_bundle_payload(revision, 1, "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z");
+    let payload_bytes = serde_json::to_vec(&payload).unwrap();
+    let wrong_key = rotated_signing_key();
+    let sig = BundleSignature {
+        key_id: KeyId("primary".to_string()),
+        algorithm: SignatureAlgorithm::Ed25519,
+        signature_b64: sign_domain(&payload_bytes, &wrong_key),
+    };
+    let envelope = build_envelope_bytes(&payload_bytes, vec![sig]);
+    let trust = trust_store(vec![trusted_key_for(
+        "primary",
+        &primary_signing_key(),
+        None,
+        None,
+    )]);
+    let err = verify_bundle(&envelope, &trust, base_now()).unwrap_err();
+    assert!(matches!(err, BundleRejection::SignatureInvalid { .. }));
+}
+
+#[test]
+fn t31_unknown_key_id_is_rejected() {
+    let revision = sample_revision();
+    let payload =
+        sample_bundle_payload(revision, 1, "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z");
+    let payload_bytes = serde_json::to_vec(&payload).unwrap();
+    let sk = primary_signing_key();
+    let sig = valid_signature_entry("ghost", &payload_bytes, &sk);
+    let envelope = build_envelope_bytes(&payload_bytes, vec![sig]);
+    let trust = trust_store(vec![trusted_key_for("primary", &sk, None, None)]);
+    let err = verify_bundle(&envelope, &trust, base_now()).unwrap_err();
+    match err {
+        BundleRejection::UnknownKeyId { offered } => {
+            assert_eq!(offered, vec![KeyId("ghost".to_string())]);
+        }
+        other => panic!("expected UnknownKeyId, got {other:?}"),
+    }
+}
+
+#[test]
+fn t32_expired_bundle_is_rejected() {
+    let (envelope, trust) =
+        valid_envelope_and_trust("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z");
+    let now: DateTime<Utc> = "2026-01-03T00:00:00Z".parse().unwrap();
+    let err = verify_bundle(&envelope, &trust, now).unwrap_err();
+    assert!(matches!(err, BundleRejection::BundleExpired { .. }));
+}
+
+#[test]
+fn t33_within_clock_skew_tolerance_before_not_before_is_ok() {
+    let (envelope, trust) =
+        valid_envelope_and_trust("2026-01-01T00:10:00Z", "2026-01-02T00:00:00Z");
+    let not_before: DateTime<Utc> = "2026-01-01T00:10:00Z".parse().unwrap();
+    let now = not_before - Duration::seconds(120);
+    verify_bundle(&envelope, &trust, now).expect("within tolerance should verify");
+}
+
+#[test]
+fn t34_beyond_clock_skew_tolerance_before_not_before_is_rejected() {
+    let (envelope, trust) =
+        valid_envelope_and_trust("2026-01-01T00:10:00Z", "2026-01-02T00:00:00Z");
+    let not_before: DateTime<Utc> = "2026-01-01T00:10:00Z".parse().unwrap();
+    let now = not_before - Duration::seconds(600);
+    let err = verify_bundle(&envelope, &trust, now).unwrap_err();
+    assert!(matches!(err, BundleRejection::BundleNotYetValid { .. }));
+}
+
+#[test]
+fn t35_expiry_grants_no_grace_period_even_within_clock_skew_tolerance() {
+    let (envelope, trust) =
+        valid_envelope_and_trust("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z");
+    let expires_at: DateTime<Utc> = "2026-01-02T00:00:00Z".parse().unwrap();
+    let now = expires_at + Duration::seconds(120);
+    let err = verify_bundle(&envelope, &trust, now).unwrap_err();
+    assert!(matches!(err, BundleRejection::BundleExpired { .. }));
+}
+
+fn two_signed_envelope() -> (Vec<u8>, TrustedKey, TrustedKey) {
+    let revision = sample_revision();
+    let payload =
+        sample_bundle_payload(revision, 1, "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z");
+    let payload_bytes = serde_json::to_vec(&payload).unwrap();
+    let old_key = primary_signing_key();
+    let new_key = rotated_signing_key();
+    let sig_old = valid_signature_entry("old", &payload_bytes, &old_key);
+    let sig_new = valid_signature_entry("new", &payload_bytes, &new_key);
+    let envelope = build_envelope_bytes(&payload_bytes, vec![sig_old, sig_new]);
+    let old_trusted = trusted_key_for("old", &old_key, None, None);
+    let new_trusted = trusted_key_for("new", &new_key, None, None);
+    (envelope, old_trusted, new_trusted)
+}
+
+#[test]
+fn t36_rotation_store_has_only_old_key_verifies_via_old() {
+    let (envelope, old_trusted, _new_trusted) = two_signed_envelope();
+    let trust = trust_store(vec![old_trusted]);
+    let verified = verify_bundle(&envelope, &trust, base_now()).unwrap();
+    assert_eq!(verified.verified_by(), &KeyId("old".to_string()));
+}
+
+#[test]
+fn t37_rotation_store_has_only_new_key_verifies_via_new() {
+    let (envelope, _old_trusted, new_trusted) = two_signed_envelope();
+    let trust = trust_store(vec![new_trusted]);
+    let verified = verify_bundle(&envelope, &trust, base_now()).unwrap();
+    assert_eq!(verified.verified_by(), &KeyId("new".to_string()));
+}
+
+#[test]
+fn t38_rotation_store_has_both_keys_verifies_exactly_once() {
+    let (envelope, old_trusted, new_trusted) = two_signed_envelope();
+    let trust = trust_store(vec![old_trusted, new_trusted]);
+    let verified = verify_bundle(&envelope, &trust, base_now()).unwrap();
+    // `VerifiedPolicyBundle::verified_by` returns a single `KeyId` by
+    // construction (never a list), so "exactly one" is structurally
+    // guaranteed; assert it names one of the two offered signers.
+    assert!(
+        verified.verified_by() == &KeyId("old".to_string())
+            || verified.verified_by() == &KeyId("new".to_string())
+    );
+}
+
+#[test]
+fn t39_key_retired_via_not_after_is_rejected() {
+    let revision = sample_revision();
+    let payload =
+        sample_bundle_payload(revision, 1, "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z");
+    let payload_bytes = serde_json::to_vec(&payload).unwrap();
+    let sk = primary_signing_key();
+    let sig = valid_signature_entry("primary", &payload_bytes, &sk);
+    let envelope = build_envelope_bytes(&payload_bytes, vec![sig]);
+    let trust = trust_store(vec![trusted_key_for(
+        "primary",
+        &sk,
+        None,
+        Some("2025-12-31T00:00:00Z"),
+    )]);
+    let err = verify_bundle(&envelope, &trust, base_now()).unwrap_err();
+    assert!(matches!(err, BundleRejection::KeyRetired { .. }));
+}
+
+#[test]
+fn t40_key_not_yet_valid_via_not_before_is_rejected() {
+    let revision = sample_revision();
+    let payload =
+        sample_bundle_payload(revision, 1, "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z");
+    let payload_bytes = serde_json::to_vec(&payload).unwrap();
+    let sk = primary_signing_key();
+    let sig = valid_signature_entry("primary", &payload_bytes, &sk);
+    let envelope = build_envelope_bytes(&payload_bytes, vec![sig]);
+    let trust = trust_store(vec![trusted_key_for(
+        "primary",
+        &sk,
+        Some("2027-01-01T00:00:00Z"),
+        None,
+    )]);
+    let err = verify_bundle(&envelope, &trust, base_now()).unwrap_err();
+    assert!(matches!(err, BundleRejection::KeyNotYetValid { .. }));
+}
+
+#[test]
+fn t41_unrecognized_algorithm_fails_closed_unlike_adr0006s_fail_open_selector_rule() {
+    let revision = sample_revision();
+    let payload =
+        sample_bundle_payload(revision, 1, "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z");
+    let payload_bytes = serde_json::to_vec(&payload).unwrap();
+    let sk = primary_signing_key();
+    let sig = BundleSignature {
+        key_id: KeyId("primary".to_string()),
+        algorithm: SignatureAlgorithm::Unrecognized("ed448".to_string()),
+        signature_b64: sign_domain(&payload_bytes, &sk),
+    };
+    let envelope = build_envelope_bytes(&payload_bytes, vec![sig]);
+    let trust = trust_store(vec![trusted_key_for("primary", &sk, None, None)]);
+    let err = verify_bundle(&envelope, &trust, base_now()).unwrap_err();
+    assert!(matches!(err, BundleRejection::UnsupportedAlgorithm { .. }));
+}
+
+#[test]
+fn t42a_non_canonical_base64_alphabet_char_is_rejected() {
+    let envelope = SignedPolicyBundle {
+        bundle_schema_version: BUNDLE_SCHEMA_VERSION,
+        payload_b64: "not*valid*base64!!".to_string(),
+        signatures: vec![valid_signature_entry(
+            "primary",
+            b"irrelevant",
+            &primary_signing_key(),
+        )],
+    };
+    let bytes = serde_json::to_vec(&envelope).unwrap();
+    let trust = trust_store(vec![trusted_key_for(
+        "primary",
+        &primary_signing_key(),
+        None,
+        None,
+    )]);
+    let err = verify_bundle(&bytes, &trust, base_now()).unwrap_err();
+    assert!(matches!(
+        err,
+        BundleRejection::MalformedPayloadEncoding { .. }
+    ));
+}
+
+#[test]
+fn t42b_unpadded_base64_is_rejected_under_strict_canonical_decoding() {
+    let mut payload_b64 = STANDARD.encode(b"hi"); // "aGk=" -- one required pad char
+    payload_b64 = payload_b64.trim_end_matches('=').to_string();
+    let envelope = SignedPolicyBundle {
+        bundle_schema_version: BUNDLE_SCHEMA_VERSION,
+        payload_b64,
+        signatures: vec![valid_signature_entry(
+            "primary",
+            b"irrelevant",
+            &primary_signing_key(),
+        )],
+    };
+    let bytes = serde_json::to_vec(&envelope).unwrap();
+    let trust = trust_store(vec![trusted_key_for(
+        "primary",
+        &primary_signing_key(),
+        None,
+        None,
+    )]);
+    let err = verify_bundle(&bytes, &trust, base_now()).unwrap_err();
+    assert!(matches!(
+        err,
+        BundleRejection::MalformedPayloadEncoding { .. }
+    ));
+}
+
+#[test]
+fn t42c_base64_with_nonzero_trailing_bits_is_rejected() {
+    // "AA==" is the canonical encoding of a single zero byte; "AB==" encodes
+    // the same byte but leaves nonzero low bits in the final symbol, which
+    // strict trailing-bit checking must reject.
+    let envelope = SignedPolicyBundle {
+        bundle_schema_version: BUNDLE_SCHEMA_VERSION,
+        payload_b64: "AB==".to_string(),
+        signatures: vec![valid_signature_entry(
+            "primary",
+            b"irrelevant",
+            &primary_signing_key(),
+        )],
+    };
+    let bytes = serde_json::to_vec(&envelope).unwrap();
+    let trust = trust_store(vec![trusted_key_for(
+        "primary",
+        &primary_signing_key(),
+        None,
+        None,
+    )]);
+    let err = verify_bundle(&bytes, &trust, base_now()).unwrap_err();
+    assert!(matches!(
+        err,
+        BundleRejection::MalformedPayloadEncoding { .. }
+    ));
+}
+
+#[test]
+fn t43_valid_signature_over_non_json_bytes_is_malformed_payload() {
+    let payload_bytes = b"this is not json".to_vec();
+    let sk = primary_signing_key();
+    let sig = valid_signature_entry("primary", &payload_bytes, &sk);
+    let envelope = build_envelope_bytes(&payload_bytes, vec![sig]);
+    let trust = trust_store(vec![trusted_key_for("primary", &sk, None, None)]);
+    let err = verify_bundle(&envelope, &trust, base_now()).unwrap_err();
+    assert!(matches!(err, BundleRejection::MalformedPayload { .. }));
+}
+
+#[test]
+fn t44_hand_edited_inner_revision_digest_is_malformed_payload() {
+    let revision = sample_revision();
+    let payload =
+        sample_bundle_payload(revision, 1, "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z");
+    let mut value = serde_json::to_value(&payload).unwrap();
+    let fake_digest = format!("sha256:{}", "0".repeat(64));
+    value["revision"]["digest"] = serde_json::json!(fake_digest);
+    let payload_bytes = serde_json::to_vec(&value).unwrap();
+    let sk = primary_signing_key();
+    let sig = valid_signature_entry("primary", &payload_bytes, &sk);
+    let envelope = build_envelope_bytes(&payload_bytes, vec![sig]);
+    let trust = trust_store(vec![trusted_key_for("primary", &sk, None, None)]);
+    let err = verify_bundle(&envelope, &trust, base_now()).unwrap_err();
+    assert!(matches!(err, BundleRejection::MalformedPayload { .. }));
+}
+
+#[test]
+fn t45a_empty_signatures_is_rejected() {
+    let revision = sample_revision();
+    let payload =
+        sample_bundle_payload(revision, 1, "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z");
+    let payload_bytes = serde_json::to_vec(&payload).unwrap();
+    let envelope = build_envelope_bytes(&payload_bytes, vec![]);
+    let trust = trust_store(vec![trusted_key_for(
+        "primary",
+        &primary_signing_key(),
+        None,
+        None,
+    )]);
+    let err = verify_bundle(&envelope, &trust, base_now()).unwrap_err();
+    assert!(matches!(err, BundleRejection::NoSignatures));
+}
+
+#[test]
+fn t45b_nine_signatures_exceeds_the_limit() {
+    let revision = sample_revision();
+    let payload =
+        sample_bundle_payload(revision, 1, "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z");
+    let payload_bytes = serde_json::to_vec(&payload).unwrap();
+    let sk = primary_signing_key();
+    let sigs: Vec<BundleSignature> = (0..9)
+        .map(|i| valid_signature_entry(&format!("k{i}"), &payload_bytes, &sk))
+        .collect();
+    let envelope = build_envelope_bytes(&payload_bytes, sigs);
+    let trust = trust_store(vec![trusted_key_for("k0", &sk, None, None)]);
+    let err = verify_bundle(&envelope, &trust, base_now()).unwrap_err();
+    assert!(matches!(
+        err,
+        BundleRejection::TooManySignatures { found: 9, max: 8 }
+    ));
+}
+
+#[test]
+fn t46_oversized_payload_is_rejected_before_signature_verification() {
+    let big = vec![b'a'; MAX_PAYLOAD_BYTES + 1];
+    let sk = primary_signing_key();
+    let sig = valid_signature_entry("primary", &big, &sk);
+    let envelope = build_envelope_bytes(&big, vec![sig]);
+    let trust = trust_store(vec![trusted_key_for("primary", &sk, None, None)]);
+    let err = verify_bundle(&envelope, &trust, base_now()).unwrap_err();
+    assert!(matches!(err, BundleRejection::PayloadTooLarge { .. }));
+}
+
+#[test]
+fn t47_envelope_and_payload_schema_version_mismatch_is_rejected() {
+    let revision = sample_revision();
+    let mut payload =
+        sample_bundle_payload(revision, 1, "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z");
+    payload.bundle_schema_version = 999;
+    let payload_bytes = serde_json::to_vec(&payload).unwrap();
+    let sk = primary_signing_key();
+    let sig = valid_signature_entry("primary", &payload_bytes, &sk);
+    let envelope = build_envelope_bytes(&payload_bytes, vec![sig]);
+    let trust = trust_store(vec![trusted_key_for("primary", &sk, None, None)]);
+    let err = verify_bundle(&envelope, &trust, base_now()).unwrap_err();
+    assert!(matches!(
+        err,
+        BundleRejection::SchemaVersionMismatch {
+            envelope: 1,
+            payload: 999
+        }
+    ));
+}
+
+#[test]
+fn t48_binding_digest_mismatch_with_revision_is_rejected() {
+    let revision = sample_revision();
+    let other_revision = published(cloud_sync_content(false));
+    let mut binding = org_binding("org-1", &revision);
+    binding.revision_ref.digest = other_revision.digest().clone();
+    let payload = bundle_payload_with(
+        revision,
+        vec![binding],
+        1,
+        "2026-01-01T00:00:00Z",
+        "2026-01-02T00:00:00Z",
+    );
+    let payload_bytes = serde_json::to_vec(&payload).unwrap();
+    let sk = primary_signing_key();
+    let sig = valid_signature_entry("primary", &payload_bytes, &sk);
+    let envelope = build_envelope_bytes(&payload_bytes, vec![sig]);
+    let trust = trust_store(vec![trusted_key_for("primary", &sk, None, None)]);
+    let err = verify_bundle(&envelope, &trust, base_now()).unwrap_err();
+    assert!(matches!(
+        err,
+        BundleRejection::BindingRevisionMismatch { .. }
+    ));
+}
+
+#[test]
 fn t49_frozen_fixture_verifies_and_regenerator_reproduces_it_byte_for_byte() {
     let fixture = include_str!("../../tests/fixtures/signed_policy_bundle_v1.json");
     let trust = trust_store(vec![trusted_key_for(
@@ -1136,4 +1592,111 @@ fn t49_frozen_fixture_verifies_and_regenerator_reproduces_it_byte_for_byte() {
         regenerated, expected,
         "regenerator must reproduce the frozen fixture exactly"
     );
+}
+
+#[test]
+fn t50_signature_over_bare_payload_without_domain_prefix_is_rejected_proving_domain_separation() {
+    let revision = sample_revision();
+    let payload =
+        sample_bundle_payload(revision, 1, "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z");
+    let payload_bytes = serde_json::to_vec(&payload).unwrap();
+    let sk = primary_signing_key();
+    let sig = BundleSignature {
+        key_id: KeyId("primary".to_string()),
+        algorithm: SignatureAlgorithm::Ed25519,
+        signature_b64: sign_bare(&payload_bytes, &sk),
+    };
+    let envelope = build_envelope_bytes(&payload_bytes, vec![sig]);
+    let trust = trust_store(vec![trusted_key_for("primary", &sk, None, None)]);
+    let err = verify_bundle(&envelope, &trust, base_now()).unwrap_err();
+    assert!(matches!(err, BundleRejection::SignatureInvalid { .. }));
+}
+
+#[test]
+fn t51_single_byte_mutations_of_a_valid_envelope_never_panic_and_always_err() {
+    let (envelope, trust) =
+        valid_envelope_and_trust("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z");
+    for i in 0..envelope.len() {
+        let mut mutated = envelope.clone();
+        mutated[i] ^= 0xFF;
+        let trust_ref = &trust;
+        let mutated_ref = &mutated;
+        let now = base_now();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            verify_bundle(mutated_ref, trust_ref, now)
+        }));
+        let outcome = result.unwrap_or_else(|_| panic!("verify_bundle panicked mutating byte {i}"));
+        assert!(
+            outcome.is_err(),
+            "mutation at byte {i} unexpectedly verified"
+        );
+    }
+}
+
+#[test]
+fn t52a_load_rejects_duplicate_key_ids_with_differing_material() {
+    let a = trusted_key_for("dup", &primary_signing_key(), None, None);
+    let b = trusted_key_for("dup", &rotated_signing_key(), None, None);
+    let store = trust_store(vec![a, b]);
+    let raw = serde_json::to_string(&store).unwrap();
+    let err = TrustedVerificationKeys::load(&raw).unwrap_err();
+    assert!(matches!(err, TrustStoreError::DuplicateKeyId { .. }));
+}
+
+#[test]
+fn t52b_load_rejects_an_empty_key_set() {
+    let store = trust_store(vec![]);
+    let raw = serde_json::to_string(&store).unwrap();
+    let err = TrustedVerificationKeys::load(&raw).unwrap_err();
+    assert!(matches!(err, TrustStoreError::Empty));
+}
+
+#[test]
+fn t52c_load_rejects_malformed_key_bytes() {
+    let mut key = trusted_key_for("bad", &primary_signing_key(), None, None);
+    key.public_key_b64 = "not-base64!!".to_string();
+    let store = trust_store(vec![key]);
+    let raw = serde_json::to_string(&store).unwrap();
+    let err = TrustedVerificationKeys::load(&raw).unwrap_err();
+    assert!(matches!(err, TrustStoreError::MalformedKey { .. }));
+}
+
+#[test]
+fn t53_rotation_skips_a_retired_key_and_still_verifies_via_the_still_valid_key() {
+    let revision = sample_revision();
+    let payload =
+        sample_bundle_payload(revision, 1, "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z");
+    let payload_bytes = serde_json::to_vec(&payload).unwrap();
+    let old_key = primary_signing_key();
+    let new_key = rotated_signing_key();
+    let sig_old = valid_signature_entry("old", &payload_bytes, &old_key);
+    let sig_new = valid_signature_entry("new", &payload_bytes, &new_key);
+
+    let old_trusted = trusted_key_for("old", &old_key, None, Some("2025-12-31T00:00:00Z"));
+    let new_trusted = trusted_key_for("new", &new_key, None, None);
+    let trust = trust_store(vec![old_trusted.clone(), new_trusted.clone()]);
+
+    // Old key listed first in the signature list: a naive implementation
+    // that returns on the first unusable signature would report
+    // `KeyRetired` here and never try the second signature.
+    let envelope = build_envelope_bytes(&payload_bytes, vec![sig_old.clone(), sig_new.clone()]);
+    let verified = verify_bundle(&envelope, &trust, base_now())
+        .expect("must verify via the still-valid new key despite the old key being retired");
+    assert_eq!(verified.verified_by(), &KeyId("new".to_string()));
+
+    // Order-independence: new key listed first, old (retired) key second.
+    let envelope_reordered = build_envelope_bytes(&payload_bytes, vec![sig_new, sig_old]);
+    let verified_reordered = verify_bundle(&envelope_reordered, &trust, base_now())
+        .expect("order of signatures in the list must not matter");
+    assert_eq!(verified_reordered.verified_by(), &KeyId("new".to_string()));
+}
+
+#[test]
+fn t52d_load_rejects_a_malformed_not_after_timestamp() {
+    let mut key = trusted_key_for("bad-timestamp", &primary_signing_key(), None, None);
+    key.not_after = Some("not-a-timestamp".to_string());
+    let store = trust_store(vec![key]);
+    let raw = serde_json::to_string(&store).unwrap();
+    let err = TrustedVerificationKeys::load(&raw).unwrap_err();
+    assert!(matches!(err, TrustStoreError::Malformed { .. }));
 }
