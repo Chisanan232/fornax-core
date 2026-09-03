@@ -27,6 +27,7 @@
 //!   every one carries a non-empty `message` and `remediation`.
 
 mod action_classification;
+mod bundle;
 mod content;
 mod diagnostics;
 mod local;
@@ -35,6 +36,13 @@ mod revision;
 mod target;
 
 pub use action_classification::classify_action_class;
+pub use bundle::{
+    verify_bundle, BundlePayload, BundleProvenance, BundleRejection, BundleSignature, KeyId,
+    PayloadDigest, SignatureAlgorithm, SignedPolicyBundle, TrustStoreError, TrustedKey,
+    TrustedVerificationKeys, VerifiedPolicyBundle, BUNDLE_SCHEMA_VERSION, BUNDLE_SIGNING_DOMAIN,
+    CLOCK_SKEW_TOLERANCE_SECONDS, MAX_PAYLOAD_BYTES, MAX_SIGNATURES,
+    SUPPORTED_BUNDLE_SCHEMA_VERSIONS,
+};
 pub use content::{
     ActionClass, CacheScope, CollectionScope, EgressContentClass, EgressScope, EnforcementOutcome,
     EnforcementRule, EnforcementScope, PolicyContent, RedactionProfile, ResolvedValues, RiskClass,
