@@ -452,6 +452,17 @@ pub enum IngestMessage {
     Event(AgentEvent),
     Claim(Claim),
     Evidence(Evidence),
+    /// A signed policy bundle envelope (FORNX-119), imported via `fornax
+    /// policy import <path>`. `envelope` is the raw envelope JSON text
+    /// (`policy::SignedPolicyBundle`, base64 payload + signatures) exactly
+    /// as read from the file — parsing/verification happens daemon-side via
+    /// `fornax_store::Store::submit_policy_bundle`. Fire-and-forget over
+    /// the existing UDS, same as every other `IngestMessage` variant — no
+    /// new HTTP POST route (the localhost HTTP surface is GET-only,
+    /// deliberately, since it is browser-reachable).
+    PolicyBundle {
+        envelope: String,
+    },
     /// Adapter announces what its runtime can observe, once per connection.
     Capabilities(RuntimeCapabilities),
 }
