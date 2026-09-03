@@ -12,8 +12,11 @@ use sqlx::SqlitePool;
 use std::path::Path;
 use std::str::FromStr;
 
+pub mod audit_ledger;
 pub mod policy_cache;
 pub mod retention;
+
+pub use audit_ledger::{AppendedAuditEvent, AuditLedgerEntry, ChainVerification, DivergenceKind};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -27,6 +30,14 @@ pub enum StoreError {
     /// indicates on-disk corruption or manual tampering with `fornax.db`.
     #[error("policy cache data corrupt: {0}")]
     PolicyCacheCorrupt(String),
+    /// FORNX-315: a persisted `audit_events` row's `payload` failed to
+    /// deserialize back into `AuditEvent`. Should never happen for a row
+    /// `Store::append_audit_event` itself wrote -- indicates on-disk
+    /// corruption or manual tampering with `fornax.db` (in which case
+    /// `Store::verify_audit_chain` is the authoritative check, not this
+    /// error path -- see `audit_ledger.rs`'s trust-boundary doc comment).
+    #[error("audit ledger data corrupt: {0}")]
+    AuditLedgerCorrupt(String),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;

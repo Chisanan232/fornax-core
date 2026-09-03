@@ -214,6 +214,27 @@ enum Commands {
         #[command(subcommand)]
         action: PolicyAction,
     },
+    /// Local append-only, hash-chained audit ledger (FORNX-315). Reads
+    /// `$FORNAX_HOME/fornax.db` directly (`fornax_store::Store`), mirroring
+    /// `export-spool`'s direct-store access rather than the daemon's HTTP
+    /// API -- the ledger is local file state, not a daemon-mediated view.
+    Audit {
+        #[command(subcommand)]
+        action: AuditAction,
+    },
+}
+
+/// `fornax audit <action>` (FORNX-315).
+#[derive(Subcommand)]
+enum AuditAction {
+    /// Verifies the local audit ledger's hash chain end-to-end
+    /// (`fornax_store::Store::verify_audit_chain`). Prints the typed
+    /// `ChainVerification` result and exits non-zero on `Diverged` -- see
+    /// `crates/fornax-store/src/audit_ledger.rs`'s module doc comment for
+    /// what a `Valid` result does and does not attest to.
+    Verify,
+    /// Lists every appended audit event, oldest first.
+    List,
 }
 
 /// `fornax policy <action>` (FORNX-119).
@@ -409,8 +430,63 @@ async fn main() -> anyhow::Result<()> {
         Commands::UninstallCodex => uninstall_codex()?,
         Commands::Experiment { action } => experiment_ux::handle(action, &fornax_home())?,
         Commands::Policy { action } => handle_policy_action(action).await?,
+        Commands::Audit { action } => handle_audit_action(action).await?,
     }
     Ok(())
+}
+
+async fn handle_audit_action(action: AuditAction) -> anyhow::Result<()> {
+    let db_path = fornax_home().join("fornax.db");
+    let store = fornax_store::Store::open(&db_path).await?;
+    match action {
+        AuditAction::Verify => {
+            let result = store.verify_audit_chain().await?;
+            let diverged = matches!(result, fornax_store::ChainVerification::Diverged { .. });
+            println!("{}", render_audit_verification(&result));
+            if diverged {
+                std::process::exit(1);
+            }
+        }
+        AuditAction::List => {
+            let events = store.audit_events().await?;
+            print!("{}", render_audit_list(&events));
+        }
+    }
+    Ok(())
+}
+
+fn render_audit_verification(v: &fornax_store::ChainVerification) -> String {
+    match v {
+        fornax_store::ChainVerification::Valid => {
+            "audit ledger: valid (hash chain intact)".to_string()
+        }
+        fornax_store::ChainVerification::Diverged {
+            first_bad_seq,
+            kind,
+        } => {
+            format!("audit ledger: DIVERGED at seq={first_bad_seq} kind={kind:?}")
+        }
+    }
+}
+
+fn render_audit_list(events: &[fornax_store::AuditLedgerEntry]) -> String {
+    if events.is_empty() {
+        return "audit ledger: no events recorded\n".to_string();
+    }
+    let mut out = String::new();
+    for e in events {
+        out.push_str(&format!(
+            "seq={} event_id={} recorded_at={} action={:?} outcome={:?} export_class={} entry_hash={}\n",
+            e.seq,
+            e.event.event_id,
+            e.recorded_at,
+            e.event.action,
+            e.event.outcome,
+            e.export_class,
+            e.entry_hash,
+        ));
+    }
+    out
 }
 
 async fn handle_policy_action(action: PolicyAction) -> anyhow::Result<()> {
@@ -3593,5 +3669,74 @@ trust_level = \"trusted\"\n";
             drift_state_label(&serde_json::json!("quantum_pending")),
             "◌ quantum_pending"
         );
+    }
+
+    #[test]
+    fn render_audit_verification_reports_valid() {
+        let rendered = render_audit_verification(&fornax_store::ChainVerification::Valid);
+        assert_eq!(rendered, "audit ledger: valid (hash chain intact)");
+    }
+
+    #[test]
+    fn render_audit_verification_reports_diverged_with_seq_and_kind() {
+        let rendered = render_audit_verification(&fornax_store::ChainVerification::Diverged {
+            first_bad_seq: 5,
+            kind: fornax_store::DivergenceKind::HashMismatch,
+        });
+        assert_eq!(
+            rendered,
+            "audit ledger: DIVERGED at seq=5 kind=HashMismatch"
+        );
+    }
+
+    #[test]
+    fn render_audit_list_reports_empty_ledger() {
+        assert_eq!(render_audit_list(&[]), "audit ledger: no events recorded\n");
+    }
+
+    /// FORNX-315: `fornax audit list`/`fornax audit verify` read the same
+    /// `fornax_store::Store` `export-spool` does (direct-store access, not
+    /// the daemon's HTTP API) -- proven end to end here, mirroring
+    /// `export_spool_from_store`'s own test pattern above of taking an
+    /// already-open `Store` rather than touching `$FORNAX_HOME`.
+    #[tokio::test]
+    async fn audit_verify_and_list_round_trip_through_a_real_store() {
+        use fornax_types::{
+            AuditAction as EventAction, AuditActor, AuditExportClass, AuditOutcome, AuditTarget,
+        };
+
+        let path =
+            std::env::temp_dir().join(format!("fornax-cli-audit-test-{}.db", uuid::Uuid::new_v4()));
+        let store = fornax_store::Store::open(&path).await.expect("open db");
+
+        let event = fornax_types::AuditEvent::new(
+            "e1",
+            "2026-09-03T00:00:00Z",
+            AuditActor::System,
+            EventAction::PermissionCheck,
+            AuditTarget::Permission {
+                target_id: "read_findings".into(),
+            },
+            AuditOutcome::Granted,
+            AuditExportClass::Metadata,
+        );
+        store
+            .append_audit_event(&event, "2026-09-03T00:00:00Z".parse().unwrap())
+            .await
+            .expect("append audit event");
+
+        let result = store.verify_audit_chain().await.expect("verify chain");
+        assert_eq!(
+            render_audit_verification(&result),
+            "audit ledger: valid (hash chain intact)"
+        );
+
+        let events = store.audit_events().await.expect("list events");
+        let rendered = render_audit_list(&events);
+        assert!(rendered.contains("seq=1"));
+        assert!(rendered.contains("event_id=e1"));
+        assert!(rendered.contains("PermissionCheck"));
+
+        std::fs::remove_file(&path).ok();
     }
 }
