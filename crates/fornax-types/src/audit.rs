@@ -89,6 +89,11 @@ pub enum AuditTarget {
     Device {
         target_id: String,
     },
+    /// FORNX-319: the specific `evidence` row an `AuditAction::EvidencePurged`
+    /// event was raised for.
+    Evidence {
+        target_id: String,
+    },
     Organization {
         target_id: String,
     },
@@ -107,6 +112,11 @@ pub enum AuditAction {
     PolicyBundleActivated,
     PolicyRevocationIngested,
     RoleAssignmentChanged,
+    /// FORNX-319: a `RetentionClass::RawLocal` evidence row's payload was
+    /// purged by the local retention sweep (`fornax_store::retention`) once
+    /// its retention window elapsed. See
+    /// `docs/adr/0011-audit-event-model.md` §2's table.
+    EvidencePurged,
     /// Forward-compatibility catch-all. Preserves and round-trips the
     /// original wire string verbatim — see the module docs' "Two enum
     /// shapes" section.
@@ -450,6 +460,20 @@ mod tests {
         assert_eq!(json["actor_kind"], serde_json::json!("system"));
     }
 
+    /// FORNX-319: `AuditTarget::Evidence` round-trips with the explicit
+    /// `evidence` wire tag, matching ADR-0011 §2's target-kind table.
+    #[test]
+    fn audit_target_evidence_round_trips_with_the_explicit_wire_tag() {
+        let target = AuditTarget::Evidence {
+            target_id: "ev-1".to_string(),
+        };
+        let json = serde_json::to_value(&target).unwrap();
+        assert_eq!(json["target_kind"], serde_json::json!("evidence"));
+        assert_eq!(json["target_id"], serde_json::json!("ev-1"));
+        let back: AuditTarget = serde_json::from_value(json).unwrap();
+        assert_eq!(back, target);
+    }
+
     #[test]
     fn every_canonical_audit_action_tag_round_trips_to_its_named_variant() {
         let cases = [
@@ -470,6 +494,7 @@ mod tests {
                 "\"role_assignment_changed\"",
                 AuditAction::RoleAssignmentChanged,
             ),
+            ("\"evidence_purged\"", AuditAction::EvidencePurged),
         ];
         for (json, expected) in cases {
             let v: AuditAction = serde_json::from_str(json).unwrap();

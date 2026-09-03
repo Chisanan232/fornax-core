@@ -1511,9 +1511,24 @@ fn render_evidence_graph(v: &serde_json::Value) -> String {
                     .get("linked_at")
                     .and_then(|s| s.as_str())
                     .unwrap_or("?");
-                out.push_str(&format!(
-                    "    evidence: {evidence_id}  linked_at: {linked_at}\n"
-                ));
+                // FORNX-319 AC3: never let a purged evidence row render as
+                // if it were simply absent or UNAVAILABLE — say explicitly
+                // that it expired. The finding/verdict this evidence once
+                // supported is unaffected; only the raw payload is gone.
+                let purged = link
+                    .get("evidence_purged")
+                    .and_then(|b| b.as_bool())
+                    .unwrap_or(false);
+                if purged {
+                    out.push_str(&format!(
+                        "    evidence: {evidence_id}  linked_at: {linked_at}  \
+                         [EVIDENCE EXPIRED — raw payload purged per retention policy]\n"
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "    evidence: {evidence_id}  linked_at: {linked_at}\n"
+                    ));
+                }
             }
         }
     }
@@ -2196,6 +2211,30 @@ mod tests {
         assert!(!rendered.contains("no evidence linked"));
     }
 
+    /// FORNX-319 AC3: a link whose evidence has been purged must render an
+    /// explicit "evidence expired" statement, never silently look identical
+    /// to an ordinary, still-present evidence link.
+    #[test]
+    fn render_evidence_graph_marks_purged_evidence_as_expired_not_silently_present() {
+        let v = serde_json::json!({
+            "claim": "c1", "session": "s1", "found": true,
+            "links": [
+                {"evidence_id": "e1", "relation": "supports", "linked_at": "2026-09-01T00:00:00Z", "evidence_purged": true},
+                {"evidence_id": "e2", "relation": "supports", "linked_at": "2026-09-01T00:00:01Z", "evidence_purged": false},
+            ],
+            "missing": [],
+        });
+        let rendered = render_evidence_graph(&v);
+        assert!(rendered.contains("evidence: e1"));
+        assert!(rendered.contains("EVIDENCE EXPIRED"));
+        // e2 is not purged — its line must not carry the expired marker.
+        let e2_line = rendered
+            .lines()
+            .find(|l| l.contains("evidence: e2"))
+            .expect("e2's line must be present");
+        assert!(!e2_line.contains("EVIDENCE EXPIRED"));
+    }
+
     /// FORNX-90 regression: a link with an unrecognized relation tag must
     /// still be shown, never silently dropped — "show each item" applies
     /// even to a state this renderer doesn't yet name.
@@ -2776,6 +2815,7 @@ trust_level = \"trusted\"\n";
                 provenance: "codex:rollout:exec_command_end".into(),
                 source: None,
                 extension: None,
+                evidence_purged: false,
             };
             store
                 .insert_evidence(&evidence)
@@ -3054,6 +3094,7 @@ trust_level = \"trusted\"\n";
                     derived_from: Vec::new(),
                 }),
                 extension: None,
+                evidence_purged: false,
             };
             store
                 .insert_evidence(&evidence)
@@ -3139,6 +3180,7 @@ trust_level = \"trusted\"\n";
                 provenance: "claude_code:PostToolUse:Bash#heuristic:stderr_empty".into(),
                 source: None,
                 extension: Some(extension),
+                evidence_purged: false,
             };
             store
                 .insert_evidence(&evidence)
