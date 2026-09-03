@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub mod adapter;
+pub mod audit;
 pub mod capabilities;
 pub mod causal;
 pub mod experiment;
@@ -26,6 +27,11 @@ pub mod sensor;
 pub mod sensor_config;
 
 pub use adapter::{AgentAdapter, NormalizationOutcome};
+pub use audit::{
+    validate_audit_event, AuditAction, AuditActor, AuditEvent, AuditEventRejection,
+    AuditExportClass, AuditOutcome, AuditRef, AuditRefParseError, AuditTarget,
+    AUDIT_SCHEMA_VERSION, SUPPORTED_AUDIT_SCHEMA_VERSIONS,
+};
 pub use capabilities::{
     CapabilityProbe, CapabilitySignal, LegacyCapabilitiesWire, RuntimeCapabilities,
     SignalAvailability, SignalClass, CAPABILITY_SCHEMA_VERSION,
