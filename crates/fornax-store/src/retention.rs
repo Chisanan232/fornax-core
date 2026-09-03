@@ -95,6 +95,9 @@
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use fornax_types::audit::{
+    AuditAction, AuditActor, AuditEvent, AuditExportClass, AuditOutcome, AuditTarget,
+};
 use fornax_types::{DatasetLineageTag, RetentionClass, TenantRef};
 
 use crate::{Result, Store};
@@ -381,8 +384,33 @@ impl Store {
     /// impression this ticket's AC3 forbids) — so any reader of
     /// `Evidence::payload`, present or future, sees an honest marker
     /// instead of silence. Returns `true` if a row with this id existed.
-    pub async fn purge_evidence_payload(&self, evidence_id: &str) -> Result<bool> {
-        purge_evidence_payload_row(&self.pool, evidence_id).await
+    ///
+    /// FORNX-319 AC "every purge action emits an AuditEvent": when a row
+    /// really was purged, this also appends an
+    /// `AuditAction::EvidencePurged` event to the local audit ledger
+    /// (`Store::append_audit_event`, FORNX-315), after the `UPDATE` above
+    /// has committed. The append runs in the ledger's own separate `BEGIN
+    /// IMMEDIATE` transaction (`audit_ledger.rs`) on a different pool
+    /// connection — it MUST happen after this method's own write commits,
+    /// never while an update/insert transaction of this store's is still
+    /// open, because SQLite serializes writers at the file level, not the
+    /// connection level: two overlapping write transactions on the same
+    /// database file, even from different pool connections, self-deadlock.
+    /// The purge and its audit event are therefore not cross-table-atomic
+    /// — a crash in the narrow window between them leaves that one purge
+    /// unaudited; see [`Store::sweep_expired_records`]'s doc comment for
+    /// the same trade-off made there for the same reason.
+    pub async fn purge_evidence_payload(
+        &self,
+        evidence_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let purged = purge_evidence_payload_row(&self.pool, evidence_id).await?;
+        if purged {
+            self.append_audit_event(&evidence_purged_audit_event(evidence_id, now), now)
+                .await?;
+        }
+        Ok(purged)
     }
 
     /// Whether the `evidence` row named `evidence_id` has been purged
@@ -495,6 +523,15 @@ impl Store {
             ..Default::default()
         };
         let mut last_key: Option<(String, String, String)> = None;
+        // Evidence ids purged this batch, audited only AFTER `tx` commits
+        // (see below) — `Store::append_audit_event` opens its own `BEGIN
+        // IMMEDIATE` on a separate pool connection, and SQLite serializes
+        // writers at the FILE level, not the connection level: calling it
+        // while `tx` is still open self-deadlocks (this pool's own
+        // in-progress write transaction blocks the audit ledger's write
+        // lock acquisition, forever, since both would need the other to
+        // finish first).
+        let mut purged_evidence_ids: Vec<String> = Vec::new();
 
         for row in rows {
             let recorded_at = row.recorded_at.clone();
@@ -513,6 +550,7 @@ impl Store {
                 "evidence" => {
                     purge_evidence_payload_row(&mut *tx, &record.record_id).await?;
                     report.purged_evidence += 1;
+                    purged_evidence_ids.push(record.record_id.clone());
                 }
                 "agent_events" => {
                     sqlx::query("DELETE FROM agent_events WHERE id = ?1")
@@ -550,6 +588,21 @@ impl Store {
         }
 
         tx.commit().await?;
+
+        // FORNX-319/FORNX-315: every purge action emits an AuditEvent —
+        // appended only now, after `tx` has committed (see the comment
+        // above `purged_evidence_ids` for why appending any earlier
+        // self-deadlocks). This does mean the purge and its audit event
+        // are not cross-table-atomic: a crash between the commit above and
+        // one of these appends leaves that one purge unaudited. Given a
+        // local single-process daemon with no concurrent writer racing
+        // this exact window, that gap is accepted rather than engineered
+        // away — the alternative (holding `tx` open across the ledger's
+        // own transaction) is the deadlock this code avoids.
+        for evidence_id in &purged_evidence_ids {
+            self.append_audit_event(&evidence_purged_audit_event(evidence_id, now), now)
+                .await?;
+        }
 
         report.more_remaining = examined == batch_size as usize;
         report.next_cursor = if report.more_remaining {
@@ -594,6 +647,28 @@ pub fn evidence_expired_payload_marker() -> serde_json::Value {
         "evidence_expired": true,
         "detail": "raw evidence payload purged per local retention policy; the finding/verdict this evidence once supported is unaffected",
     })
+}
+
+/// The `AuditAction::EvidencePurged` event both [`Store::purge_evidence_payload`]
+/// and [`Store::sweep_expired_records`] append (FORNX-319/FORNX-315).
+/// `AuditActor::System` — a retention purge is this binary's own automatic,
+/// unattended action, never attributable to a specific device/user/service
+/// caller. `AuditOutcome::Expired` — the target's retention window had
+/// elapsed, matching that variant's documented meaning exactly.
+/// `AuditExportClass::Metadata` — only structural fields (which evidence id,
+/// when), no raw evidence content is embedded in the event itself.
+fn evidence_purged_audit_event(evidence_id: &str, now: DateTime<Utc>) -> AuditEvent {
+    AuditEvent::new(
+        uuid::Uuid::new_v4().to_string(),
+        now.to_rfc3339(),
+        AuditActor::System,
+        AuditAction::EvidencePurged,
+        AuditTarget::Evidence {
+            target_id: evidence_id.to_string(),
+        },
+        AuditOutcome::Expired,
+        AuditExportClass::Metadata,
+    )
 }
 
 async fn purge_evidence_payload_row<'e, E>(executor: E, evidence_id: &str) -> Result<bool>
@@ -1074,7 +1149,7 @@ mod tests {
         let (_event, _claim, evidence, _finding) = seed_full_record_set(&store).await;
 
         let purged = store
-            .purge_evidence_payload(&evidence.id.to_string())
+            .purge_evidence_payload(&evidence.id.to_string(), Utc::now())
             .await
             .expect("purge evidence payload");
         assert!(purged, "a real row existed and must report as purged");
@@ -1095,6 +1170,21 @@ mod tests {
             serde_json::json!({}),
             "an empty object reads as 'empty evidence was collected' — AC3 forbids exactly this"
         );
+        // FORNX-319/FORNX-315: the purge itself must have emitted an
+        // EvidencePurged audit event naming this evidence row.
+        let audit_events = store.audit_events().await.expect("read audit ledger");
+        assert_eq!(audit_events.len(), 1);
+        assert_eq!(
+            audit_events[0].event.action,
+            fornax_types::audit::AuditAction::EvidencePurged
+        );
+        assert_eq!(
+            audit_events[0].event.target,
+            fornax_types::audit::AuditTarget::Evidence {
+                target_id: evidence.id.to_string()
+            }
+        );
+
         assert_eq!(
             ev.payload["evidence_expired"],
             serde_json::json!(true),
@@ -1164,6 +1254,21 @@ mod tests {
             .expect("evidence row still exists — soft purge, not delete");
         assert!(ev.evidence_purged);
         assert_eq!(ev.payload, evidence_expired_payload_marker());
+
+        // FORNX-319/FORNX-315: the sweep-driven purge must have emitted an
+        // EvidencePurged audit event too, after tx committed.
+        let audit_events = store.audit_events().await.expect("read audit ledger");
+        assert_eq!(audit_events.len(), 1);
+        assert_eq!(
+            audit_events[0].event.action,
+            fornax_types::audit::AuditAction::EvidencePurged
+        );
+        assert_eq!(
+            audit_events[0].event.target,
+            fornax_types::audit::AuditTarget::Evidence {
+                target_id: evidence.id.to_string()
+            }
+        );
 
         let remaining_tag_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM dataset_lineage_tags WHERE record_table = 'evidence' AND record_id = ?1",

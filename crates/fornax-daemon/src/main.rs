@@ -2414,7 +2414,7 @@ mod tests {
 
         state
             .store
-            .purge_evidence_payload(&evidence_id.to_string())
+            .purge_evidence_payload(&evidence_id.to_string(), Utc::now())
             .await
             .expect("purge evidence payload");
 
